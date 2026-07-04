@@ -9,6 +9,8 @@ import { needsPlanning, generatePlan, persistPlan, updatePlanStatus } from "./pl
 import { runExecute } from "./executor.js";
 import { critique } from "./critic.js";
 import { createHttpFn } from "./http.js";
+import { REGISTRY } from "./actionRegistry.js";
+import { indexTools, retrieveTools } from "./toolRag.js";
 
 const newRunId = () => `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -24,7 +26,11 @@ async function persistTurn(ctx, record) {
       tokens_out: null,
       latency_ms: record.latency_ms,
       outcome: record.outcome,
-      attrs: record,
+      attrs: {
+        ...record,
+        tools_offered: ctx.toolsOffered ?? null,
+        toolrag_fallback: ctx.toolragFallback ?? null,
+      },
       workspace_id: ctx.workspaceId,
     });
   } catch {
@@ -77,6 +83,19 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       tokens += planned.tokens;
       planEntityId = await persistPlan(prompt, plan, ctx);
     }
+
+    // 3b. Tool-RAG: index the registry lazily (fire-and-forget-ish - never
+    // fails the turn, indexTools already catches internally) then retrieve
+    // the top-K relevant tools + core set for this turn's execute stage.
+    try {
+      await indexTools(REGISTRY, { httpFn: ctx.httpFn, workspaceId: ctx.workspaceId, ...opts.toolRag });
+    } catch {
+      // Defense-in-depth only; indexTools does not throw.
+    }
+    const retrieval = await retrieveTools(prompt, REGISTRY, opts.toolRag);
+    ctx.toolNames = retrieval.tools;
+    ctx.toolsOffered = retrieval.tools.length;
+    ctx.toolragFallback = retrieval.fallback;
 
     // 4. Execute (bounded).
     const exec = await runExecute(prompt, worldSnapshot, plan, ctx);

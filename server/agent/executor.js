@@ -121,16 +121,24 @@ export async function runTool(ctx, toolName, args = {}) {
   return result;
 }
 
-// Builds one SDK MCP tool per registered (allowed + gated) tool. Forbidden
+// The tools offered this turn - Tool-RAG's retrieved subset (ctx.toolNames,
+// set by the loop before calling runExecute) when present, else the full
+// registry (e.g. a direct executor call in tests, or Tool-RAG not wired).
+function offeredToolNames(ctx) {
+  return ctx.toolNames ?? Object.keys(REGISTRY);
+}
+
+// Builds one SDK MCP tool per offered (allowed + gated) tool. Forbidden
 // domains are intentionally never built - there is no tool to call.
 function buildSdkTools(ctx) {
-  return Object.entries(REGISTRY).map(([name, entry]) =>
-    sdkTool(sdkToolName(name), entry.description, entry.inputSchema, async (args) => {
+  return offeredToolNames(ctx).map((name) => {
+    const entry = REGISTRY[name];
+    return sdkTool(sdkToolName(name), entry.description, entry.inputSchema, async (args) => {
       const result = await runTool(ctx, name, args);
       const text = result.untrusted ?? JSON.stringify(result);
       return { content: [{ type: "text", text }] };
-    }),
-  );
+    });
+  });
 }
 
 function usageTokens(usage) {
@@ -157,7 +165,7 @@ export async function runExecute(goal, worldSnapshot, plan, ctx, refineIssue = n
   const options = {
     purpose: "execute",
     mcpServers: { [MCP_SERVER_NAME]: mcp },
-    allowedTools: Object.keys(REGISTRY).map((n) => `mcp__${MCP_SERVER_NAME}__${sdkToolName(n)}`),
+    allowedTools: offeredToolNames(ctx).map((n) => `mcp__${MCP_SERVER_NAME}__${sdkToolName(n)}`),
     disallowedTools: DISALLOWED_TOOLS,
     permissionMode: "dontAsk",
     maxTurns: MAX_STEPS,

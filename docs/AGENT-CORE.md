@@ -61,6 +61,8 @@ Modeled on the disciplined turn lifecycle, adapted to Life OS's substrate. Bound
 
 ## 4. Tool registry + Tool-RAG
 
+**Implemented (issue #123):** `server/agent/toolRag.js` (`indexTools`/`retrieveTools`), wired into `server/agent/loop.js` before the execute stage and into `server/agent/executor.js`'s SDK tool build; tests in `server/test/toolRag.test.js`.
+
 - **Registry.** The agent's tools are the existing thin surfaces - `bin/lifeos` CRUD, the Agent Control Plane action tools (`entity.create`, `edge.create`, `draft.create`, `view.configure`, `pipeline.run`, `module.requestBuild`, `search`, …), and heavy on-demand capabilities loaded via mcp-multiplexer (Figma, Higgsfield). **CRUD is never an MCP** ([CLAUDE.md](../CLAUDE.md)); the registry is a manifest of thin HTTP/CLI tools plus their JSON schemas.
 - **Tool-RAG.** Mounting every tool every turn is token waste and dulls tool choice. Instead, embed each tool's description once (reuse `memvec.py` / sqlite-vec in `lifeos-derived.db` - the same infra `entity_vec` already uses) and **retrieve the top-K relevant tools per turn** plus an always-on **core set** (search, entity read/write, the gate-respecting actuators). Falls back to the full catalog on any retrieval failure. This is the mechanism that lets the tool count grow to hundreds (every self-authored tool, every module's `agentTools`) without bloating the prompt.
 
