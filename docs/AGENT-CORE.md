@@ -70,6 +70,8 @@ Modeled on the disciplined turn lifecycle, adapted to Life OS's substrate. Bound
 
 ## 5. Memory integration - reuse `lifeos-memory`, don't rebuild it
 
+**Implemented (issue #124):** `server/agent/memoryContext.js` (`fetchMemoryContext`/`ingestTurnOutcome`), wired into `server/agent/loop.js`'s context-assembly step (recall in, appended to the planner/executor prompt as a labeled block) and its finalize/catch paths (write-out via `/api/memory/ingest`, skipped on gate refusal); tests in `server/test/memoryContext.test.js`.
+
 Founder OS bolts a vector+SQL+graph triplex onto its agent. Life OS already has a **stronger** brain in `services/lifeos-memory` (activation recall `A(m)=relevance·recency·importance·frequency`, spreading activation, sleep-cycle consolidation, procedural store, bi-temporal supersede - see [AI-MEMORY.md](./AI-MEMORY.md)), and it is already wired into the live `lifeos-drain` loop via `Dispatch::MemorySleep`. The agent core is a **consumer** of it:
 
 - **Recall in:** step 2 calls `lifeos-memory` retrieval (the token-budgeted context compiler, `compiler.rs`) to inject working/episodic/semantic context - not a flat top-K, the activation-scored recall the crate already computes.

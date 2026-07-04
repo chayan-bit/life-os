@@ -1,9 +1,8 @@
 // Compact world-model snapshot (docs/AGENT-CORE.md §3 step 2, §11). A cheap,
 // bounded read over `entities` that gives the turn its situational block so the
-// agent never re-asks for context it could compute. This is a genuine stub:
-// counts only, no memory injection yet.
-//
-// #124: lifeos-memory activation recall injected here.
+// agent never re-asks for context it could compute. This is counts only;
+// lifeos-memory activation recall (#124) is fetched and appended alongside
+// this snapshot in loop.js, not here - see server/agent/memoryContext.js.
 
 const LIST_LIMIT = 200;
 const DONE_STATUSES = new Set(["done", "completed", "archived", "cancelled"]);

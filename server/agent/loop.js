@@ -11,6 +11,7 @@ import { critique } from "./critic.js";
 import { createHttpFn } from "./http.js";
 import { REGISTRY } from "./actionRegistry.js";
 import { indexTools, retrieveTools } from "./toolRag.js";
+import { fetchMemoryContext, ingestTurnOutcome } from "./memoryContext.js";
 
 const newRunId = () => `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -30,6 +31,7 @@ async function persistTurn(ctx, record) {
         ...record,
         tools_offered: ctx.toolsOffered ?? null,
         toolrag_fallback: ctx.toolragFallback ?? null,
+        memory_injected: ctx.memoryInjected ?? false,
       },
       workspace_id: ctx.workspaceId,
     });
@@ -70,15 +72,21 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
   }
 
   try {
-    // 2. Context assembly.
+    // 2. Context assembly - world snapshot + lifeos-memory activation recall
+    // (docs/AGENT-CORE.md §5, #124). The memory block is the compiler's own
+    // token-budgeted output, appended verbatim - never a re-query, never a
+    // raw dump.
     const worldSnapshot = await buildWorldSnapshot(ctx);
+    const memory = await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt);
+    ctx.memoryInjected = Boolean(memory.block);
+    const context = memory.block ? `${worldSnapshot}\n\n${memory.block}` : worldSnapshot;
 
     // 3. Plan (conditional).
     let plan = null;
     let planEntityId = null;
     let tokens = 0;
     if (needsPlanning(prompt)) {
-      const planned = await generatePlan(prompt, worldSnapshot, ctx);
+      const planned = await generatePlan(prompt, context, ctx);
       plan = planned.plan;
       tokens += planned.tokens;
       planEntityId = await persistPlan(prompt, plan, ctx);
@@ -98,7 +106,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     ctx.toolragFallback = retrieval.fallback;
 
     // 4. Execute (bounded).
-    const exec = await runExecute(prompt, worldSnapshot, plan, ctx);
+    const exec = await runExecute(prompt, context, plan, ctx);
     tokens += exec.tokens;
     let text = exec.text;
     let refined = false;
@@ -116,7 +124,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       const verdict = await critique(prompt, text, ctx);
       tokens += verdict.tokens;
       if (!verdict.critique.ok && verdict.critique.fixable) {
-        const redo = await runExecute(prompt, worldSnapshot, plan, ctx, verdict.critique.issue);
+        const redo = await runExecute(prompt, context, plan, ctx, verdict.critique.issue);
         tokens += redo.tokens;
         if (redo.text) text = redo.text;
         refined = true;
@@ -145,11 +153,16 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       refined: false,
       outcome: "failed",
     });
+    // Write-back (issue #124): even a crashed turn produced ledger work worth
+    // folding into the next sleep cycle. Best-effort - never rethrows.
+    await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, "failed", "");
     return { success: false, runId, outcome: "failed", error: error.message };
   }
 }
 
-// Persists the plan status + the agent.turn row.
+// Persists the plan status + the agent.turn row, then writes the turn's
+// outcome back to memory (issue #124) best-effort so the next sleep cycle
+// (consolidate.rs) can fold it - no new subsystem, `events` stays the path.
 async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, text, refined, started }) {
   const planStatus = outcome === "completed" ? "completed" : outcome === "awaiting_approval" ? "awaiting_approval" : "failed";
   if (plan) await updatePlanStatus(planEntityId, plan, prompt, planStatus, ctx);
@@ -165,4 +178,5 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, text
     outcome,
     result_preview: (text || "").slice(0, 500),
   });
+  await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, outcome, text);
 }
