@@ -42,6 +42,7 @@ async fn test_app() -> TestApp {
         jwt_secret: "test-secret".into(),
         agent_cwd: None,
         agent_timeout_secs: 30,
+        server_dir: "server".to_string(),
         nango_server_url: None,
         nango_secret_key: None,
     kite_api_key: None,

@@ -33,6 +33,10 @@ pub struct Config {
     pub agent_cwd: Option<String>,
     /// Hard ceiling on how long a single agent invocation may run.
     pub agent_timeout_secs: u64,
+    /// Directory the JS agent runtime (`agent/run.js`, `scaffold.js`) is spawned
+    /// from - the `server/` dir in the repo. `/api/agent` shells into it the same
+    /// way `lifeos-drain` shells `node scaffold.js` (issue #122).
+    pub server_dir: String,
     /// Base URL of the self-hosted Nango instance (infra/nango/). `None` means
     /// no Nango deployment is configured yet - connection routes return
     /// `ApiError::NotImplemented` rather than pretending to work.
@@ -119,6 +123,8 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(180);
 
+        let server_dir = std::env::var("LIFEOS_SERVER_DIR").unwrap_or_else(|_| "server".to_string());
+
         let nango_server_url = std::env::var("NANGO_SERVER_URL").ok().filter(|s| !s.is_empty());
         let nango_secret_key = std::env::var("NANGO_SECRET_KEY_DEV").ok().filter(|s| !s.is_empty());
 
@@ -167,6 +173,7 @@ impl Config {
             jwt_secret,
             agent_cwd,
             agent_timeout_secs,
+            server_dir,
             nango_server_url,
             nango_secret_key,
             kite_api_key,

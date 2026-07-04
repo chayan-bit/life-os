@@ -1,5 +1,6 @@
 //! HTTP surface for `lifeos-api`. One handler module per resource group.
 
+mod agent;
 mod browser;
 mod calendar;
 mod configs;
@@ -160,6 +161,8 @@ pub fn router(state: AppState) -> Router {
         // --- local agent router (OpenDesign-style) ---
         .route("/api/agents", get(llm::agents))
         .route("/api/llm", post(llm::llm))
+        // --- agent core loop (#122) ---
+        .route("/api/agent", post(agent::agent))
         // --- planned routes: enqueue where it makes sense, honest 501 otherwise ---
         .route("/api/ingest", post(planned::ingest))
         .route("/api/pipeline/run", post(planned::pipeline_run))
