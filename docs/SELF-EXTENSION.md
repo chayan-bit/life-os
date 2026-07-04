@@ -1,5 +1,7 @@
 # Self-extension - "Ask AI to add a module"
 
+> **This is Tier 0 (the manifest builder) of the generation ladder specified in [SELF-EXTENSION-V2.md](./SELF-EXTENSION-V2.md).** This doc remains the authoritative spec for the built-and-tested manifest path (issues #72-#80); v2 places it as rung one and adds T1-T5 (renderer → agent tool → backend route → migration → whole subsystem). Read v2 for the ladder; read here for how Tier 0 actually works today.
+
 > The system grows itself: an in-app affordance that, on request, writes a brand-new declarative module, validates it, and hot-loads it - as a revertable git commit.
 > Built on the **Claude Agent SDK** (not a raw `claude -p` subprocess), so tool-locking, structured output, and hooks are first-class.
 
@@ -257,13 +259,20 @@ an arbitrary sleep, the timeout is only the safety net for a event that genuinel
 One bounded retry (`MAX_ATTEMPTS = 2`) on any failure; teardown (browser, both child processes,
 scratch DB dir) always runs, even on failure. `scaffold.js` calls this after Validator 1 passes
 and before `commitAndMerge`.
-**Scope note:** the live hot-install path only ever carries a minimal `{id, name, version,
-icon}` manifest through the real SSE event - `InstalledModulePage.jsx` renders hot-installed
-modules as a flat list, not through the full multi-view `ModuleManifestPage` that the 14 static
-day-1 modules get. So "assert 0 console/page errors + `module-mounted:<id>` fires" is exercised
-for real; "assert each declared view mounts a node" isn't yet, since there's no live per-view
-render path for a hot-installed module to assert against today - that's frontend work beyond
-this issue (same kind of scope line #74 drew for `agentTool`/`botCommand` id uniqueness).
+**Scope note (closed by issue #121, docs/SELF-EXTENSION-V2.md §6):** the hot-install path used to
+carry only a minimal `{id, name, version, icon}` manifest through the real SSE event, so
+`InstalledModulePage.jsx` rendered every hot-installed module as a flat list instead of through
+the full multi-view `ModuleManifestPage` the 14 static day-1 modules get. `scaffold.js` now
+persists the real object-shaped manifest (module.js's own `osRegisterModule({...})` argument) as
+a generic entity - `module: 'system'`, `type: 'module_manifest'`, upserted by matching on a
+`title: module_manifest_<id>` key since `POST /api/entity` always server-generates its own row
+id (`server/lib/manifestEntity.js`). `useModuleStream.js` fetches that entity on `module.installed`
+and `InstalledModulePage.jsx` mounts `ModuleManifestPage` once it has real `entityTypes`/`views`,
+falling back to `GenericList` only for a genuinely manifest-less module. This validator now
+asserts "each declared view mounts a node" for real too: it loads the manifest from
+`opts.modulePath` via `loadManifestFromFile`, seeds the same manifest entity, then clicks each
+view's `[data-view-tab="<id>"]` and asserts `[data-view-id="<id>"]` is attached to the DOM
+(`ModuleManifestPage.jsx`'s view switcher and mounted-view container).
 Tested via `server/test/renderSmoke.test.js` (real Playwright + real HTTP fixtures standing in
 for the heavy cargo/Vite boot, so the suite stays fast: happy path, retry-then-succeed,
 retry-exhausted, timeout-without-firing, teardown-always-runs) and

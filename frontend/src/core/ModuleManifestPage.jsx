@@ -129,6 +129,7 @@ export default function ModuleManifestPage({ manifest }) {
         {manifest.views.map((v) => (
           <button
             key={v.id}
+            data-view-tab={v.id}
             onClick={() => setActiveViewId(v.id)}
             className={`neo-btn py-1.5 px-3 text-xs font-bold ${view?.id === v.id ? 'bg-neo-yellow' : 'bg-neo-surface'}`}
           >
@@ -137,7 +138,7 @@ export default function ModuleManifestPage({ manifest }) {
         ))}
       </div>
 
-      <div className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
+      <div data-view-id={view?.id} className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
         {state === 'offline' && <p className="text-xs text-neo-red font-bold">Backend unreachable.</p>}
         {state === 'loading' && <p className="text-xs text-neo-text-muted">Loading…</p>}
         {state === 'ready' && view?.kind === 'metric' && metric && (

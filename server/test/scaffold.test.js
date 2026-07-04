@@ -106,6 +106,50 @@ describe("scaffoldModule - happy path", () => {
   });
 });
 
+describe("scaffoldModule - manifest entity persistence (issue #121)", () => {
+  it("persists the real object-shaped module.js manifest, not the array-shaped structured-output summary", async () => {
+    const calls = [];
+    const result = await scaffoldModule("add a reading list module", "ws_test", {
+      repoRoot,
+      queryFn: (params) => benignQuery(params),
+      validateRenderSmoke: async () => ({ valid: true, errors: [] }),
+      persistManifestEntity: async (apiBase, moduleId, manifest, opts) => {
+        calls.push({ apiBase, moduleId, manifest, opts });
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].moduleId).toBe("add_a_reading_list_module");
+    expect(calls[0].opts).toEqual({ workspaceId: "ws_test" });
+    // The real module.js manifest has an object-keyed entityTypes (matching
+    // the 14 static day-1 modules ModuleManifestPage.jsx already renders),
+    // not VALID_MANIFEST's array-shaped entityTypes (the structured-output
+    // summary format, docs/SELF-EXTENSION.md §3).
+    expect(calls[0].manifest.entityTypes).toEqual({
+      item: {
+        label: "Item",
+        plural: "Items",
+        icon: "FileText",
+        attrs: { name: { type: "text", required: true } },
+      },
+    });
+  });
+
+  it("does not fail the install when manifest persistence throws", async () => {
+    const result = await scaffoldModule("add a reading list module", "ws_test", {
+      repoRoot,
+      queryFn: (params) => benignQuery(params),
+      validateRenderSmoke: async () => ({ valid: true, errors: [] }),
+      persistManifestEntity: async () => {
+        throw new Error("simulated API outage");
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+});
+
 describe("scaffoldModule - render smoke validation (issue #75)", () => {
   it("aborts and merges nothing when Validator 2 reports the module doesn't render cleanly", async () => {
     const { stdout: before } = await git(["log", "--oneline", "main"]);

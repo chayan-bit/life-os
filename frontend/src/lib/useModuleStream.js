@@ -5,6 +5,7 @@
 // errors out - the UI behavior is identical either way, just less instant.
 import { useEffect, useRef } from 'react';
 import { API_BASE, WORKSPACE_ID_KEY, apiCall } from './api';
+import { fetchInstalledManifest } from './manifestApi';
 import { registerModule } from './moduleRegistry';
 
 const POLL_FALLBACK_MS = 10000;
@@ -16,6 +17,24 @@ function manifestFromEvent(ev) {
   // (issue #22) is visibly wired end-to-end rather than silently inert.
   const id = ev.attrs?.id || ev.entity_id || ev.id;
   return { id, name: ev.attrs?.name || ev.attrs?.prompt || id, version: '0.0.0-dev', icon: '+' };
+}
+
+// Registers the minimal manifest immediately (so the tab appears with zero
+// delay), then swaps in the persisted full manifest (issue #121) once it
+// resolves - server/lib/manifestEntity.js's row can lag the SSE event by a
+// beat since it's written earlier in the same install but over a separate
+// request. Falls back to the minimal manifest (already registered) if the
+// entity isn't found or the fetch fails - no error surfaced to the user.
+function registerFromEvent(ev) {
+  const minimal = manifestFromEvent(ev);
+  registerModule(minimal);
+  fetchInstalledManifest(minimal.id)
+    .then((full) => {
+      if (full) registerModule(full);
+    })
+    .catch(() => {
+      // Minimal manifest above still renders via the GenericList fallback.
+    });
 }
 
 export function useModuleStream() {
@@ -34,7 +53,7 @@ export function useModuleStream() {
           for (const ev of [...data].reverse()) {
             if (ev.id > lastSeenRef.current) {
               lastSeenRef.current = ev.id;
-              registerModule(manifestFromEvent(ev));
+              registerFromEvent(ev);
             }
           }
         }
@@ -47,7 +66,7 @@ export function useModuleStream() {
       const workspaceId = localStorage.getItem(WORKSPACE_ID_KEY) || '';
       es = new EventSource(`${API_BASE}/api/stream/modules?workspace_id=${encodeURIComponent(workspaceId)}`);
       es.addEventListener('module.installed', (e) => {
-        try { registerModule(manifestFromEvent(JSON.parse(e.data))); } catch { /* malformed payload - skip */ }
+        try { registerFromEvent(JSON.parse(e.data)); } catch { /* malformed payload - skip */ }
       });
       es.onerror = () => {
         // SSE dropped (backend down, proxy issue, etc.) - degrade to polling

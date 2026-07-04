@@ -3,23 +3,25 @@
 // `return true`, a `// In a real environment we would...` comment) with a
 // real boot of the app stack against a scratch DB on ephemeral ports.
 //
-// Scope note on "mount the new tile": the live frontend's hot-install path
-// (frontend/src/lib/useModuleStream.js -> moduleRegistry.js) only ever
-// carries a minimal {id, name, version, icon} manifest through the real
-// `module.installed` SSE event - not the full entityTypes/views manifest
-// from modules/<id>/module.js (InstalledModulePage.jsx renders hot-installed
-// modules as a flat GenericList, not the multi-view ModuleManifestPage; only
-// the 14 static day-1 modules get that treatment). So "mount the new tile,
-// assert the module-mounted:<id> ready event fires, assert 0 console/page
-// errors" is exercised end-to-end for real; per-view DOM assertions aren't
-// (there's no live view system for hot-installed modules yet to assert
-// against - that's frontend work beyond this issue's scope, matching #74's
-// note that Validator 1 also doesn't assert everything §4's prose lists).
+// Scope note (issue #121, docs/SELF-EXTENSION-V2.md §6): the hot-install
+// path now persists the real object-shaped manifest (module.js's own
+// osRegisterModule({...}) argument) as a `module='system'`,
+// `type='module_manifest'` entity (server/lib/manifestEntity.js), and
+// InstalledModulePage.jsx mounts the full multi-view ModuleManifestPage for
+// it instead of degrading to a flat GenericList. So this validator now
+// asserts, end-to-end against the real app: 0 console/page errors, the
+// `module-mounted:<id>` ready event fires, AND - when `opts.modulePath` is
+// given - every view the manifest declares actually mounts a DOM node
+// (`[data-view-tab="<id>"]` / `[data-view-id="<id>"]`, ModuleManifestPage.jsx).
+// The previously-flagged scope gap ("no live per-view render path for a
+// hot-installed module to assert against") is closed.
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { getEphemeralPort, launchApi as defaultLaunchApi, launchFrontend as defaultLaunchFrontend } from "../lib/appBoot.js";
+import { loadManifestFromFile } from "../lib/loadManifest.js";
+import { persistManifestEntity as defaultPersistManifestEntity } from "../lib/manifestEntity.js";
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 const MOUNT_TIMEOUT_MS = 10000;
@@ -30,7 +32,7 @@ async function runOnce(moduleId, manifest, opts) {
   const launchApi = opts.launchApi ?? defaultLaunchApi;
   const launchFrontend = opts.launchFrontend ?? defaultLaunchFrontend;
   const openBrowser = opts.openBrowser ?? (() => chromium.launch());
-
+  const persistManifestEntity = opts.persistManifestEntity ?? defaultPersistManifestEntity;
   const dbDir = await fs.mkdtemp(path.join(os.tmpdir(), "lifeos-render-smoke-"));
   const apiPort = await getEphemeralPort();
   const frontendPort = await getEphemeralPort();
@@ -43,8 +45,24 @@ async function runOnce(moduleId, manifest, opts) {
   const jsErrors = [];
 
   try {
+    // `opts.modulePath` points at the real module.js still sitting in the
+    // scaffold worktree (scaffold.js calls this before removeWorktree) - its
+    // object-shaped entityTypes/views is what ModuleManifestPage.jsx actually
+    // renders, unlike the array-shaped structured-output `manifest` param.
+    // Falls back to `manifest` itself (whatever shape/fields the caller
+    // passed) when no modulePath is given, e.g. this file's own unit tests.
+    const fullManifest = opts.modulePath ? await loadManifestFromFile(opts.modulePath) : manifest;
+    const views = fullManifest?.views ?? [];
+
     api = await launchApi({ repoRoot, dbDir, port: apiPort });
     frontend = await launchFrontend({ repoRoot, apiUrl: api.url, port: frontendPort });
+
+    // Seeds the manifest entity the frontend fetches on `module.installed`
+    // (frontend/src/lib/manifestApi.js's fetchInstalledManifest) - same
+    // entity write route/upsert-by-title convention as scaffold.js's real
+    // install path (server/lib/manifestEntity.js), so this validator
+    // exercises the exact mechanism a live install uses.
+    await persistManifestEntity(api.url, moduleId, fullManifest);
 
     browser = await openBrowser();
     context = await browser.newContext();
@@ -117,6 +135,21 @@ async function runOnce(moduleId, manifest, opts) {
     }
     if (winner === "timeout") {
       throw new Error(`module-mounted:${moduleId} did not fire within ${MOUNT_TIMEOUT_MS}ms`);
+    }
+
+    // Per-view assertion (issue #121): every declared view must actually
+    // mount a node when its tab is clicked - closes the scope gap this
+    // file's header used to flag. A module with no views (shouldn't happen
+    // post-structural-validation, docs/SELF-EXTENSION.md §4) skips the loop.
+    for (const declaredView of views) {
+      await page.click(`[data-view-tab="${declaredView.id}"]`, { timeout: MOUNT_TIMEOUT_MS });
+      // `state: "attached"` (not the default "visible") - the assertion is
+      // "this view's node exists in the DOM", not that it has a non-empty
+      // layout box, which an otherwise-correct empty view container can lack.
+      await page.waitForSelector(`[data-view-id="${declaredView.id}"]`, { timeout: MOUNT_TIMEOUT_MS, state: "attached" });
+      if (jsErrors.length > 0) {
+        throw new Error(`console/page errors during render: ${jsErrors.join("; ")}`);
+      }
     }
 
     return { valid: true, errors: [] };

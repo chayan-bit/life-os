@@ -18,10 +18,13 @@ import { buildSandboxConfig } from "./lib/sandbox.js";
 import { createPreToolUseHook } from "./lib/preToolUseHook.js";
 import { slugify } from "./lib/slugify.js";
 import { commitAndMerge, createWorktree, removeWorktree } from "./lib/worktree.js";
+import { loadManifestFromFile } from "./lib/loadManifest.js";
+import { persistManifestEntity as defaultPersistManifestEntity } from "./lib/manifestEntity.js";
 import { validateStructural } from "./validators/structural.js";
 import { validateRenderSmoke as defaultValidateRenderSmoke } from "./validators/render.js";
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dirname, "..");
+const DEFAULT_API_BASE = process.env.LIFEOS_API_URL || "http://127.0.0.1:8080";
 
 // Layer A (docs/SELF-EXTENSION.md §2) - the primary gate. `dontAsk` denies
 // anything not pre-approved instead of prompting, which is what makes this
@@ -96,6 +99,8 @@ export async function scaffoldModule(prompt, workspaceId, opts = {}) {
   const repoRoot = opts.repoRoot ?? DEFAULT_REPO_ROOT;
   const queryFn = opts.queryFn ?? defaultQuery;
   const validateRenderSmoke = opts.validateRenderSmoke ?? defaultValidateRenderSmoke;
+  const persistManifestEntity = opts.persistManifestEntity ?? defaultPersistManifestEntity;
+  const apiBase = opts.apiBase ?? DEFAULT_API_BASE;
 
   const moduleId = slugify(prompt);
   const { worktreePath, branch } = await createWorktree(repoRoot, moduleId);
@@ -144,12 +149,31 @@ export async function scaffoldModule(prompt, workspaceId, opts = {}) {
       throw new Error(`Structural validation failed: ${structural.errors.join("; ")}`);
     }
 
+    const modulePath = path.join(targetModuleDir, "module.js");
+
+    // Persists the real object-shaped manifest (module.js's own
+    // osRegisterModule({...}) argument - the same shape the 14 static day-1
+    // modules use, not the array-shaped structured-output summary above) as
+    // a generic entity so the frontend can render the full multi-view
+    // ModuleManifestPage for this hot-installed module instead of degrading
+    // to a flat GenericList (issue #121, docs/SELF-EXTENSION-V2.md §6).
+    // Best-effort only: a persistence failure must not fail the install -
+    // the GenericList fallback still works without it.
+    try {
+      const fileManifest = await loadManifestFromFile(modulePath);
+      await persistManifestEntity(apiBase, moduleId, fileManifest, { workspaceId });
+    } catch (error) {
+      console.warn(`[scaffold] failed to persist module_manifest entity for '${moduleId}': ${error.message}`);
+    }
+
     // Validator 2 (§4, issue #75) - boots the real app stack (its own
     // default repoRoot, not the worktree/scratch `repoRoot` above: the
-    // frontend build and lifeos-api binary only exist in the real checkout,
-    // and the check only needs `moduleId` + the manifest's `name`, not any
-    // worktree-specific file - see server/validators/render.js's header).
-    const render = await validateRenderSmoke(moduleId, manifest);
+    // frontend build and lifeos-api binary only exist in the real checkout).
+    // `modulePath` still points into this worktree (removed only after this
+    // validator + commitAndMerge below both succeed), so render.js can load
+    // the real manifest to seed the manifest entity and assert every
+    // declared view mounts a node (issue #121).
+    const render = await validateRenderSmoke(moduleId, manifest, { modulePath });
     if (!render.valid) {
       throw new Error(`Render smoke validation failed: ${render.errors.join("; ")}`);
     }
