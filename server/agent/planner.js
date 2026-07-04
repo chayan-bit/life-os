@@ -3,6 +3,7 @@
 // call emits an ordered plan, persisted as a pipeline-style DAG entity (reusing
 // the lifeos-pipelines StageSpec shape, NOT a new table).
 import { z } from "zod";
+import { emptyUsage, foldUsage } from "./usage.js";
 
 const MIN_MULTI_IMPERATIVES = 2;
 const MIN_SOLO_IMPERATIVES = 3;
@@ -81,23 +82,18 @@ export async function generatePlan(goal, worldSnapshot, ctx) {
     ...(ctx.model ? { model: ctx.model } : {}),
   };
   let structured = null;
-  let tokens = 0;
+  let usage = emptyUsage();
   for await (const message of ctx.queryFn({ prompt: buildPlanPrompt(goal, worldSnapshot), options })) {
     if (message.type === "result") {
       structured = message.structured_output;
-      tokens += usageTokens(message.usage);
+      usage = foldUsage(usage, message.usage);
     }
   }
   const parsed = PlanSchema.safeParse(structured);
   if (!parsed.success) {
     throw new Error(`planner structured output invalid: ${parsed.error.message}`);
   }
-  return { plan: parsed.data, tokens };
-}
-
-function usageTokens(usage) {
-  if (!usage) return 0;
-  return (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);
+  return { plan: parsed.data, tokens: usage.tokensIn + usage.tokensOut, ...usage };
 }
 
 // Persists the plan as a pipeline_run entity (reuses the pipeline DAG shape).

@@ -97,6 +97,37 @@ No new flight recorder. The `events` table already doubles as the harness run-lo
 - **Eval + Gate** - deliberate agent turns are a natural `gate:"eval"` boundary (sampled Haiku judge, content-cached, [HARNESS-LOOP.md](./HARNESS-LOOP.md) §2).
 - **Replay** - a turn's `plan` + `tool_calls` reconstruct exactly what it did, the same auditability the Agent Control Plane's action ledger gives at the data layer.
 
+**Implemented (issue #125):** `server/agent/loop.js`'s `persistTurn` now
+additionally stamps the run-log lens fields `lifeos-pipelines::emit_run_event`
+already writes for pipeline stages - `tier:"mac"`, `tokens_in`/`tokens_out`
+(split per stage via the new `server/agent/usage.js` accumulator, replacing
+three duplicated `usageTokens` helpers in
+`planner.js`/`critic.js`/`executor.js`), `gated` (`1` iff the turn ends
+`awaiting_approval`), and `error` (the caught exception message, or `null`)
+- all as **top-level** `/api/event` columns, not nested in `attrs`, so
+`GET /api/metrics` (`services/lifeos-api/src/routes/metrics.rs`) counts
+and sums them with **no Rust change**: its aggregation SQL already runs
+over the whole `events` table regardless of `type`. A deliberate turn
+(had a plan, finished `completed`) also stamps `attrs.stage:"eval"` - the
+exact field `events_by_phase` already reads via
+`json_extract(attrs, '$.stage')` - so agent turns slot into the same
+phase lens pipeline stages do and become selectable as the natural eval
+boundary. **Scope note:** actually invoking the sampled Haiku judge on
+that boundary stays out of scope here (wiring only, per the issue) -
+today `eval_gate::judge_stage_output` is only called inline from
+`lifeos-pipelines::process_pipeline_job`'s Rust stage runner; there is no
+HTTP surface or batch consumer that scores arbitrary `events` rows yet. A
+future issue would add one keyed on
+`type='agent.turn' AND json_extract(attrs,'$.stage')='eval'`.
+`server/scripts/replayTurn.js` (`node server/scripts/replayTurn.js
+<run_id>`) is the read-only replay inspector: fetches the one
+`agent.turn` row via `GET /api/event?run_id=...&type=agent.turn` and
+renders goal/plan/tool-calls/outcome/tokens step-by-step
+(`formatTurnReplay`, exported separately from the CLI wrapper, is a pure
+function over the event row - never re-executes a tool call). Tests:
+`server/test/agent.test.js` (Observe stamps, exactly-one-event-on-refine)
+and `server/test/replayTurn.test.js` (formatter + not-found path).
+
 ---
 
 ## 8. Safety - the loop invents no new authority

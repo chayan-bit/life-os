@@ -154,6 +154,58 @@ describe("runAgentTurn - forbidden refusal", () => {
   });
 });
 
+describe("runAgentTurn - agent.turn Observe stamps (#125)", () => {
+  it("stamps tier/tokens_in/tokens_out/gated/error on a completed deliberate turn, marked as an eval boundary", async () => {
+    const httpFn = makeHttp();
+    const queryFn = makeQueryFn({
+      plan: { stages: [{ name: "find", tool: "entity.list", description: "find overdue tasks" }] },
+      toolCalls: [{ tool: "entity.list", args: { module: "tasks" } }],
+      text: "done",
+    });
+
+    await runAgentTurn("find my overdue tasks, tag them urgent, and draft a summary", "ws_test", { queryFn, httpFn });
+
+    const turn = turnEvents(httpFn, "agent.turn")[0].body;
+    expect(turn.tier).toBe("mac");
+    expect(turn.tokens_in).toBeGreaterThan(0);
+    expect(turn.tokens_out).toBeGreaterThan(0);
+    expect(turn.gated).toBe(0);
+    expect(turn.error).toBeNull();
+    // A deliberate (planned) completed turn is the natural eval boundary.
+    expect(turn.attrs.stage).toBe("eval");
+  });
+
+  it("stamps gated:1 on a turn that ends awaiting_approval, with no eval-boundary stamp", async () => {
+    const httpFn = makeHttp();
+    const queryFn = makeQueryFn({
+      toolCalls: [{ tool: "draft.create", args: { module: "social", type: "post", attrs: { text: "launch!" } } }],
+      text: "drafted",
+    });
+
+    await runAgentTurn("draft a tweet about the launch", "ws_test", { queryFn, httpFn });
+
+    const turn = turnEvents(httpFn, "agent.turn")[0].body;
+    expect(turn.gated).toBe(1);
+    expect(turn.outcome).toBe("awaiting_approval");
+    expect(turn.attrs.stage).toBeNull();
+  });
+
+  it("writes exactly one agent.turn event even when the refine round fires", async () => {
+    const httpFn = makeHttp();
+    const queryFn = makeQueryFn({
+      verify: { ok: false, issue: "too short", fixable: true },
+      text: "revised answer",
+    });
+
+    const result = await runAgentTurn("what is the CAP theorem?", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    const turns = turnEvents(httpFn, "agent.turn");
+    expect(turns).toHaveLength(1);
+    expect(turns[0].body.attrs.refined).toBe(true);
+  });
+});
+
 describe("runAgentTurn - gated enqueue", () => {
   it("writes a pending_approval draft and does not execute the outward effect", async () => {
     const httpFn = makeHttp();

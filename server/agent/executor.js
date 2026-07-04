@@ -6,6 +6,7 @@
 // touch the closed action registry.
 import { tool as sdkTool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { REGISTRY, classify } from "./actionRegistry.js";
+import { emptyUsage, foldUsage } from "./usage.js";
 
 export const MAX_STEPS = 8;
 const MCP_SERVER_NAME = "lifeos";
@@ -141,11 +142,6 @@ function buildSdkTools(ctx) {
   });
 }
 
-function usageTokens(usage) {
-  if (!usage) return 0;
-  return (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);
-}
-
 function buildExecutePrompt(goal, worldSnapshot, plan, refineIssue) {
   const parts = [
     "You operate Life OS through the provided tools only. Reads are free; gated tools are drafted for human approval, never executed outward. Refuse nothing silently.",
@@ -158,7 +154,8 @@ function buildExecutePrompt(goal, worldSnapshot, plan, refineIssue) {
 }
 
 // Runs one execute pass. Shares `ctx` (ledger, step counter, pendingApprovals)
-// so a refine pass continues the same budget. Returns { text, tokens }.
+// so a refine pass continues the same budget. Returns
+// { text, tokens, tokensIn, tokensOut }.
 export async function runExecute(goal, worldSnapshot, plan, ctx, refineIssue = null) {
   const tools = buildSdkTools(ctx);
   const mcp = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools });
@@ -176,12 +173,12 @@ export async function runExecute(goal, worldSnapshot, plan, ctx, refineIssue = n
   };
 
   let text = "";
-  let tokens = 0;
+  let usage = emptyUsage();
   for await (const message of ctx.queryFn({ prompt: buildExecutePrompt(goal, worldSnapshot, plan, refineIssue), options })) {
     if (message.type === "result") {
       if (typeof message.result === "string") text = message.result;
-      tokens += usageTokens(message.usage);
+      usage = foldUsage(usage, message.usage);
     }
   }
-  return { text, tokens };
+  return { text, tokens: usage.tokensIn + usage.tokensOut, ...usage };
 }

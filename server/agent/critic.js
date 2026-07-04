@@ -2,6 +2,7 @@
 // judges the execute result against the goal. A single real, fixable issue
 // triggers EXACTLY ONE refine round - bounded, never an open loop.
 import { z } from "zod";
+import { emptyUsage, foldUsage } from "./usage.js";
 
 export const CritiqueSchema = z.object({
   ok: z.boolean(),
@@ -19,11 +20,6 @@ export const critiqueJsonSchema = {
     fixable: { type: "boolean" },
   },
 };
-
-function usageTokens(usage) {
-  if (!usage) return 0;
-  return (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);
-}
 
 function buildCritiquePrompt(goal, resultText) {
   return [
@@ -43,16 +39,17 @@ export async function critique(goal, resultText, ctx) {
     ...(ctx.model ? { model: ctx.model } : {}),
   };
   let structured = null;
-  let tokens = 0;
+  let usage = emptyUsage();
   for await (const message of ctx.queryFn({ prompt: buildCritiquePrompt(goal, resultText), options })) {
     if (message.type === "result") {
       structured = message.structured_output;
-      tokens += usageTokens(message.usage);
+      usage = foldUsage(usage, message.usage);
     }
   }
+  const tokens = usage.tokensIn + usage.tokensOut;
   const parsed = CritiqueSchema.safeParse(structured);
   if (!parsed.success) {
-    return { critique: { ok: true, issue: null, fixable: false }, tokens };
+    return { critique: { ok: true, issue: null, fixable: false }, tokens, ...usage };
   }
-  return { critique: parsed.data, tokens };
+  return { critique: parsed.data, tokens, ...usage };
 }
