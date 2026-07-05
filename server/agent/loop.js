@@ -105,7 +105,8 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
   // 1. Gate - fail closed before any model call.
   const gate = await checkGate(ctx);
   if (!gate.ok) {
-    return { success: false, runId, outcome: gate.reason, error: gate.reason };
+    const text = gate.reason === "kill_switch" ? "Agent paused: the kill switch is on for this workspace." : null;
+    return { success: false, runId, outcome: gate.reason, error: gate.reason, ...(text ? { text } : {}) };
   }
 
   try {
@@ -116,7 +117,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     const worldSnapshot = await buildWorldSnapshot(ctx);
     const memory = await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt);
     ctx.memoryInjected = Boolean(memory.block);
-    const context = memory.block ? `${worldSnapshot}\n\n${memory.block}` : worldSnapshot;
+    const context = [worldSnapshot, memory.block].filter(Boolean).join("\n\n");
 
     // 3. Plan (conditional). Tracks tokensIn/tokensOut separately (not just
     // the combined `tokens`) for the run-log lens's tokens_in/tokens_out

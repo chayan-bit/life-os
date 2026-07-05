@@ -2,6 +2,8 @@
 // any model call: honors a per-workspace kill switch and a daily token budget,
 // and fails closed (refuses) on ANY error evaluating the gate - the same
 // discipline as broker-guard. No model tokens are ever spent past a refusal.
+// Both refusal paths (kill switch, budget) escalate an append-only event
+// best-effort, so a paused/exhausted agent is visible in Observe, not silent.
 
 // Named constants - no magic numbers.
 export const DEFAULT_DAILY_TOKEN_BUDGET = 2_000_000;
@@ -67,6 +69,18 @@ export async function checkGate(ctx) {
   }
 
   if (config.killSwitch) {
+    // Escalate: same append-only visibility as agent.budget_exhausted below,
+    // so a paused agent shows up in Observe rather than silently going quiet.
+    try {
+      await httpFn("POST", "/api/event", {
+        type: "agent.paused",
+        actor: "agent",
+        attrs: { reason: "kill_switch" },
+        workspace_id: workspaceId,
+      });
+    } catch {
+      // Escalation is best-effort; the refusal below still stands.
+    }
     return { ok: false, reason: "kill_switch" };
   }
 

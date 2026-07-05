@@ -172,6 +172,37 @@ Two cheap, high-value guards the loop assumes in §3 but that deserve to be expl
 - **World-model snapshot.** Step 2 assembles a compact situational block from a single read over `entities` (open tasks / trades / drafts / pending jobs / due follow-ups / approvals for the workspace) and injects it every turn, so the agent never re-asks for context it could compute. This is a read, not a new store - the same `events`/`entities` source [Observe](./HARNESS-LOOP.md) §3 and the per-module dashboards already use, a different lens.
 - **Kill-switch + spend cap as fail-closed gates.** A per-workspace `config` kill-switch and a daily token/spend ceiling (the [Observe](./HARNESS-LOOP.md) §3 meter) are checked *before every model call* and fail closed to "stop and ask" - the same discipline as `broker-guard`. This bounds a runaway loop in cost, not just in steps.
 
+**Implemented (issue #126, delta on top of #122/#125's guards):** `server/agent/gate.js`'s
+kill-switch and daily-token-budget checks, and `agent.turn`'s tier/tokens/gated Observe stamps,
+were already shipped by #122/#125 (see §4/§5/§7). This issue closed the remaining two gaps:
+- `server/agent/worldSnapshot.js`'s `buildWorldSnapshot` grew from a two-count stub into the
+  full snapshot - open tasks, open trades, drafts/pending approvals, pending jobs, and tasks
+  due today-or-overdue - via four parallel bounded reads (`GET /api/entity?module=tasks`,
+  `GET /api/entity?module=trading&type=trade`, `GET /api/entity?status=pending_approval`,
+  `GET /api/jobs?status=pending`), each capped at `LIST_LIMIT` rows. "Drafts" and "pending
+  approvals" collapse to one query in this schema: `draft.create` (`server/agent/actionRegistry.js`,
+  the only gated write) is what sets `status='pending_approval'`, on any module - there is no
+  separate universal draft type to query, so inventing a second one would double-count, not add
+  signal. "Due follow-ups" reuses the `/today` bot command's own convention
+  (`attrs.due` on the `tasks` module, [MODULES.md](./MODULES.md) §2.2) rather than a
+  non-existent follow-up entity type. "Open trades" reads the trade schema's own
+  `attrs.closed_at` ([MODULES.md](./MODULES.md) §2.4) since trades have no separate lifecycle
+  status convention. The snapshot is failure-tolerant at two levels: if every read fails
+  outright it returns `null` and `loop.js` omits the block entirely (the turn still proceeds -
+  this is context, not a gate); if only some reads fail, the rest still render and the failed
+  categories degrade to `0` rather than losing the whole block over one flaky route.
+- `server/agent/gate.js`'s kill-switch refusal now also appends an `events('agent.paused')` row,
+  best-effort, mirroring the `agent.budget_exhausted` escalation already next to it - so a
+  paused agent shows up in Observe instead of just going quiet. `loop.js`'s refusal response
+  also carries a `text: "Agent paused: the kill switch is on for this workspace."` field for
+  the kill-switch case specifically, on top of the existing `outcome`/`error` reason codes.
+  Tests: `server/test/worldSnapshot.test.js` (per-category assembly, JSON-string attrs,
+  total-failure -> `null`, partial-failure -> degraded zero) and `server/test/agent.test.js`
+  (`agent.paused` emission, best-effort on escalation-write failure, snapshot injected into the
+  execute prompt, snapshot omitted without a stray `"null"` when every read fails, and both the
+  kill-switch and `gate_unavailable` guards proven to block before `queryFn` or any world-snapshot
+  route is ever touched).
+
 ## 12. Retrieval quality - corrective-RAG + honest abstention
 
 `services/lifeos-memory/gate.rs` already has a self-RAG gate + multi-hop detector - the seed of a corrective loop, not the whole thing. Upgrade it to the full cycle for question-answering turns: **grade** the retrieved context for sufficiency → on weak grade, **rewrite** the query and **re-retrieve** (activation recall again) → still weak, **fall back to web/proxy** read (wrapped untrusted) → answer **with citations** to the entities/segments used. Pair it with a **calibrated confidence signal**: a genuinely low-confidence turn **abstains and asks a clarifying question** instead of emitting a confident guess - the single cheapest defense against hallucinated actuation, and a natural fit with the verify pass (§3 step 5).

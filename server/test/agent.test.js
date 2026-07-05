@@ -282,6 +282,139 @@ describe("runAgentTurn - kill switch", () => {
 
     expect(result.success).toBe(false);
     expect(result.outcome).toBe("kill_switch");
+    expect(result.text).toMatch(/paused/i);
     expect(queryFn).not.toHaveBeenCalled();
+  });
+
+  it("emits agent.paused best-effort so a pause is visible in Observe", async () => {
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.includes("/api/entity/agent_config_"),
+        reply: () => ({ ok: true, status: 200, data: { attrs: { killSwitch: true } } }),
+      },
+    ]);
+    const queryFn = makeQueryFn({ toolCalls: [{ tool: "entity.list" }] });
+
+    await runAgentTurn("do anything", "ws_test", { queryFn, httpFn });
+
+    expect(turnEvents(httpFn, "agent.paused")).toHaveLength(1);
+    expect(turnEvents(httpFn, "agent.paused")[0].body.attrs).toEqual({ reason: "kill_switch" });
+  });
+
+  it("still refuses and never calls the model even if the agent.paused escalation write fails", async () => {
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.includes("/api/entity/agent_config_"),
+        reply: () => ({ ok: true, status: 200, data: { attrs: { killSwitch: true } } }),
+      },
+      {
+        match: (m, p) => m === "POST" && p === "/api/event",
+        reply: () => {
+          throw new Error("events route down");
+        },
+      },
+    ]);
+    const queryFn = makeQueryFn({ toolCalls: [{ tool: "entity.list" }] });
+
+    const result = await runAgentTurn("do anything", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(false);
+    expect(result.outcome).toBe("kill_switch");
+    expect(queryFn).not.toHaveBeenCalled();
+  });
+});
+
+describe("runAgentTurn - world snapshot injection", () => {
+  // A prompt-capturing variant of makeQueryFn (mirrors memoryContext.test.js)
+  // so we can assert on what the execute stage actually saw.
+  function makeQueryFnCapturingPrompts(script = {}) {
+    const prompts = [];
+    const queryFn = vi.fn(async function* ({ prompt, options }) {
+      prompts.push(prompt);
+      if (options.purpose === "plan") {
+        yield {
+          type: "result",
+          structured_output: script.plan ?? { stages: [{ name: "step", tool: null, description: "do it" }] },
+          usage: { input_tokens: 5, output_tokens: 5 },
+        };
+        return;
+      }
+      if (options.purpose === "verify") {
+        yield {
+          type: "result",
+          structured_output: script.verify ?? { ok: true, issue: null, fixable: false },
+          usage: { input_tokens: 3, output_tokens: 3 },
+        };
+        return;
+      }
+      yield { type: "result", result: script.text ?? "done", usage: { input_tokens: 10, output_tokens: 8 } };
+    });
+    queryFn.prompts = prompts;
+    return queryFn;
+  }
+
+  it("injects the world snapshot block into the execute prompt", async () => {
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.includes("module=tasks"),
+        reply: () => ({ ok: true, status: 200, data: [{ id: "t1", status: "open", attrs: {} }] }),
+      },
+    ]);
+    const queryFn = makeQueryFnCapturingPrompts({ text: "done" });
+
+    const result = await runAgentTurn("what's on my plate?", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    expect(queryFn.prompts.some((p) => p.includes("World snapshot"))).toBe(true);
+    expect(queryFn.prompts.some((p) => p.includes("open tasks: 1"))).toBe(true);
+  });
+
+  it("proceeds without a snapshot block when every snapshot read fails", async () => {
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && (p.includes("module=tasks") || p.includes("module=trading") || p.includes("status=pending_approval") || p.includes("/api/jobs")),
+        reply: () => {
+          throw new Error("entity route down");
+        },
+      },
+    ]);
+    const queryFn = makeQueryFnCapturingPrompts({ text: "done anyway" });
+
+    const result = await runAgentTurn("what's on my plate?", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    expect(result.outcome).toBe("completed");
+    expect(queryFn.prompts.some((p) => p.includes("World snapshot"))).toBe(false);
+    expect(queryFn.prompts.some((p) => p.includes("null"))).toBe(false);
+  });
+});
+
+describe("runAgentTurn - both guards block before any queryFn call", () => {
+  it("gate_unavailable and kill_switch both refuse before the model or any tool route is touched", async () => {
+    const unavailableHttp = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.includes("/api/entity/agent_config_"),
+        reply: () => {
+          throw new Error("connection refused");
+        },
+      },
+    ]);
+    const killSwitchHttp = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.includes("/api/entity/agent_config_"),
+        reply: () => ({ ok: true, status: 200, data: { attrs: { killSwitch: true } } }),
+      },
+    ]);
+    const queryFn = makeQueryFn({ toolCalls: [{ tool: "entity.list" }] });
+
+    const unavailableResult = await runAgentTurn("do anything", "ws_test", { queryFn, httpFn: unavailableHttp });
+    const killSwitchResult = await runAgentTurn("do anything", "ws_test", { queryFn, httpFn: killSwitchHttp });
+
+    expect(unavailableResult.outcome).toBe("gate_unavailable");
+    expect(killSwitchResult.outcome).toBe("kill_switch");
+    expect(queryFn).not.toHaveBeenCalled();
+    // Neither the world snapshot nor any tool/entity route ran past the gate.
+    expect(unavailableHttp.calls.some((c) => c.path.includes("module=tasks"))).toBe(false);
+    expect(killSwitchHttp.calls.some((c) => c.path.includes("module=tasks"))).toBe(false);
   });
 });
