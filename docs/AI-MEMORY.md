@@ -88,11 +88,21 @@ The derived DB stays a physically separate, never-synced file (libSQL has no tab
 
 ```
 A(m) = relevance(m,q) · recency(m) · importance(m) · frequency(m)
-relevance = RRF( vector_rank , bm25_rank , entity_match_rank )   -- hybrid, not vector-only
-recency   = exp(-λ · Δt)                                         -- ACT-R decay (λ ≈ 0.995/hr)
-frequency = log(1 + access_count)                                -- ACT-R base-level activation
-importance= salience scored once at write time (cheap)           -- not per-read
+relevance = RRF( vector_rank , bm25_rank , entity_match_rank , like_rank )  -- hybrid, not vector-only
+recency   = decay_per_hour ^ Δhours                              -- ACT-R decay (decay_per_hour ≈ 0.995/hr, Δhours from now or as_of)
+frequency = 1.0 + ln(1 + access_count)                           -- ACT-R base-level activation, +1.0 offset so a never-accessed memory still scores
+importance= max(0.05, salience scored once at write time)        -- not per-read; a 0.05 floor so a low-salience memory can never zero out A(m)
 ```
+
+The exact parameterization the implementation uses (`retrieval.rs::score_candidates`):
+`recency` is `decay_per_hour.powf(Δhours)` where `Δhours = max(0, reference - ts) / 3600` and `reference` is `now` for current-truth recall or `as_of` for point-in-time recall.
+`frequency` carries a `+1.0` offset (`1.0 + ln(1 + access_count)`) so a memory that has never been recalled still contributes a factor of `1.0` rather than `0.0`.
+`importance` is floored at `0.05` (`importance.max(0.05)`) so even the least-salient memory keeps a non-zero activation and can still surface when relevance and recency are strong.
+
+**Vector lane wiring (env-gated):** the semantic ANN lane is a `VectorSearcher` the API injects, because vec0/sqlite-vec is owned by `memvec.py` and is not loadable from the Rust libSQL build.
+When `LIFEOS_MEMVEC` is set, `lifeos-api` wires a subprocess-backed `MemvecSearcher` (the same shared seam `/api/search` uses); when it is unset, or the subprocess is missing/fails/times out, recall degrades to the lexical lanes (`NoopVectorSearcher`) and never errors.
+Memory-node vectors are partitioned from entity vectors by a `mem:<ws>` workspace label, so the memory lane only ever returns `mn_*` ids and `/api/search` only ever returns entity ids.
+Memory nodes are embedded best-effort at recall/ingest time (`embed_new_nodes`), tracked in the never-synced derived DB (`d.memory_embedded`); because node ids are content-deterministic, an embedding stays valid across a rebuild and never needs invalidating.
 
 Pipeline per query:
 1. **Query reformulation** (one cheap LLM call): rewrite the turn into "what would a relevant memory look like?" before scoring.
@@ -119,8 +129,11 @@ Jobs (Tokio async on the Mac; triggered on idle + an accumulated-importance thre
 - `segment_episodes`: cut the raw event stream at **cognitive episode boundaries** (topic shift / task done), not per message - episode-aligned units retrieve better (ES-Mem).
 - `consolidate`: episodes -> episode summaries; summaries -> semantic facts; weekly -> reflections (multi-resolution).
 - `score_importance` + `score_surprise`: salience at write time; **Novel:** flag low-similarity outliers (surprising/contradicting memories) as high-importance, slow-decay, and trigger reconciliation.
-- `decay_sweep`: nightly ranking recompute (no LLM).
+- `decay_sweep`: nightly ranking recompute (no LLM); it also runs the cold-tier sweep (§7) on the same cadence, actually tiering a bounded batch of cold nodes out to storage when a backend is available, not merely counting them.
 - `supersede_detector`: turn UPDATE-type events into `t_invalid` on the old edge + a supersede pointer.
+
+The sleep cycle takes the workspace's primary storage backend as an optional argument.
+When it is present, the decay sweep tiers cold nodes out on cadence (bounded to `TIER_BATCH_MAX` per cycle, same thresholds as the manual `POST /api/memory/tier`); when it is `None`, the sweep records an honest `memory.tier.skipped` ledger note and only counts, so a deployment with no backend degrades cleanly rather than erroring.
 
 **The unsolved field problem is summarization drift** (rare-but-important details silently dropped) and **reflection self-reinforcement** (a consolidation error propagating with no ground truth).
 Life OS's mitigation is structural and not implemented by any current system: **raw events are never deleted, every summary carries `source_event_ids` + a `confidence`/source-count**, so a bad consolidation is auditable and correctable by recompute.
@@ -150,6 +163,9 @@ Auditability is sacred, so nothing is hard-deleted.
   Retrieval never returns `t_invalid < now` facts as current truth, but a point-in-time query can still ask "what was true in March?".
   This is the mechanism that fixes temporal reasoning - the field's hardest axis (even GPT-4o-class systems score ~49% on it with decay alone).
 - **Tiered storage:** cold, low-activation events/blobs migrate to the user's [storage backend](./STORAGE-BACKENDS.md) (warm index stays in the derived DB); promote-on-access.
+  Tiering runs automatically on the sleep cadence (§5), not only via the manual endpoint: `tier_out_cold` bundles cold node content to a content-addressed blob and replaces each node's row content with a 64-char stub + `tiered_ref`, keeping the row, its scores, and its provenance intact.
+  Crucially it leaves the derived FTS mirror (`d.memory_idx`) holding the FULL text, so a tiered node's distinctive terms - even ones past the stub - still match on the lexical lane and recall still surfaces it; the FTS index is derived and local, so retaining full text there does not defeat tiering (the storage win is moving the canonical blob, not shrinking the disposable index).
+  On recall, promote-on-access then restores the full content from the backend and clears `tiered_ref`, and the restored text is reflected in that same recall response, not just persisted for next time.
 
 ---
 

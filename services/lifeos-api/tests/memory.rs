@@ -427,6 +427,57 @@ async fn recall_degrades_cleanly_without_the_vector_lane() {
     assert!(contents.iter().any(|c| c.contains("release loop")), "{contents:?}");
 }
 
+/// Audit #3: a tiered node whose distinctive term sits PAST the 64-char stub is
+/// still recalled (the derived FTS mirror keeps full text after tier-out), and
+/// promote-on-access restores the full content INTO the recall response - the
+/// previously-untested promote seam, end-to-end over HTTP.
+#[tokio::test]
+async fn tiered_node_is_recalled_by_a_deep_term_and_promoted_in_the_response() {
+    let app = test_app().await;
+    let t0 = now_secs();
+    // The stub is the first 64 chars of "[terminal] observation.captured: <text>";
+    // "zzdistinctzz" sits well past that, so only the retained FTS full text can
+    // match it once the node is tiered.
+    ingest(
+        &app.router,
+        "terminal",
+        None,
+        "the quick brown fox jumped lazily then zzdistinctzz appeared here",
+    )
+    .await;
+    // Age the note past the 30-day cold threshold so the tier sweep takes it.
+    // The node's ts is stamped at projection time, so backdate the events then
+    // rebuild to re-project the node with the aged timestamp.
+    let backdate = 40 * 86400;
+    backdate_events(&app.db_path, backdate).await;
+    let (st, _) = send(&app.router, "POST", "/api/memory/rebuild", None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Tier it out to the (local-fs) backend.
+    let (st, tier) = send(&app.router, "POST", "/api/memory/tier", None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK, "{tier:?}");
+    assert!(tier["tiered"].as_i64().unwrap() >= 1, "{tier:?}");
+
+    // Point-in-time recall just after the note was created: recency is high
+    // enough to clear abstention (a cold node's decayed recency wouldn't), so
+    // the tiered node surfaces via the retained FTS full text.
+    let as_of = t0 - backdate + 3600;
+    let (st, body) = send(
+        &app.router, "POST", "/api/memory/recall", None,
+        Some(json!({"query": "what did zzdistinctzz do?", "no_gate": true, "as_of": as_of})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["outcome"], "recalled", "tiered node must still be recallable: {body:?}");
+    let hit = recalled(&body)
+        .into_iter()
+        .find(|(_, c, _)| c.contains("zzdistinctzz"))
+        .expect("the deep term must resolve to the tiered node");
+    // Promote-on-access restored the full text INTO this response (not the stub).
+    assert!(hit.1.contains("quick brown fox"), "promoted full content missing: {}", hit.1);
+    assert!(!hit.1.contains("[tiered]"), "response still shows the stub: {}", hit.1);
+}
+
 /// Issue #139 (GraphRAG global queries, docs/AGENT-CORE.md §13): the sleep
 /// cycle rebuilds a community map over two clusters, `/api/memory/network`
 /// lists both with non-empty summaries, and `/api/memory/network/ask` ranks

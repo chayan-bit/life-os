@@ -286,8 +286,13 @@ pub async fn sleep_handler(
     let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
     let now = now_secs();
     let model = ReplayCachedModel::new(&HeuristicModel, &state.conn, now);
+    // Give the cycle the workspace's primary backend so its decay sweep can
+    // actually tier cold memories out (issue #117 auto-tiering, audit #3), not
+    // just count them. FTS keeps full text, so tiered nodes stay recallable.
+    let backend = crate::storage::primary_backend(&state, &ws).await?;
     let report = run_sleep_cycle(
         &state.conn, &ws, &model, &HeuristicPolicyLearner, &HeuristicSummarizer, now,
+        Some(backend.as_ref()),
     )
     .await
     .map_err(internal)?;

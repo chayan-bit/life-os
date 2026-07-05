@@ -15,6 +15,7 @@ use crate::procedural::{PolicyLearner, RuleDelta};
 use crate::project::{fetch_events_after, node_id, project_workspace, EventRecord};
 use crate::redact::{flatten_redacted, is_secret_event_type};
 use libsql::{params, Connection};
+use lifeos_vcs::StorageBackend;
 use std::collections::HashSet;
 
 /// A new episode starts after this much silence (cognitive boundary, ES-Mem).
@@ -33,6 +34,15 @@ const DAY_ROLLUP_MIN_EPISODES: usize = 3;
 const RULE_TTL_DAYS: i64 = 45;
 /// Below this confidence, a stale rule is retired rather than kept forever.
 const RULE_RETIRE_CONFIDENCE: f64 = 0.6;
+/// Cold-tier thresholds for the sleep-cadence auto-tier (issue #117): same
+/// constants the manual `POST /api/memory/tier` sweep uses, so on-cadence and
+/// on-demand tiering are identical.
+const TIER_MIN_AGE_SECS: i64 = 30 * 86400;
+const TIER_MAX_IMPORTANCE: f64 = 0.4;
+const TIER_MAX_ACCESS: i64 = 1;
+/// Cap how many cold nodes one cycle moves out, so a large first sweep is
+/// bounded work; the backlog drains over subsequent cycles.
+const TIER_BATCH_MAX: usize = 200;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SleepReport {
@@ -44,6 +54,9 @@ pub struct SleepReport {
     pub rules_added: usize,
     pub rules_retired: usize,
     pub cold_candidates: usize,
+    /// How many cold nodes this cycle actually tiered out to storage (0 when no
+    /// backend was passed, or nothing was cold).
+    pub tiered: usize,
     pub communities: usize,
 }
 
@@ -70,6 +83,12 @@ pub async fn unconsolidated_importance(
 /// `summarizer` drives the GraphRAG community-summary rebuild (issue #139,
 /// docs/AGENT-CORE.md §13) that runs at the end of the cycle, same seam
 /// shape as `learner`.
+///
+/// `storage` is the workspace's primary backend (or `None` when none is
+/// configured / the caller has none): when present, the decay sweep doesn't
+/// just COUNT cold nodes, it actually tiers a bounded batch of them out
+/// (issue #117). Passing `None` keeps the census-only behavior with a ledger
+/// note, so a deployment with no backend degrades honestly rather than erroring.
 pub async fn run_sleep_cycle(
     conn: &Connection,
     workspace_id: &str,
@@ -77,6 +96,7 @@ pub async fn run_sleep_cycle(
     learner: &dyn PolicyLearner,
     summarizer: &dyn CommunitySummarizer,
     now: i64,
+    storage: Option<&dyn StorageBackend>,
 ) -> Result<SleepReport, MemoryError> {
     // Make sure raw events are projected before we reason about their nodes.
     project_workspace(conn, workspace_id).await?;
@@ -227,7 +247,10 @@ pub async fn run_sleep_cycle(
     report.rules_retired += retire_stale_rules(conn, workspace_id, now).await?;
 
     // --- decay_sweep (no LLM): surface cold-tier candidates + a ledger entry.
-    let cold = crate::tier::find_cold_nodes(conn, workspace_id, now, 30 * 86400, 0.4, 1).await?;
+    let cold = crate::tier::find_cold_nodes(
+        conn, workspace_id, now, TIER_MIN_AGE_SECS, TIER_MAX_IMPORTANCE, TIER_MAX_ACCESS,
+    )
+    .await?;
     report.cold_candidates = cold.len();
     emit(
         conn, workspace_id, "memory.decay.swept", None, None,
@@ -235,6 +258,41 @@ pub async fn run_sleep_cycle(
         now,
     )
     .await?;
+
+    // --- auto-tier (issue #117, audit #3): actually move cold content out on
+    //     the sleep cadence, not only via the manual endpoint. Bounded batch.
+    //     Tiering stubs `memory_nodes.content` but leaves the derived FTS
+    //     mirror (`d.memory_idx`) untouched, so a tiered node's full text stays
+    //     searchable and recall's promote-on-access restores it - forgetting is
+    //     a storage move, never a loss of recall. No backend => census-only,
+    //     recorded honestly in the ledger.
+    report.tiered = match storage {
+        Some(backend) if !cold.is_empty() => {
+            let batch: Vec<String> = cold.iter().take(TIER_BATCH_MAX).cloned().collect();
+            let r = crate::tier::tier_out_cold(conn, workspace_id, backend, &batch).await?;
+            if r.tiered > 0 {
+                emit(
+                    conn, workspace_id, "memory.tiered", None, None,
+                    &serde_json::json!({ "tiered": r.tiered, "blob_ref": r.blob_ref }),
+                    now,
+                )
+                .await?;
+            }
+            r.tiered
+        }
+        Some(_) => 0,
+        None => {
+            if !cold.is_empty() {
+                emit(
+                    conn, workspace_id, "memory.tier.skipped", None, None,
+                    &serde_json::json!({ "cold_candidates": cold.len(), "reason": "no storage backend configured" }),
+                    now,
+                )
+                .await?;
+            }
+            0
+        }
+    };
 
     write_cursor(conn, workspace_id, scan_ts, &scan_id, now).await?;
     // Fold everything this cycle emitted into the read models.
@@ -464,7 +522,7 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW, None).await.unwrap();
         assert_eq!(report.episodes, 2);
         assert_eq!(report.summaries, 2, "one episode summary each, no day rollup yet");
 
@@ -488,7 +546,7 @@ mod tests {
 
         // Second cycle: cursor advanced, nothing new to consolidate.
         let again =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW, None).await.unwrap();
         assert_eq!(again.events_consumed, 0);
         assert_eq!(again.summaries, 0);
     }
@@ -510,7 +568,7 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW, None).await.unwrap();
         assert!(report.supersedes >= 1);
 
         // Old fact: invalidated with a pointer, never deleted.
@@ -546,7 +604,7 @@ mod tests {
         .await;
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW, None).await.unwrap();
         assert_eq!(report.rules_added, 1);
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
@@ -578,7 +636,7 @@ mod tests {
         let later = NOW + (RULE_TTL_DAYS + 1) * 86400;
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later, None).await.unwrap();
         assert_eq!(report.rules_retired, 1);
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
@@ -613,7 +671,7 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later, None).await.unwrap();
         assert_eq!(report.rules_retired, 0);
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
@@ -645,7 +703,7 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW)
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW, None)
                 .await
                 .unwrap();
         assert_eq!(report.communities, 2, "trading cluster + learning cluster");
@@ -657,12 +715,87 @@ mod tests {
         // A later cycle with no new events still returns early (no new
         // communities work is queued) - the map stays exactly as it was.
         let again =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW)
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW, None)
                 .await
                 .unwrap();
         assert_eq!(again.communities, 0, "no new events -> early return, no rebuild queued");
         let map_after = crate::communities::list_network_map(&conn, "ws_1").await.unwrap();
         let ids_after: Vec<String> = map_after.iter().map(|c| c.id.clone()).collect();
         assert_eq!(ids_before, ids_after, "unchanged graph -> identical community ids");
+    }
+
+    /// Audit #3: the sleep cadence must actually TIER cold memories out (not
+    /// just count them) when a backend is available - and leave the row + its
+    /// provenance behind as a stub, exactly like the manual endpoint.
+    #[tokio::test]
+    async fn sleep_auto_tiers_cold_nodes_when_a_backend_is_present() {
+        let conn = test_conn().await;
+        seed_event(
+            &conn, "ws_1", "evt_cold", 1000, "note.captured", None, "user",
+            json!({"text": "an old rarely-touched note about ferns and their spores"}), None,
+        )
+        .await;
+        project_workspace(&conn, "ws_1").await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = lifeos_vcs::LocalFsBackend::new(dir.path());
+        // 40 days on: the note is settled (consumable) AND older than the 30d
+        // cold threshold, so the decay sweep tiers it out.
+        let later = 1000 + 40 * 86400;
+        let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
+        let report = run_sleep_cycle(
+            &conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later,
+            Some(&backend),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.cold_candidates, 1, "{report:?}");
+        assert_eq!(report.tiered, 1, "auto-tier must move the cold node, not just count it");
+
+        // The node row survives with provenance; content is now a stub.
+        let node = node_id("ws_1", "evt_cold");
+        let mut rows = conn
+            .query(
+                "SELECT content, tiered_ref, source_event_ids FROM memory_nodes WHERE id = ?1",
+                params![node],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert!(row.get::<String>(0).unwrap().contains("[tiered]"));
+        assert!(row.get::<Option<String>>(1).unwrap().is_some(), "tiered_ref set");
+        assert!(row.get::<String>(2).unwrap().contains("evt_cold"), "provenance kept");
+    }
+
+    /// With no backend the cadence stays census-only and records the honest
+    /// "couldn't tier" note rather than erroring.
+    #[tokio::test]
+    async fn sleep_without_a_backend_counts_but_does_not_tier() {
+        let conn = test_conn().await;
+        seed_event(
+            &conn, "ws_1", "evt_cold", 1000, "note.captured", None, "user",
+            json!({"text": "another cold note left in place"}), None,
+        )
+        .await;
+        project_workspace(&conn, "ws_1").await.unwrap();
+
+        let later = 1000 + 40 * 86400;
+        let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
+        let report = run_sleep_cycle(
+            &conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.cold_candidates, 1);
+        assert_eq!(report.tiered, 0, "no backend => nothing tiered");
+
+        let node = node_id("ws_1", "evt_cold");
+        let mut rows = conn
+            .query("SELECT content, tiered_ref FROM memory_nodes WHERE id = ?1", params![node])
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert!(!row.get::<String>(0).unwrap().contains("[tiered]"), "content untouched");
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
     }
 }

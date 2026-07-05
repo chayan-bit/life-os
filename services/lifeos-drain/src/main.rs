@@ -119,7 +119,12 @@ async fn main() {
     };
 
     let vcs_blob_root = std::env::var("LIFEOS_VCS_BLOB_ROOT").unwrap_or_else(|_| "lifeos-blobs".to_string());
-    let vcs_store = lifeos_vcs::ObjectStore::new(vcs_blob_root);
+    let vcs_store = lifeos_vcs::ObjectStore::new(vcs_blob_root.clone());
+    // The local CAS backend memory_sleep tiers cold nodes into. Drain has no
+    // per-workspace storage-backend config machinery (that lives in lifeos-api),
+    // so it uses the same local blob root as its honest default - identical to
+    // lifeos-api's `primary_backend` fallback when nothing is configured.
+    let sleep_backend = lifeos_vcs::LocalFsBackend::new(vcs_blob_root);
     let embedder: Box<dyn Embedder> = match std::env::var("LIFEOS_MEMVEC") {
         Ok(memvec_path) if !memvec_path.is_empty() => {
             let derived_db_path =
@@ -217,6 +222,7 @@ async fn main() {
                     pipeline_eval_sample_rate,
                     notifier.as_ref(),
                     telegram_admin_chat_id.as_deref(),
+                    &sleep_backend,
                 )
                 .await
             }
@@ -267,6 +273,7 @@ async fn run_job(
     pipeline_eval_sample_rate: f64,
     notifier: &dyn Notifier,
     telegram_admin_chat_id: Option<&str>,
+    sleep_backend: &dyn lifeos_vcs::StorageBackend,
 ) {
     println!("lifeos-drain: claimed {} (kind={})", job.id, job.kind);
     let result = match dispatch(&job.kind) {
@@ -347,6 +354,7 @@ async fn run_job(
                 &lifeos_memory::HeuristicPolicyLearner,
                 &lifeos_memory::HeuristicSummarizer,
                 now,
+                Some(sleep_backend),
             )
             .await
             {
