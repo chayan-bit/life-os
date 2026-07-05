@@ -16,12 +16,17 @@ import { query as defaultQuery } from "@anthropic-ai/claude-agent-sdk";
 import { ModuleManifest, moduleManifestJsonSchema } from "./lib/moduleManifest.js";
 import { buildSandboxConfig } from "./lib/sandbox.js";
 import { createPreToolUseHook } from "./lib/preToolUseHook.js";
+import { scopeDirs } from "./lib/tierScopes.js";
 import { slugify } from "./lib/slugify.js";
 import { commitAndMerge, createWorktree, removeWorktree } from "./lib/worktree.js";
 import { loadManifestFromFile } from "./lib/loadManifest.js";
 import { persistManifestEntity as defaultPersistManifestEntity } from "./lib/manifestEntity.js";
-import { validateStructural } from "./validators/structural.js";
-import { validateRenderSmoke as defaultValidateRenderSmoke } from "./validators/render.js";
+import { getValidators } from "./validators/registry.js";
+
+// Tier 0 (manifest build). The self-extension ladder (docs/SELF-EXTENSION-V2.md)
+// parameterizes scope + validators by tier; scaffold.js is the T0 caller.
+const T0_TIER = "T0";
+const T0_BASE_REF = "main"; // the scaffold branch is cut from main (worktree.js)
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dirname, "..");
 const DEFAULT_API_BASE = process.env.LIFEOS_API_URL || "http://127.0.0.1:8080";
@@ -98,9 +103,14 @@ async function runAgent(queryFn, prompt, options, hookState, moduleId) {
 export async function scaffoldModule(prompt, workspaceId, opts = {}) {
   const repoRoot = opts.repoRoot ?? DEFAULT_REPO_ROOT;
   const queryFn = opts.queryFn ?? defaultQuery;
-  const validateRenderSmoke = opts.validateRenderSmoke ?? defaultValidateRenderSmoke;
   const persistManifestEntity = opts.persistManifestEntity ?? defaultPersistManifestEntity;
   const apiBase = opts.apiBase ?? DEFAULT_API_BASE;
+
+  // Dispatch T0's gates through the validator registry (docs/SELF-EXTENSION-V2.md
+  // §9) rather than importing them directly: protected-surface (§5) + structural
+  // + render-smoke, in that order. Render-smoke stays overridable via opts.
+  const t0Validators = new Map(getValidators(T0_TIER).map((v) => [v.name, v]));
+  const validateRenderSmoke = opts.validateRenderSmoke ?? t0Validators.get("renderSmoke").run;
 
   const moduleId = slugify(prompt);
   const { worktreePath, branch } = await createWorktree(repoRoot, moduleId);
@@ -111,7 +121,10 @@ export async function scaffoldModule(prompt, workspaceId, opts = {}) {
     // Wraps Layer B's hook so scaffold.js can observe a denial directly,
     // rather than inferring it from the SDK's message stream.
     const hookState = { denied: false, reason: null };
-    const baseHook = createPreToolUseHook(targetModuleDir);
+    // Layer B, tier-parameterized: T0's write-scope is modules/<id>/**, and the
+    // never-generable surfaces (§5) are denied regardless. `root` is the
+    // worktree so file paths resolve repo-relative for glob matching.
+    const baseHook = createPreToolUseHook({ tier: T0_TIER, params: { moduleId }, root: worktreePath });
     const trackedHook = async (input) => {
       const result = await baseHook(input);
       if (result.hookSpecificOutput?.permissionDecision === "deny") {
@@ -132,17 +145,25 @@ export async function scaffoldModule(prompt, workspaceId, opts = {}) {
       // build) - omitted entirely when unset so the SDK/CLI's own default
       // applies, same opt-in-only shape as every other `opts.*` here.
       ...(opts.model ? { model: opts.model } : {}),
-      ...buildSandboxConfig(),
+      ...buildSandboxConfig(scopeDirs(T0_TIER, { moduleId })),
     };
 
     const manifest = await runAgent(queryFn, buildPrompt(prompt, moduleId), options, hookState, moduleId);
+
+    // Validator 0 (§5, §9) - the never-generable-surface gate: inspects the
+    // worktree diff and hard-rejects if the agent touched any protected surface
+    // (defense in depth behind Layer B, which already confines T0 writes).
+    const protectedCheck = await t0Validators.get("protectedSurface").run({ worktreePath, baseRef: T0_BASE_REF });
+    if (!protectedCheck.valid) {
+      throw new Error(`Protected-surface validation failed: ${protectedCheck.errors.join("; ")}`);
+    }
 
     // Validator 1 (§4, issue #74) - re-loads the file the agent actually
     // wrote (not the structured-output summary) and checks it against
     // module.schema.json, plus dup-type-id and dangling-view-ref checks
     // against the worktree's full modules/ tree (a worktree checkout already
     // contains every sibling module, so no separate lookup is needed).
-    const structural = await validateStructural(path.join(targetModuleDir, "module.js"), {
+    const structural = await t0Validators.get("structural").run(path.join(targetModuleDir, "module.js"), {
       modulesDir: path.join(worktreePath, "modules"),
     });
     if (!structural.valid) {

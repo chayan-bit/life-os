@@ -89,6 +89,8 @@ locally with `TELEGRAM_BOT_TOKEN` set, confirm a real commit lands and a real me
 
 Restricting writes to one subdir is not a single switch; layer all three.
 
+> **Tier-parameterized (issue #131):** all three layers below are now driven by `server/lib/tierScopes.js` per self-extension tier (T0-T5) rather than hardcoding `modules/<id>/`; T0 is the case shown here. Layer B/C take a `{tier, params, root}` scope, and the four never-generable surfaces are denied at every tier. See [SELF-EXTENSION-V2.md](./SELF-EXTENSION-V2.md) §3/§5/§9.
+
 **Layer A - locked tool surface (primary gate):**
 ```ts
 options = {

@@ -43,6 +43,8 @@ The three layers from [SELF-EXTENSION.md](./SELF-EXTENSION.md) §2 are **paramet
 - **Layer C - Seatbelt sandbox.** `filesystem.allowWrite` is set to the tier's scope; `failIfUnavailable:true` unchanged. Bash children stay physically confined; credentials/env still denied.
 - **Human gate.** T0-T2 are internal + reversible → auto-commit (a `git revert` away). T3-T5 are higher-blast-radius → **draft → Telegram/PWA approve → commit**, reusing the [SECURITY.md](./SECURITY.md) §2 gating state machine. This mirrors "outward or irreversible actions are human-gated" - generating a backend route or a whole crate is treated with the same seriousness as an outward action.
 
+**Implemented (issue #131):** `server/lib/tierScopes.js` is the single source of truth - `TIER_SCOPES` maps each of T0-T5 to a function of build params returning the tier's repo-relative write globs (T0 `modules/<id>/**`; T1 the one `Generic<Kind>.jsx` + its `ModuleManifestPage.jsx` registration; T2 the module's `agentTools` entry + the CLI wrapper; T3 `services/<crate>/src/routes/**` or `lifeos-pipelines/src/**`; T4 a migration/derived index; T5 the new crate + `services/Cargo.toml`). `evaluateWrite`/`isWriteAllowed` resolve+normalize the path (rejecting `..`/absolute-outside/traversal), then apply **deny-wins**: a protected surface (§5) is denied before any tier allow is consulted. Layer B (`server/lib/preToolUseHook.js`) now takes `{tier, params, root}` and calls `evaluateWrite`, keeping a deprecated string-arg branch for the pre-v2 single-dir form. Layer C (`server/lib/sandbox.js`) takes the tier's top-level dirs from `scopeDirs(tier, params)`. Glob matching uses `picomatch` (no hand-rolled globbing).
+
 ---
 
 ## 4. The build pipeline - spec → plan → build → validate → gate → commit
@@ -93,6 +95,8 @@ The generation ladder is broad, so its floor must be explicit and hard. The gene
 
 This is the one place the ladder is a strict deny-list: the agent's generative reach is broad by default and narrowed only at these four cut-lines, each mapping to a fail-closed guard - the exact inverse-of-deny-list principle the Agent Control Plane already uses for actuation, now applied to codegen.
 
+**Implemented (issue #131):** `PROTECTED_SURFACES` in `server/lib/tierScopes.js` is the authoritative glob deny-list, enforced at **two** layers and **every** tier. (1) Layer B never lets a write land on a protected path (deny-wins over any tier allow). (2) `protectedSurfaceValidator` (`server/validators/registry.js`) `git diff`s the build (`base...HEAD` ∪ `status --porcelain -uall`) and hard-rejects if any changed path matches - failing closed if the diff can't be inspected. The list covers all four domains plus self-protection: security/gating config + capability matrix + action registry (`server/lib/sandbox.js`, `preToolUseHook.js`, `tierScopes.js`, `server/validators/**`, `server/agent/actionRegistry.js`, `frontend/src/lib/{capabilities,capabilityMatrix,agentActions,actionPlanCompiler}.js`); `broker-guard` + order-execution paths (`**/broker-guard*`, `**/*order*.rs`, `**/orders/**`); OAuth/connections/secrets (`infra/nango/**`, `migrations/0002_control_plane.sql`, `migrations/0011_workspace_envelope_key.sql`); VCS internals (`services/lifeos-vcs/**`); and git/CI/harness config (`.git/**`, `.github/**`, `.claude/**`).
+
 ---
 
 ## 6. Runtime-consumption fix (ship this first, standalone)
@@ -139,6 +143,8 @@ Today's two validators (`server/validators/structural.js`, `render.js`) become a
 | T5 | `cargo build` the new crate + its full test suite green + eval-gate + reviewer sign-off (§7) |
 
 Every validator keeps Tier 0's discipline: run in a disposable worktree against a scratch/derived DB, fail → discard, nothing touches `main` or `lifeos.db`. The biggest reliability risk stays render-flakiness, mitigated as in [SELF-EXTENSION.md](./SELF-EXTENSION.md) §6 (ephemeral ports, scratch DB, explicit ready-event, one bounded retry).
+
+**Implemented (issue #131):** `getValidators(tier)` in `server/validators/registry.js` returns the ordered validator list per tier. `protectedSurfaceValidator` (§5) runs **first at every tier**; T0 then adds the existing `structural` + `renderSmoke` entries (`scaffold.js` now dispatches through the registry instead of importing them directly). T1-T5 carry the protected-surface gate plus a placeholder that **fails closed** (`validator not yet implemented for <tier>`) until each tier's real validators land with its generator - an unvalidatable tier can never pass. An unknown tier resolves to the rejecting placeholder alone.
 
 ---
 
