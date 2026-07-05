@@ -101,6 +101,9 @@ export async function runBuildPipeline(request, workspaceId, opts = {}) {
     validateRenderSmoke: opts.validateRenderSmoke,
     persistManifestEntity: opts.persistManifestEntity,
     model: opts.model,
+    // T3's real validator (server/validators/t3Route.js) shells cargo/git;
+    // this is its DI seam so vitest never runs real cargo.
+    execFn: opts.execFn,
   };
 
   // SPEC + PLAN, then deterministic DAG validation. Any failure here (bad

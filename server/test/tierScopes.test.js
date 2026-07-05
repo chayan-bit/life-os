@@ -58,6 +58,14 @@ describe("TIER_SCOPES glob shapes", () => {
   it("T2 targets the one generated-tool descriptor file only (issue #134)", () => {
     expect(TIER_SCOPES.T2({ name: "rMultiple" })).toEqual(["server/agent/tools/generated/rMultiple.js"]);
   });
+
+  it("T3 targets the one named route file, mod.rs, and its own integration test (issue #135)", () => {
+    expect(TIER_SCOPES.T3({ crate: "lifeos-api", name: "week" })).toEqual([
+      "services/lifeos-api/src/routes/week.rs",
+      "services/lifeos-api/src/routes/mod.rs",
+      "services/lifeos-api/tests/week_integration.rs",
+    ]);
+  });
 });
 
 describe("isWriteAllowed - per-tier allow", () => {
@@ -78,9 +86,12 @@ describe("isWriteAllowed - per-tier allow", () => {
     expect(isWriteAllowed("T1", { kind: "graph" }, abs("modules/x/module.js"), ROOT)).toBe(false);
   });
 
-  it("T3 allows its crate routes but denies a write into lifeos-vcs", () => {
-    expect(isWriteAllowed("T3", { crate: "lifeos-api" }, abs("services/lifeos-api/src/routes/week.rs"), ROOT)).toBe(true);
-    expect(isWriteAllowed("T3", { crate: "lifeos-api" }, abs("services/lifeos-vcs/src/history.rs"), ROOT)).toBe(false);
+  it("T3 allows its named route/test but denies a sibling route and lifeos-vcs", () => {
+    const params = { crate: "lifeos-api", name: "week" };
+    expect(isWriteAllowed("T3", params, abs("services/lifeos-api/src/routes/week.rs"), ROOT)).toBe(true);
+    expect(isWriteAllowed("T3", params, abs("services/lifeos-api/tests/week_integration.rs"), ROOT)).toBe(true);
+    expect(isWriteAllowed("T3", params, abs("services/lifeos-api/src/routes/other.rs"), ROOT)).toBe(false);
+    expect(isWriteAllowed("T3", params, abs("services/lifeos-vcs/src/history.rs"), ROOT)).toBe(false);
   });
 
   it("T2 allows only its one named descriptor file, denies a sibling and the loader itself (issue #134)", () => {
@@ -103,7 +114,7 @@ describe("isWriteAllowed - every protected surface denied at EVERY tier", () => 
     ["T0", { moduleId: "habits" }],
     ["T1", { kind: "graph" }],
     ["T2", { name: "rMultiple" }],
-    ["T3", { crate: "lifeos-api" }],
+    ["T3", { crate: "lifeos-api", name: "week" }],
     ["T4", {}],
     ["T5", { crate: "lifeos-finance" }],
   ];
@@ -198,6 +209,13 @@ describe("scopeDirs - Seatbelt allowWrite derivation", () => {
     expect(scopeDirs("T5", { crate: "lifeos-finance" })).toEqual([
       "./services/lifeos-finance",
       "./services",
+    ]);
+  });
+
+  it("derives routes dir + tests dir for T3, deduped", () => {
+    expect(scopeDirs("T3", { crate: "lifeos-api", name: "week" })).toEqual([
+      "./services/lifeos-api/src/routes",
+      "./services/lifeos-api/tests",
     ]);
   });
 

@@ -47,11 +47,17 @@ export const TIER_SCOPES = {
   // never touches index.js itself.
   T2: ({ name }) => [`server/agent/tools/generated/${name}.js`],
 
-  // T3 Backend route / pipeline - a route in the target crate OR a pipeline
-  // DAG stage.
-  T3: ({ crate }) => [
-    `services/${crate}/src/routes/**`,
-    "services/lifeos-pipelines/src/**",
+  // T3 Backend route (issue #135) - the one named route file, its additive
+  // registration in the crate's routes/mod.rs, and its own integration test.
+  // Scoped to the three concrete files (not `routes/**`), so a build can
+  // never overwrite a sibling route or any other file in the crate; mod.rs is
+  // in scope only because registration is unavoidable - protectedSurface
+  // still independently blocks every protected surface, and the T3 validator
+  // (server/validators/t3Route.js) diff-checks mod.rs is edited additively.
+  T3: ({ crate, name }) => [
+    `services/${crate}/src/routes/${name}.rs`,
+    `services/${crate}/src/routes/mod.rs`,
+    `services/${crate}/tests/${name}_integration.rs`,
   ],
 
   // T4 Migration / derived - an additive migration file or a derived-index

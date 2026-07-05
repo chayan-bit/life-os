@@ -203,7 +203,7 @@ describe("runBuildPipeline - mid-DAG validator failure aborts the subtree", () =
 describe("runBuildPipeline - T3 node is gated, not committed", () => {
   it("marks the node awaiting_approval, creates a pending_approval entity, commits nothing", async () => {
     const plan = {
-      nodes: [{ id: "r", tier: "T3", params: { crate: "lifeos-x" }, description: "weekly summary route", dependsOn: [] }],
+      nodes: [{ id: "r", tier: "T3", params: { crate: "lifeos-x", name: "week" }, description: "weekly summary route", dependsOn: [] }],
     };
     const httpCalls = [];
     const beforeCount = await mainLogCount();
@@ -257,18 +257,18 @@ describe("runBuildPipeline - cyclic plan fails closed before any build", () => {
   });
 });
 
-describe("runBuildPipeline - T3 validator placeholder fails closed", () => {
-  it("fails a T3 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
+describe("runBuildPipeline - T4 validator placeholder fails closed", () => {
+  it("fails a T4 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
     const plan = {
-      nodes: [{ id: "t3", tier: "T3", params: { crate: "lifeos-api" }, description: "weekly summary route", dependsOn: [] }],
+      nodes: [{ id: "t4", tier: "T4", params: {}, description: "additive due-date column", dependsOn: [] }],
     };
     const beforeCount = await mainLogCount();
 
-    // No validateFn injected: the real registry placeholder for T3 runs and
+    // No validateFn injected: the real registry placeholder for T4 runs and
     // rejects, so the node fails and nothing ships. T1 got its real validator
-    // in issue #133, T2 in issue #134 - this assertion now targets T3, which
-    // is still a genuine placeholder.
-    const result = await runBuildPipeline("add a weekly summary endpoint", "ws_test", {
+    // in issue #133, T2 in issue #134, T3 in issue #135 - this assertion now
+    // targets T4, which is still a genuine placeholder.
+    const result = await runBuildPipeline("make due date a fast-queryable field", "ws_test", {
       repoRoot,
       queryFn: makeQueryFn(plan, []),
       httpFn: makeHttpFn([]),
@@ -276,7 +276,87 @@ describe("runBuildPipeline - T3 validator placeholder fails closed", () => {
 
     expect(result.success).toBe(false);
     expect(result.nodes[0].status).toBe("failed");
-    expect(result.nodes[0].reason).toMatch(/not yet implemented for T3/);
+    expect(result.nodes[0].reason).toMatch(/not yet implemented for T4/);
+    expect(await mainLogCount()).toBe(beforeCount);
+  });
+});
+
+describe("runBuildPipeline - T3 node builds, validates via the REAL t3Route validator, and gates (issue #135)", () => {
+  it("writes an in-scope route + additive mod.rs + scratch-DB test, validates it with mocked cargo, then halts awaiting_approval without committing", async () => {
+    const crate = "lifeos-x";
+    const name = "week";
+    const plan = {
+      nodes: [{ id: "r", tier: "T3", params: { crate, name }, description: "weekly summary route", dependsOn: [] }],
+    };
+    const beforeCount = await mainLogCount();
+    const httpCalls = [];
+
+    const queryFn = async function* (params) {
+      const purpose = params.options?.purpose;
+      if (purpose === "build_spec") {
+        yield { type: "result", subtype: "success", is_error: false, structured_output: SPEC };
+        return;
+      }
+      if (purpose === "build_plan") {
+        yield { type: "result", subtype: "success", is_error: false, structured_output: plan };
+        return;
+      }
+      // T3 build node: write the route, an additive mod.rs, and a
+      // scratch-DB integration test - exactly the t3Route validator's
+      // scope + additive-diff + scratch-DB expectations.
+      const routesDir = path.join(params.options.cwd, "services", crate, "src", "routes");
+      const testsDir = path.join(params.options.cwd, "services", crate, "tests");
+      await fs.mkdir(routesDir, { recursive: true });
+      await fs.mkdir(testsDir, { recursive: true });
+      const modPath = path.join(routesDir, "mod.rs");
+      await fs.writeFile(modPath, "pub fn router() {}\n", "utf8");
+      // Seed + commit mod.rs first so the additive edit below has a base to
+      // diff against (mirrors createWorktree cutting from main's committed tip).
+      await execFile("git", ["add", "."], { cwd: params.options.cwd });
+      await execFile("git", ["commit", "-m", "seed mod.rs", "--allow-empty"], { cwd: params.options.cwd });
+      await fs.writeFile(
+        modPath,
+        `pub fn router() {}\n// --- generated (T3) ---\nmod ${name};\n`,
+        "utf8",
+      );
+      await fs.writeFile(path.join(routesDir, `${name}.rs`), "pub async fn week() {}\n", "utf8");
+      await fs.writeFile(
+        path.join(testsDir, `${name}_integration.rs`),
+        '#[test]\nfn ok() { let _ = std::env::temp_dir().join("scratch.db"); }\n',
+        "utf8",
+      );
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        structured_output: {
+          tier: "T3",
+          files: [`services/${crate}/src/routes/${name}.rs`, `services/${crate}/src/routes/mod.rs`, `services/${crate}/tests/${name}_integration.rs`],
+          summary: "ok",
+        },
+      };
+    };
+
+    // No validateFn override: exercises the REAL t3Route + protectedSurface
+    // validators end to end. cargo build/test/clippy are mocked via
+    // opts.execFn so this test never shells real cargo.
+    const result = await runBuildPipeline("add a weekly summary endpoint", "ws_test", {
+      repoRoot,
+      queryFn,
+      httpFn: makeHttpFn(httpCalls),
+      execFn: async () => ({ stdout: "", stderr: "" }),
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.nodes[0].status).toBe("awaiting_approval");
+
+    const pending = httpCalls.find((c) => c.method === "POST" && c.path === "/api/entity" && c.body.type === "pending_approval");
+    expect(pending).toBeTruthy();
+    expect(pending.body.attrs.tier).toBe("T3");
+    const gated = httpCalls.find((c) => c.path === "/api/event" && c.body.type === "build.node.gated");
+    expect(gated).toBeTruthy();
+
+    // Nothing committed - the gate halts before commit.js ever runs.
     expect(await mainLogCount()).toBe(beforeCount);
   });
 });

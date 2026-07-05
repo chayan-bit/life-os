@@ -16,20 +16,22 @@ const BASE_REF = "main";
 // Each named validator gets exactly the args shape its `run` function
 // expects; a validator with no entry here (the fail-closed placeholders) is
 // called bare. Adding a tier-specific validator (e.g. t1Render, #133) only
-// needs one new line here, not a growing if/else chain.
+// needs one new line here, not a growing if/else chain. t3Route additionally
+// takes `ctx.execFn` (opts.execFn DI) so tests never shell real cargo.
 const VALIDATOR_ARGS = {
   protectedSurface: (worktreePath, node) => ({ worktreePath, baseRef: BASE_REF }),
   t1Render: (worktreePath, node) => ({ worktreePath, params: node.params }),
   t2Tool: (worktreePath, node) => ({ worktreePath, params: node.params }),
+  t3Route: (worktreePath, node, ctx) => ({ worktreePath, params: node.params, opts: { execFn: ctx.execFn } }),
 };
 
 // Runs each validator for `tier` against the worktree, short-circuiting on the
 // first failure (fail closed).
-async function runRegistryValidators(tier, worktreePath, node) {
+async function runRegistryValidators(tier, worktreePath, node, ctx) {
   const validators = getValidators(tier);
   for (const validator of validators) {
     const argsFn = VALIDATOR_ARGS[validator.name];
-    const result = argsFn ? await validator.run(argsFn(worktreePath, node)) : await validator.run();
+    const result = argsFn ? await validator.run(argsFn(worktreePath, node, ctx)) : await validator.run();
     if (!result.valid) return result;
   }
   return { valid: true, errors: [] };
@@ -42,5 +44,5 @@ export async function validateNode(ctx, node, { worktreePath }) {
   if (typeof ctx.validateFn === "function") {
     return ctx.validateFn(node.tier, worktreePath, node, ctx);
   }
-  return runRegistryValidators(node.tier, worktreePath, node);
+  return runRegistryValidators(node.tier, worktreePath, node, ctx);
 }

@@ -45,7 +45,7 @@ export const buildNodeSummaryJsonSchema = {
 export const TIER_PROMPTS = {
   T1: (node) => t1Prompt(node),
   T2: (node) => t2Prompt(node),
-  T3: (node) => tierPrompt("Tier 3 backend route or pipeline stage", node),
+  T3: (node) => t3Prompt(node),
   T4: (node) => tierPrompt("Tier 4 additive migration or derived-index rebuild", node),
   T5: (node) => tierPrompt("Tier 5 subsystem (new crate)", node),
 };
@@ -132,6 +132,39 @@ function t2Prompt(node) {
       "(the R-multiple itself is computed by the caller from the fetched entity's attrs - this descriptor only " +
       "reads; it never writes.)",
     `Write ${name}.js to solve: ${node.description}`,
+    "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
+  ].join("\n\n");
+}
+
+// T3 real generator prompt (issue #135) - a new axum route + its additive
+// mod.rs registration + its own integration test against a scratch DB. The
+// t3Route validator (server/validators/t3Route.js) independently re-checks
+// scope, mod.rs's additive-only diff, the scratch-DB pattern, and shells
+// cargo build/test/clippy, so a build that strays from this contract fails
+// closed downstream regardless of what this prompt asks for.
+function t3Prompt(node) {
+  const { crate, name } = node.params ?? {};
+  const scope = scopeDirs(node.tier, node.params).join(", ");
+  return [
+    "You are building a Tier 3 backend route for the Life OS self-extension ladder.",
+    `Task: ${node.description}`,
+    `Write only within this tier's scope: ${scope}. Never touch anything else.`,
+    `Create services/${crate}/src/routes/${name}.rs following the crate's existing route style (study the ` +
+      "sibling files already under that directory): an async handler taking `State(state): State<AppState>`, " +
+      "resolving the workspace the same way the crate's other routes do, and returning `ApiResult<Json<...>>`. " +
+      "Read-only or draft-writing routes ONLY - never perform an outward effect (send/post/publish/place an " +
+      "order) directly; if the route needs to act outward, it must write a `pending_approval` draft entity " +
+      "instead, per docs/SECURITY.md §2's gating state machine, and let the existing approve flow perform the " +
+      "real effect later.",
+    `Register the new route ADDITIVELY in services/${crate}/src/routes/mod.rs under a ` +
+      "'// --- generated (T3) ---' banner: add your new `mod ${name};` declaration and `.route(...)` line only - " +
+      "never remove, reorder, or edit any existing line in that file (the t3Route validator diff-checks this " +
+      "and rejects any destructive change to mod.rs).",
+    `Write services/${crate}/tests/${name}_integration.rs as an HTTP-level integration test, following the ` +
+      "EXACT Config-literal + scratch-DB pattern the crate's existing integration tests already use (a `Config` " +
+      "struct literal pointing `db_path`/`derived_db_path` at a fresh path under `std::env::temp_dir()`) - " +
+      `study a sibling test file under services/${crate}/tests/ before writing this one. NEVER point the test ` +
+      "at the real `lifeos.db`, a `~/` path, or a hardcoded `/Users/...` path.",
     "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
   ].join("\n\n");
 }
