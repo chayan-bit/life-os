@@ -5,7 +5,8 @@
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import ModuleManifestPage from './ModuleManifestPage';
+import ModuleManifestPage, { KIND_RENDERERS } from './ModuleManifestPage';
+import { RENDERER_KINDS } from './rendererKinds';
 
 vi.mock('../lib/api', () => ({ apiCall: vi.fn() }));
 import { apiCall } from '../lib/api';
@@ -43,5 +44,15 @@ describe('ModuleManifestPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Board' }));
 
     await waitFor(() => expect(document.querySelector('[data-view-id="board"]')).toBeTruthy());
+  });
+});
+
+// Drift guard (T1, issue #133): rendererKinds.js is the plain-JS source of
+// truth the server-side structural validator imports directly (it can't
+// import KIND_RENDERERS itself - that map needs React/JSX), so the two lists
+// must always describe the same set of kinds.
+describe('KIND_RENDERERS / RENDERER_KINDS drift guard', () => {
+  it('registers exactly the same kinds as rendererKinds.js', () => {
+    expect(Object.keys(KIND_RENDERERS).sort()).toEqual([...RENDERER_KINDS].sort());
   });
 });

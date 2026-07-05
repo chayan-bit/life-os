@@ -257,16 +257,18 @@ describe("runBuildPipeline - cyclic plan fails closed before any build", () => {
   });
 });
 
-describe("runBuildPipeline - T1 validator placeholder fails closed", () => {
-  it("fails a T1 node against the not-yet-implemented registry validator (until #133)", async () => {
+describe("runBuildPipeline - T2 validator placeholder fails closed", () => {
+  it("fails a T2 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
     const plan = {
-      nodes: [{ id: "t1", tier: "T1", params: { kind: "board" }, description: "board renderer", dependsOn: [] }],
+      nodes: [{ id: "t2", tier: "T2", params: { moduleId: "learning" }, description: "R-multiple tool", dependsOn: [] }],
     };
     const beforeCount = await mainLogCount();
 
-    // No validateFn injected: the real registry placeholder for T1 runs and
-    // rejects, so the node fails and nothing ships.
-    const result = await runBuildPipeline("show topics as a board", "ws_test", {
+    // No validateFn injected: the real registry placeholder for T2 runs and
+    // rejects, so the node fails and nothing ships. T1 got its real
+    // validator in issue #133 - this same assertion now targets T2, which
+    // is still a genuine placeholder.
+    const result = await runBuildPipeline("give the AI a tool to compute R-multiple", "ws_test", {
       repoRoot,
       queryFn: makeQueryFn(plan, []),
       httpFn: makeHttpFn([]),
@@ -274,7 +276,38 @@ describe("runBuildPipeline - T1 validator placeholder fails closed", () => {
 
     expect(result.success).toBe(false);
     expect(result.nodes[0].status).toBe("failed");
-    expect(result.nodes[0].reason).toMatch(/not yet implemented for T1/);
+    expect(result.nodes[0].reason).toMatch(/not yet implemented for T2/);
     expect(await mainLogCount()).toBe(beforeCount);
+  });
+});
+
+describe("runBuildPipeline - T1 node flow with the real t1Render validator mocked to pass", () => {
+  it("writes the renderer + registrations and commits the node", async () => {
+    const plan = {
+      nodes: [{ id: "t1", tier: "T1", params: { kind: "graph" }, description: "show topics as a graph", dependsOn: [] }],
+    };
+    const beforeCount = await mainLogCount();
+
+    // makeQueryFn's generic T1-T5 branch writes one in-scope renderer file
+    // (frontend/src/core/renderers/Generic.jsx) with a { tier, files, summary }
+    // structured output - exactly the shape a real T1 build agent produces.
+    // The t1Render validator itself is mocked here (validateFn override) so
+    // this test exercises the pipeline's build->validate->commit wiring, not
+    // a real Playwright boot (that's t1Render.test.js's job).
+    const result = await runBuildPipeline("show topics as a graph", "ws_test", {
+      repoRoot,
+      queryFn: makeQueryFn(plan, []),
+      httpFn: makeHttpFn([]),
+      validateFn: async (tier, worktreePath, node) => {
+        expect(tier).toBe("T1");
+        expect(node.params).toEqual({ kind: "graph" });
+        return { valid: true, errors: [] };
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.nodes[0].status).toBe("completed");
+    expect(result.nodes[0].commit).toBeTruthy();
+    expect(await mainLogCount()).toBe(beforeCount + 1);
   });
 });

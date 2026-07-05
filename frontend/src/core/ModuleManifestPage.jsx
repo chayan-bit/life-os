@@ -9,11 +9,17 @@ import GenericGallery from './renderers/GenericGallery';
 import GenericDetail from './renderers/GenericDetail';
 import GenericTimeline from './renderers/GenericTimeline';
 import GenericMap from './renderers/GenericMap';
+import GenericGraph from './renderers/GenericGraph';
 import EntityDetailPanel from '../components/EntityDetailPanel';
 import GenericMetricChart from './metrics/GenericMetricChart';
 import { resolveField } from './renderers/displayHelpers';
 
-const KIND_RENDERERS = {
+// Keep in sync with RENDERER_KINDS (rendererKinds.js, T1 #133) - that plain
+// JS module is the Node-side source of truth (server/validators/
+// structural.js imports it directly), while this map stays here because it
+// needs the React component imports rendererKinds.js deliberately avoids.
+// ModuleManifestPage.test.jsx asserts the two never drift apart.
+export const KIND_RENDERERS = {
   list: GenericList,
   table: GenericTable,
   board: GenericBoard,
@@ -21,6 +27,7 @@ const KIND_RENDERERS = {
   gallery: GenericGallery,
   timeline: GenericTimeline,
   map: GenericMap,
+  graph: GenericGraph,
 };
 
 // A view's optional `filter: { field, onOrBefore: 'today' }` narrows the

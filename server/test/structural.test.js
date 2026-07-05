@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { validateStructural } from "../validators/structural.js";
 
+const REAL_MODULES_DIR = path.resolve(import.meta.dirname, "..", "..", "modules");
+
 let modulesDir;
 
 async function writeModule(id, source) {
@@ -151,5 +153,45 @@ describe("validateStructural - dangling view refs", () => {
     const modulePath = await writeModule("widgets", source);
     const result = await validateStructural(modulePath, { modulesDir });
     expect(result.valid).toBe(true);
+  });
+});
+
+// T1 (issue #133): the known-kinds set is now derived from rendererKinds.js
+// (frontend/src/core/), not a hardcoded local list - `graph` passes now that
+// a GenericGraph renderer exists, and a made-up kind still fails.
+describe("validateStructural - kind list derived from rendererKinds.js", () => {
+  it("passes a view declaring kind:'graph'", async () => {
+    const source = `osRegisterModule({
+      id: "widgets", name: "Widgets", icon: "Zap", color: "red",
+      entityTypes: { widget: { label: "W", plural: "Ws", icon: "Zap", attrs: {} } },
+      views: [{ id: "web", label: "Web", kind: "graph", type: "widget" }],
+    });`;
+    const modulePath = await writeModule("widgets", source);
+    const result = await validateStructural(modulePath, { modulesDir });
+    expect(result.valid).toBe(true);
+  });
+
+  it("still fails a bogus, never-registered kind", async () => {
+    const source = `osRegisterModule({
+      id: "widgets", name: "Widgets", icon: "Zap", color: "red",
+      entityTypes: { widget: { label: "W", plural: "Ws", icon: "Zap", attrs: {} } },
+      views: [{ id: "web", label: "Web", kind: "hologram", type: "widget" }],
+    });`;
+    const modulePath = await writeModule("widgets", source);
+    const result = await validateStructural(modulePath, { modulesDir });
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes('"hologram"'))).toBe(true);
+  });
+});
+
+// Regression (issue #133): modules/learning declares a real kind:"graph"
+// view (docs/SELF-EXTENSION.md §4's noted finding) - it must now validate
+// against the real modules/ tree, not just an isolated fixture dir.
+describe("validateStructural - modules/learning regression", () => {
+  it("passes the real modules/learning/module.js now that GenericGraph exists", async () => {
+    const modulePath = path.join(REAL_MODULES_DIR, "learning", "module.js");
+    const result = await validateStructural(modulePath, { modulesDir: REAL_MODULES_DIR });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
   });
 });

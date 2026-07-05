@@ -27,13 +27,18 @@ export const TIER_SCOPES = {
   // T0 Manifest - one osRegisterModule({...}) file (built today).
   T0: ({ moduleId }) => [`modules/${moduleId}/**`],
 
-  // T1 View / renderer - the single new Generic<Kind>.jsx plus its
-  // registration in the KIND_RENDERERS map (ModuleManifestPage.jsx). Scoped to
-  // the one renderer, not `renderers/**`, so an existing renderer can't be
+  // T1 View / renderer - the single new Generic<Kind>.jsx, its registration
+  // in the KIND_RENDERERS map (ModuleManifestPage.jsx), and rendererKinds.js
+  // (the plain-JS RENDERER_KINDS array structural.js derives its known-kinds
+  // set from, issue #133) - the one deliberate scope-file addition beyond
+  // the original two, since a new kind is not real until both the
+  // component map AND the kind registry know about it. Scoped to the one
+  // renderer, not `renderers/**`, so an existing renderer can't be
   // overwritten.
   T1: ({ kind }) => [
     `frontend/src/core/renderers/Generic${pascalKind(kind)}.jsx`,
     "frontend/src/core/ModuleManifestPage.jsx",
+    "frontend/src/core/rendererKinds.js",
   ],
 
   // T2 Capability (agent tool) - the agentTools entry lives in the module's

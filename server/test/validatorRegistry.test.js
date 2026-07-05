@@ -34,14 +34,18 @@ describe("getValidators - registry dispatch", () => {
     expect(result.valid).toBe(false);
   });
 
-  it("T1-T5 resolve to protectedSurface + a placeholder that fails closed", async () => {
-    for (const tier of ["T1", "T2", "T3", "T4", "T5"]) {
+  it("T2-T5 resolve to protectedSurface + a placeholder that fails closed", async () => {
+    for (const tier of ["T2", "T3", "T4", "T5"]) {
       expect(validatorNames(tier)).toEqual(["protectedSurface", "notImplemented"]);
       const placeholder = getValidators(tier).find((v) => v.name === "notImplemented");
       const result = await placeholder.run();
       expect(result.valid).toBe(false);
       expect(result.errors[0]).toBe(`validator not yet implemented for ${tier}`);
     }
+  });
+
+  it("T1 resolves to protectedSurface + t1Render (issue #133 - no longer a placeholder)", () => {
+    expect(validatorNames("T1")).toEqual(["protectedSurface", "t1Render"]);
   });
 });
 

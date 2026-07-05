@@ -11,16 +11,30 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import Ajv2020 from "ajv/dist/2020.js";
 import { loadManifestFromFile } from "../lib/loadManifest.js";
+// rendererKinds.js (frontend/src/core/, issue #133) is the single source of
+// truth for every kind a Generic<Kind>.jsx renderer exists for - plain,
+// dependency-free JS (no JSX/React), so this cross-package relative ESM
+// import resolves under plain Node with no bundler and no frontend deps
+// added to server/package.json. `metric` is not a renderer kind (it charts
+// events through GenericMetricChart instead of listing entities,
+// ModuleManifestPage.jsx), so it's unioned in here rather than added to
+// RENDERER_KINDS.
+import { RENDERER_KINDS } from "../../frontend/src/core/rendererKinds.js";
 
 const SCHEMA_PATH = path.resolve(import.meta.dirname, "module.schema.json");
 const DEFAULT_MODULES_DIR = path.resolve(import.meta.dirname, "..", "..", "modules");
 
-const KNOWN_VIEW_KINDS = new Set(["list", "table", "board", "calendar", "gallery", "timeline", "map", "metric"]);
+const KNOWN_VIEW_KINDS = new Set([...RENDERER_KINDS, "metric"]);
 
 let compiledSchema = null;
 async function getValidator() {
   if (compiledSchema) return compiledSchema;
   const schema = JSON.parse(await fs.readFile(SCHEMA_PATH, "utf8"));
+  // The schema file itself ships a static enum as a readable baseline, but
+  // the live known-kinds set (KNOWN_VIEW_KINDS, derived from rendererKinds.js
+  // + "metric") is the actual source of truth - patch it in here so a new
+  // T1 renderer kind never needs a second hand-edit to this JSON file.
+  schema.$defs.view.properties.kind.enum = [...KNOWN_VIEW_KINDS];
   compiledSchema = new Ajv2020({ allErrors: true, allowUnionTypes: true }).compile(schema);
   return compiledSchema;
 }

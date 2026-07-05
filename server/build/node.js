@@ -43,7 +43,7 @@ export const buildNodeSummaryJsonSchema = {
 // Honest, minimal per-tier prompts. Each names the tier's exact write-scope so
 // the agent cannot claim it needs anything broader; Layer B enforces it anyway.
 export const TIER_PROMPTS = {
-  T1: (node) => tierPrompt("Tier 1 view renderer", node),
+  T1: (node) => t1Prompt(node),
   T2: (node) => tierPrompt("Tier 2 agent capability (tool)", node),
   T3: (node) => tierPrompt("Tier 3 backend route or pipeline stage", node),
   T4: (node) => tierPrompt("Tier 4 additive migration or derived-index rebuild", node),
@@ -56,6 +56,35 @@ function tierPrompt(role, node) {
     `You are building a ${role} for the Life OS self-extension ladder.`,
     `Task: ${node.description}`,
     `Write only within this tier's scope: ${scope}. Never touch anything else.`,
+    "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
+  ].join("\n\n");
+}
+
+// T1 real generator prompt (issue #133) - a new Generic<Kind>.jsx renderer,
+// following the exact props/data-fetch contract every sibling renderer under
+// frontend/src/core/renderers/ already uses, plus its two registrations.
+// The t1Render validator (server/validators/t1Render.js) checks both
+// registrations exist, an a11y-focusable node mounts, and a visual baseline,
+// so a build that skips either one fails closed downstream regardless of
+// what this prompt asks for.
+function t1Prompt(node) {
+  const kind = node.params?.kind;
+  const pascalKind = typeof kind === "string" && kind.length > 0 ? kind.charAt(0).toUpperCase() + kind.slice(1) : "";
+  const scope = scopeDirs(node.tier, node.params).join(", ");
+  return [
+    "You are building a Tier 1 view renderer for the Life OS self-extension ladder.",
+    `Task: ${node.description}`,
+    `Write only within this tier's scope: ${scope}. Never touch anything else.`,
+    `Create frontend/src/core/renderers/Generic${pascalKind}.jsx for the new view kind '${kind}'. ` +
+      "Study the sibling Generic*.jsx components already in that directory (GenericList, GenericBoard, GenericMap, " +
+      "GenericTimeline, etc.) and match their props contract exactly: `entities`, `setEntities`, `display` " +
+      "(resolved via displayHelpers.js's resolveDisplay/resolveField), and `onSelect` for item activation. " +
+      "Fetch any extra data it needs (e.g. graph edges from GET /api/edge) the same way sibling renderers call " +
+      "apiCall from ../../lib/api. Use the repo's existing light, minimalist neo-* CSS classes/palette, add zero " +
+      "new npm dependencies, and make every interactive element keyboard-reachable (tabIndex, Enter/Space activates " +
+      "it, same handler as onClick) with an aria-label.",
+    `Register the new kind in frontend/src/core/ModuleManifestPage.jsx's KIND_RENDERERS map ('${kind}': Generic${pascalKind}), ` +
+      `and add '${kind}' to the RENDERER_KINDS array in frontend/src/core/rendererKinds.js (plain JS, no JSX/React imports).`,
     "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
   ].join("\n\n");
 }

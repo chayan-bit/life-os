@@ -40,10 +40,11 @@ describe("TIER_SCOPES glob shapes", () => {
     expect(TIER_SCOPES.T0({ moduleId: "habits" })).toEqual(["modules/habits/**"]);
   });
 
-  it("T1 targets the single Generic<Kind> renderer + its registration", () => {
+  it("T1 targets the single Generic<Kind> renderer + its registration + the kind registry", () => {
     expect(TIER_SCOPES.T1({ kind: "graph" })).toEqual([
       "frontend/src/core/renderers/GenericGraph.jsx",
       "frontend/src/core/ModuleManifestPage.jsx",
+      "frontend/src/core/rendererKinds.js",
     ]);
   });
 

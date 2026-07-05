@@ -237,6 +237,13 @@ correctly fails on a genuine pre-existing `kind: "graph"` view (no `GenericGraph
 exists in `frontend/src/core/renderers/`) - fixing that module is out of this issue's scope,
 noted here as a known finding.
 
+**Fixed by T1 (issue #133):** `frontend/src/core/renderers/GenericGraph.jsx` now exists and
+is registered in both `ModuleManifestPage.jsx`'s `KIND_RENDERERS` map and
+`frontend/src/core/rendererKinds.js`'s `RENDERER_KINDS` array, which this validator's
+known-kinds set is now derived from instead of a hardcoded local list
+([SELF-EXTENSION-V2.md](./SELF-EXTENSION-V2.md) §9). `modules/learning`'s `kind: "graph"`
+view now passes structural validation.
+
 **Validator 2 - render smoke (headless Playwright):**
 - Boot the app against a **scratch derived/replica DB** (never canonical `lifeos.db`), on an **ephemeral port**.
 - Mount the new tile; assert **0 console/page JS errors** for the full session (`page.on('console'|'pageerror')`); assert each declared view mounts a node; assert an app-emitted **`module-mounted:<id>`** ready event (not arbitrary timeouts).
