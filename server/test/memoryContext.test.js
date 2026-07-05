@@ -199,6 +199,61 @@ describe("runAgentTurn - memory injection", () => {
     expect(result.outcome).toBe("completed");
   });
 
+  it("recalls a distilled rule via the existing memory-context passthrough (issue #128)", async () => {
+    // No new recall path is built for lessons/skills - a rule that made it
+    // into memory_rules (via feedback.given -> HeuristicPolicyLearner ->
+    // memory.rule.added, at the next sleep cycle) arrives folded into the
+    // SAME compiled context block `fetchMemoryContext` already passes
+    // through verbatim.
+    const RULE_TEXT = "lesson: always keep drafts under 80 words";
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => p === "/api/memory/context",
+        reply: () => ({ ok: true, status: 200, data: { context: `Rules:\n- ${RULE_TEXT}`, recall: { hits: 1 } } }),
+      },
+    ]);
+    const queryFn = makeQueryFn({ text: "kept it short" });
+
+    const result = await runAgentTurn("draft a launch summary", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    expect(queryFn.prompts.some((p) => p.includes(RULE_TEXT))).toBe(true);
+  });
+
+  it("injects the active operating manual alongside memory/world context (issue #128)", async () => {
+    const MANUAL_TEXT = "MANUAL-TEXT-lead-with-the-tldr-77";
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => p.startsWith("/api/configs"),
+        reply: () => ({
+          ok: true,
+          status: 200,
+          data: {
+            configs: [{ id: "cfg_1", kind: "agent_manual", payload: { text: MANUAL_TEXT }, status: "promoted" }],
+            active: { agent_manual: "cfg_1" },
+          },
+        }),
+      },
+    ]);
+    const queryFn = makeQueryFn({ text: "followed the manual" });
+
+    const result = await runAgentTurn("what should I do next?", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    expect(queryFn.prompts.some((p) => p.includes(MANUAL_TEXT))).toBe(true);
+    expect(queryFn.prompts.some((p) => p.includes("## Operating manual"))).toBe(true);
+  });
+
+  it("omits the manual block cleanly when no manual has ever been promoted", async () => {
+    const httpFn = makeHttp();
+    const queryFn = makeQueryFn({ text: "no manual yet" });
+
+    const result = await runAgentTurn("what should I do next?", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    expect(queryFn.prompts.some((p) => p.includes("## Operating manual"))).toBe(false);
+  });
+
   it("gate-refused turn makes no memory calls at all", async () => {
     const httpFn = makeHttp([
       {

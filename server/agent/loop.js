@@ -12,6 +12,8 @@ import { createHttpFn } from "./http.js";
 import { REGISTRY } from "./actionRegistry.js";
 import { indexTools, retrieveTools } from "./toolRag.js";
 import { fetchMemoryContext, ingestTurnOutcome } from "./memoryContext.js";
+import { fetchActiveManual } from "./manual.js";
+import { distillLesson } from "./reflect.js";
 import { emptyUsage } from "./usage.js";
 import { isCacheMode, looksActiony, probe as cacheProbe, store as cacheStore } from "./llmCache.js";
 
@@ -147,7 +149,8 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     const worldSnapshot = await buildWorldSnapshot(ctx);
     const memory = await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt);
     ctx.memoryInjected = Boolean(memory.block);
-    const context = [worldSnapshot, memory.block].filter(Boolean).join("\n\n");
+    const manual = await fetchActiveManual(ctx.httpFn, ctx.workspaceId);
+    const context = [worldSnapshot, memory.block, manual].filter(Boolean).join("\n\n");
 
     // 3. Plan (conditional). Tracks tokensIn/tokensOut separately (not just
     // the combined `tokens`) for the run-log lens's tokens_in/tokens_out
@@ -271,4 +274,12 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usag
     cache: cache ?? undefined,
   });
   await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, outcome, text);
+  // Distill-after (issue #128, docs/AGENT-CORE.md §6): best-effort, bounded
+  // to at most one lesson per turn, never affects the already-computed
+  // turn result.
+  await distillLesson(ctx.queryFn, prompt, outcome, text, {
+    httpFn: ctx.httpFn,
+    workspaceId: ctx.workspaceId,
+    model: ctx.model,
+  });
 }

@@ -88,6 +88,59 @@ The behavior that makes Founder OS "get better each turn" (its `lessons`/`skills
 - **The operating manual** is a single versioned `config` (reuse the `configs` + `vcs_refs(kind='config_active')` machinery from [HARNESS-LOOP.md](./HARNESS-LOOP.md) §4). The agent may **draft** a manual candidate; promoting it live is **human-typed only** (`harness config promote`) - identical to the release-loop carve-out, because the manual shapes the agent's own behavior and must not be self-promotable ([AGENT-CONTROL.md](./AGENT-CONTROL.md) §1, protected domain #2 spirit).
 - **Self-authored tools** (Voyager-style `create_tool`) are **not** a special path here - they are a **Tier-2 self-extension build** ([SELF-EXTENSION-V2.md](./SELF-EXTENSION-V2.md) §2), so they inherit that ladder's sandbox, validator, human gate, and git commit. The agent proposing a new tool is the agent asking the builder to generate one.
 
+**Implemented (issue #128):** lessons/skills ride the EXISTING procedural
+pipeline verbatim rather than a new `module='agent'` entity type - the code
+reality is that `memory_rules` (`services/lifeos-memory/src/procedural.rs`)
+is populated ONLY from `feedback.given` events via `HeuristicPolicyLearner`,
+which reads `attrs.feedback` (not `attrs.rule` - a naming trap in the
+original issue text) and hardcodes confidence by event type rather than
+trusting a caller-supplied one. `server/agent/reflect.js`'s
+`distillLesson(queryFn, prompt, outcome, resultText, opts)` is the
+"distill after" half: it runs ONLY for a **completed** turn whose prompt
+reads as corrective (`looksCorrective` - a conservative allow-list of
+words like "always"/"never"/"instead"/"next time"; skip on any doubt), makes
+one structured-output call (`{ rule, confidence, kind: 'lesson'|'skill' }`,
+`rule: null` when nothing durable applies), and - only when a rule comes
+back - appends exactly one `feedback.given` event with
+`attrs.feedback = "<kind>: <rule>"` and `attrs.confidence` (kept for a
+future learned `PolicyLearner`, even though `HeuristicPolicyLearner` doesn't
+read it today). It is wired into `loop.js`'s `finalize()` alongside
+`ingestTurnOutcome`, and is best-effort like every other write-back in that
+function - a distillation failure never affects an already-computed turn
+result. **"Recall before" needed no new code**: `memory_rules` already feeds
+`rules_for_prompt`, which the compiler already folds into
+`POST /api/memory/context`'s response, which `fetchMemoryContext` (issue
+#124) already injects into every turn - so a distilled lesson is live on the
+turn *after* the next sleep cycle consolidates it (`consolidate.rs`), by
+design, not as a shortcut.
+
+Rule aging is a small addition to that same sleep cycle:
+`consolidate.rs::retire_stale_rules` retires any `memory_rules` row that is
+both older than `RULE_TTL_DAYS` (45) and below `RULE_RETIRE_CONFIDENCE`
+(0.6), by emitting `memory.rule.retired` events through the same
+event-append path `HeuristicPolicyLearner`'s own retractions use - never a
+direct `UPDATE` outside the projector. It runs in the same
+consumable-events-required branch as `decay_sweep` (so it fires whenever a
+sleep cycle actually runs, not on a separate schedule).
+
+The operating manual reuses the release-loop `configs` +
+`vcs_refs(kind='config_active')` machinery ([HARNESS-LOOP.md](./HARNESS-LOOP.md)
+§4) with `kind='agent_manual'`: `server/agent/manual.js`'s
+`fetchActiveManual(httpFn, workspaceId)` does `GET /api/configs?kind=agent_manual`,
+cross-references the response's `active.agent_manual` pointer against its
+`configs` list, and returns that config's payload as a labeled
+`## Operating manual` block (`null` on absence or any failure -
+failure-tolerant like the memory-context fetch). `loop.js` injects it
+alongside the world snapshot and memory block. The agent may **draft** a
+candidate via the new `config.draft` action-registry tool
+(`server/agent/actionRegistry.js`, `allowed` - a draft is inert until
+promoted) - but there is deliberately no `config.promote`/`config.rollback`
+tool anywhere in the registry, and both names are now listed explicitly in
+`PROTECTED_TOOLS` (not just relying on "unknown name -> forbidden") so the
+never-agent-callable carve-out ([AGENT-CONTROL.md](./AGENT-CONTROL.md) §1)
+is intentional in the code, not incidental. Only `harness config promote`
+(human-typed CLI) ever flips the active pointer.
+
 ---
 
 ## 7. Tracing & replay - reuse the event store

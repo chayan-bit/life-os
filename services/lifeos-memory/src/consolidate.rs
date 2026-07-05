@@ -27,6 +27,11 @@ const SURPRISE_OVERLAP: f64 = 0.1;
 const SURPRISE_IMPORTANCE: f64 = 0.8;
 /// Enough episode summaries in one cycle roll up into a day-level reflection.
 const DAY_ROLLUP_MIN_EPISODES: usize = 3;
+/// Rule aging (issue #128, docs/AGENT-CORE.md §6): a rule sitting active this
+/// long without earning confidence is stale advice.
+const RULE_TTL_DAYS: i64 = 45;
+/// Below this confidence, a stale rule is retired rather than kept forever.
+const RULE_RETIRE_CONFIDENCE: f64 = 0.6;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SleepReport {
@@ -208,6 +213,13 @@ pub async fn run_sleep_cycle(
         }
     }
 
+    // --- rule aging (issue #128): retire stale, low-confidence rules so
+    //     procedural advice doesn't accrete forever. Emits proper
+    //     memory.rule.retired events through the same event-append path the
+    //     learner uses above - never a direct UPDATE of memory_rules outside
+    //     the projector.
+    report.rules_retired += retire_stale_rules(conn, workspace_id, now).await?;
+
     // --- decay_sweep (no LLM): surface cold-tier candidates + a ledger entry.
     let cold = crate::tier::find_cold_nodes(conn, workspace_id, now, 30 * 86400, 0.4, 1).await?;
     report.cold_candidates = cold.len();
@@ -222,6 +234,37 @@ pub async fn run_sleep_cycle(
     // Fold everything this cycle emitted into the read models.
     project_workspace(conn, workspace_id).await?;
     Ok(report)
+}
+
+/// Retires active rules older than `RULE_TTL_DAYS` that never earned
+/// `RULE_RETIRE_CONFIDENCE` or better, one `memory.rule.retired` event per
+/// rule (actor 'harness', folded by the projector at the end of this cycle -
+/// `apply_rule_retired` in project.rs is the only writer of
+/// `memory_rules.status`). Returns the count retired.
+async fn retire_stale_rules(conn: &Connection, ws: &str, now: i64) -> Result<usize, MemoryError> {
+    let cutoff = now - RULE_TTL_DAYS * 86400;
+    let mut rows = conn
+        .query(
+            "SELECT id FROM memory_rules \
+             WHERE workspace_id = ?1 AND status = 'active' \
+               AND created_ts < ?2 AND confidence < ?3",
+            params![ws, cutoff, RULE_RETIRE_CONFIDENCE],
+        )
+        .await?;
+    let mut stale_ids: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        stale_ids.push(row.get(0)?);
+    }
+
+    for rule_id in &stale_ids {
+        emit(
+            conn, ws, "memory.rule.retired", None, None,
+            &serde_json::json!({ "rule_id": rule_id, "reason": "stale" }),
+            now,
+        )
+        .await?;
+    }
+    Ok(stale_ids.len())
 }
 
 fn event_text(ev: &EventRecord) -> String {
@@ -495,5 +538,73 @@ mod tests {
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
         assert_eq!(rules, vec!["when asked about a trade, include the market regime".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stale_low_confidence_rule_is_retired_by_sleep() {
+        let conn = test_conn().await;
+        // A rule added long ago (ts=0) with confidence below the retire
+        // threshold - this is exactly the "stale advice" case rule aging
+        // exists to age out.
+        seed_event(
+            &conn, "ws_1", "evt_old_rule", 0, "memory.rule.added", None, "harness",
+            json!({"rule": "old stale advice", "confidence": 0.5}), None,
+        )
+        .await;
+        project_workspace(&conn, "ws_1").await.unwrap();
+
+        // A fresh event so the cycle isn't a no-op (run_sleep_cycle returns
+        // early when there is nothing new to consume).
+        seed_event(
+            &conn, "ws_1", "evt_new", NOW - SETTLE_SECS - 100, "task.completed", None, "user",
+            json!({"note": "ship it"}), None,
+        )
+        .await;
+
+        // Sleep well past the 45-day TTL relative to the rule's creation.
+        let later = NOW + (RULE_TTL_DAYS + 1) * 86400;
+        let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
+        let report =
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, later).await.unwrap();
+        assert_eq!(report.rules_retired, 1);
+
+        let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
+        assert!(!rules.contains(&"old stale advice".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fresh_or_high_confidence_rules_survive_sleep() {
+        let conn = test_conn().await;
+        let later = NOW + (RULE_TTL_DAYS + 1) * 86400;
+
+        // Old (ts=0) but high-confidence - survives on confidence alone.
+        seed_event(
+            &conn, "ws_1", "evt_trusted_rule", 0, "memory.rule.added", None, "harness",
+            json!({"rule": "trusted advice", "confidence": 0.9}), None,
+        )
+        .await;
+        // Low-confidence but recently added relative to `later` - survives
+        // on freshness alone.
+        seed_event(
+            &conn, "ws_1", "evt_fresh_rule", later - 1000, "memory.rule.added", None, "harness",
+            json!({"rule": "fresh advice", "confidence": 0.5}), None,
+        )
+        .await;
+        project_workspace(&conn, "ws_1").await.unwrap();
+
+        seed_event(
+            &conn, "ws_1", "evt_new", NOW - SETTLE_SECS - 100, "task.completed", None, "user",
+            json!({"note": "ship it"}), None,
+        )
+        .await;
+
+        let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
+        let report =
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, later).await.unwrap();
+        assert_eq!(report.rules_retired, 0);
+
+        let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
+        assert!(rules.contains(&"trusted advice".to_string()));
+        assert!(rules.contains(&"fresh advice".to_string()));
     }
 }

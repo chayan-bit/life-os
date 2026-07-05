@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { runAgentTurn } from "../agent/loop.js";
-import { classify, PROTECTED_TOOLS } from "../agent/actionRegistry.js";
+import { classify, PROTECTED_TOOLS, REGISTRY } from "../agent/actionRegistry.js";
 import { needsPlanning } from "../agent/planner.js";
 import { MAX_STEPS } from "../agent/executor.js";
 
@@ -77,6 +77,21 @@ describe("actionRegistry.classify", () => {
     for (const name of ["order.place", "order.modify", "trade.execute", "broker.order"]) {
       expect(classify(name)).toBe("forbidden");
     }
+  });
+
+  // Issue #128: the operating manual can be drafted by the agent, but
+  // promoting/rolling it back live is human-typed-only (`harness config
+  // promote|rollback`) - never agent/hook/cron-callable, matching the
+  // release-loop carve-out in docs/AGENT-CONTROL.md §1.
+  it("classifies config.promote and config.rollback as forbidden - no such tool exists", () => {
+    expect(classify("config.promote")).toBe("forbidden");
+    expect(classify("config.rollback")).toBe("forbidden");
+    expect(REGISTRY["config.promote"]).toBeUndefined();
+    expect(REGISTRY["config.rollback"]).toBeUndefined();
+  });
+
+  it("allows config.draft - a draft is inert until a human promotes it", () => {
+    expect(classify("config.draft")).toBe("allowed");
   });
 });
 
@@ -228,6 +243,32 @@ describe("runAgentTurn - gated enqueue", () => {
 
     // Gated turns skip the verify pass (nothing to verify until approval).
     expect(queryFn.mock.calls.every(([{ options }]) => options.purpose !== "verify")).toBe(true);
+  });
+});
+
+describe("runAgentTurn - config.draft (issue #128)", () => {
+  it("posts a draft config through /api/configs and auto-applies (allowed, not gated)", async () => {
+    const httpFn = makeHttp();
+    const queryFn = makeQueryFn({
+      toolCalls: [
+        {
+          tool: "config.draft",
+          args: { kind: "agent_manual", payload: { text: "Always lead with the TLDR." } },
+        },
+      ],
+      text: "drafted a manual candidate",
+    });
+
+    const result = await runAgentTurn("draft an update to the operating manual", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    expect(result.outcome).toBe("completed");
+    expect(result.pendingApprovals).toBeUndefined();
+
+    const draftPost = httpFn.calls.find((c) => c.method === "POST" && c.path === "/api/configs");
+    expect(draftPost).toBeTruthy();
+    expect(draftPost.body).toMatchObject({ kind: "agent_manual", workspace_id: "ws_test" });
+    expect(draftPost.body.payload).toEqual({ text: "Always lead with the TLDR." });
   });
 });
 

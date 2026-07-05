@@ -26,6 +26,14 @@ export const PROTECTED_TOOLS = Object.freeze([
   "connection.revoke",
   "secret.read",
   "secret.write",
+  // Release-loop promote/rollback (docs/HARNESS-LOOP.md §4, docs/
+  // AGENT-CONTROL.md §1) is human-typed-only, never agent/hook/cron-
+  // callable - not literally one of the four protected domains above, but
+  // listed explicitly (rather than relying on "unknown name -> forbidden")
+  // so the carve-out is intentional, not incidental. `agent_manual` config
+  // drafts (issue #128) ride this same never-agent-callable promote path.
+  "config.promote",
+  "config.rollback",
 ]);
 
 // tool -> { classification, description, inputSchema (Zod raw shape),
@@ -140,6 +148,22 @@ export const REGISTRY = Object.freeze({
       attrs: z.record(z.string(), z.any()).optional(),
     },
     route: { method: "POST", path: "/api/entity" },
+  },
+  // Drafts a candidate config (e.g. an `agent_manual` operating-manual
+  // revision, issue #128). `allowed`, not `gated`: a draft is inert until a
+  // HUMAN explicitly runs `harness config promote` - there is no promote or
+  // rollback tool in this registry (see PROTECTED_TOOLS above), so drafting
+  // can never self-activate.
+  "config.draft": {
+    classification: "allowed",
+    description:
+      "Draft a candidate config (e.g. an agent_manual operating-manual revision). " +
+      "Drafts require a human to run `harness config promote` before they take effect - never auto-activated.",
+    inputSchema: {
+      kind: z.string(),
+      payload: z.record(z.string(), z.any()),
+    },
+    route: { method: "POST", path: "/api/configs" },
   },
 });
 
