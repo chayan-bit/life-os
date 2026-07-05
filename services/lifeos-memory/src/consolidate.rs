@@ -8,6 +8,7 @@
 //! consolidation's work byte-identically (via the LLM replay cache) instead
 //! of re-running it.
 
+use crate::communities::{rebuild_communities, CommunitySummarizer};
 use crate::error::MemoryError;
 use crate::model::MemoryModel;
 use crate::procedural::{PolicyLearner, RuleDelta};
@@ -43,6 +44,7 @@ pub struct SleepReport {
     pub rules_added: usize,
     pub rules_retired: usize,
     pub cold_candidates: usize,
+    pub communities: usize,
 }
 
 /// How many events are waiting past the consolidation cursor - drain uses
@@ -65,11 +67,15 @@ pub async fn unconsolidated_importance(
 
 /// Run one full sleep cycle. `model` should be wrapped in ReplayCachedModel
 /// by the caller so summaries are content-addressed and replayable.
+/// `summarizer` drives the GraphRAG community-summary rebuild (issue #139,
+/// docs/AGENT-CORE.md §13) that runs at the end of the cycle, same seam
+/// shape as `learner`.
 pub async fn run_sleep_cycle(
     conn: &Connection,
     workspace_id: &str,
     model: &dyn MemoryModel,
     learner: &dyn PolicyLearner,
+    summarizer: &dyn CommunitySummarizer,
     now: i64,
 ) -> Result<SleepReport, MemoryError> {
     // Make sure raw events are projected before we reason about their nodes.
@@ -233,6 +239,12 @@ pub async fn run_sleep_cycle(
     write_cursor(conn, workspace_id, scan_ts, &scan_id, now).await?;
     // Fold everything this cycle emitted into the read models.
     project_workspace(conn, workspace_id).await?;
+
+    // --- GraphRAG global lens (issue #139, §13): rebuild the community map
+    //     from the now-current graph. Derived + rebuildable like everything
+    //     else here, so a delete+reinsert every cycle is the whole contract.
+    report.communities = rebuild_communities(conn, workspace_id, summarizer, now).await?;
+
     Ok(report)
 }
 
@@ -425,6 +437,7 @@ async fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::communities::HeuristicSummarizer;
     use crate::model::{HeuristicModel, ReplayCachedModel};
     use crate::procedural::HeuristicPolicyLearner;
     use crate::testutil::{seed_entity, seed_event, test_conn};
@@ -451,7 +464,7 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
         assert_eq!(report.episodes, 2);
         assert_eq!(report.summaries, 2, "one episode summary each, no day rollup yet");
 
@@ -475,7 +488,7 @@ mod tests {
 
         // Second cycle: cursor advanced, nothing new to consolidate.
         let again =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
         assert_eq!(again.events_consumed, 0);
         assert_eq!(again.summaries, 0);
     }
@@ -497,7 +510,7 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
         assert!(report.supersedes >= 1);
 
         // Old fact: invalidated with a pointer, never deleted.
@@ -533,7 +546,7 @@ mod tests {
         .await;
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, NOW).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW).await.unwrap();
         assert_eq!(report.rules_added, 1);
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
@@ -565,7 +578,7 @@ mod tests {
         let later = NOW + (RULE_TTL_DAYS + 1) * 86400;
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, later).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later).await.unwrap();
         assert_eq!(report.rules_retired, 1);
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
@@ -600,11 +613,56 @@ mod tests {
 
         let model = ReplayCachedModel::new(&HeuristicModel, &conn, later);
         let report =
-            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, later).await.unwrap();
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, later).await.unwrap();
         assert_eq!(report.rules_retired, 0);
 
         let rules = crate::procedural::rules_for_prompt(&conn, "ws_1", 1000).await.unwrap();
         assert!(rules.contains(&"trusted advice".to_string()));
         assert!(rules.contains(&"fresh advice".to_string()));
+    }
+
+    /// Issue #139: the GraphRAG community map is rebuilt as part of the same
+    /// sleep cycle that does everything else - derived state, same cadence.
+    #[tokio::test]
+    async fn sleep_cycle_rebuilds_the_community_map_idempotently() {
+        let conn = test_conn().await;
+        seed_entity(&conn, "ws_1", "ent_trading", "trading", "Banknifty desk").await;
+        seed_entity(&conn, "ws_1", "ent_learning", "learning", "Market microstructure").await;
+        for (i, ts) in [(0, 1000), (1, 1100), (2, 1200)] {
+            seed_event(
+                &conn, "ws_1", &format!("evt_trade_{i}"), ts, "trade.closed", Some("ent_trading"),
+                "user", json!({"note": format!("trade {i}")}), None,
+            )
+            .await;
+        }
+        for (i, ts) in [(0, 2000), (1, 2100), (2, 2200)] {
+            seed_event(
+                &conn, "ws_1", &format!("evt_study_{i}"), ts, "study.review", Some("ent_learning"),
+                "user", json!({"note": format!("topic {i}")}), None,
+            )
+            .await;
+        }
+
+        let model = ReplayCachedModel::new(&HeuristicModel, &conn, NOW);
+        let report =
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW)
+                .await
+                .unwrap();
+        assert_eq!(report.communities, 2, "trading cluster + learning cluster");
+
+        let map = crate::communities::list_network_map(&conn, "ws_1").await.unwrap();
+        assert_eq!(map.len(), 2);
+        let ids_before: Vec<String> = map.iter().map(|c| c.id.clone()).collect();
+
+        // A later cycle with no new events still returns early (no new
+        // communities work is queued) - the map stays exactly as it was.
+        let again =
+            run_sleep_cycle(&conn, "ws_1", &model, &HeuristicPolicyLearner, &HeuristicSummarizer, NOW)
+                .await
+                .unwrap();
+        assert_eq!(again.communities, 0, "no new events -> early return, no rebuild queued");
+        let map_after = crate::communities::list_network_map(&conn, "ws_1").await.unwrap();
+        let ids_after: Vec<String> = map_after.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids_before, ids_after, "unchanged graph -> identical community ids");
     }
 }

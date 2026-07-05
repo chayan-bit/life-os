@@ -103,6 +103,10 @@ Pipeline per query:
    Graph expansion is *not* always-on - "Does Memory Need Graphs?" (2026) shows it only pays off for multi-hop at scale, so single-hop queries stay on the cheap FTS5+vector path.
 6. **Abstention signal:** if the top activation is below threshold, emit "no reliable memory" so the model says *I don't know* instead of confabulating (the LongMemEval failure mode).
 
+**GraphRAG global lens (issue #139, `communities.rs`):** spreading activation above is local, seeded from one query.
+A global view - "which parts of my world touch trading?" - instead clusters the whole `memory_edges` graph with deterministic label propagation, persists a `memory_communities` read model of cluster summaries, and rebuilds it every sleep cycle.
+`ask_network` ranks clusters by relevance and returns grounded summaries; it never calls a model itself, so the caller composes the final answer.
+
 This is the SOTA-validated formula (Generative Agents + ACT-R + ENGRAM's typed hybrid), with frequency and BM25 added (both were missing from the naive recency·importance·relevance baseline).
 
 ---

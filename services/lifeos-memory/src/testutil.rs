@@ -9,6 +9,8 @@ use libsql::{params, Builder, Connection};
 /// production runs (same include_str! pattern as lifeos-api/src/db.rs).
 const MIGRATION_MEMORY: &str = include_str!("../../../migrations/0017_memory.sql");
 const MIGRATION_DERIVED_MEMORY: &str = include_str!("../../../migrations/0018_derived_memory.sql");
+const MIGRATION_MEMORY_COMMUNITIES: &str =
+    include_str!("../../../migrations/0019_memory_communities.sql");
 
 const STUB_CORE: &str = "
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -45,6 +47,7 @@ pub async fn test_conn() -> Connection {
     let conn = db.connect().unwrap();
     conn.execute_batch(STUB_CORE).await.unwrap();
     conn.execute_batch(MIGRATION_MEMORY).await.unwrap();
+    conn.execute_batch(MIGRATION_MEMORY_COMMUNITIES).await.unwrap();
     conn
 }
 
@@ -65,6 +68,7 @@ pub async fn test_conn_with_derived() -> Connection {
     let conn = db.connect().unwrap();
     conn.execute_batch(STUB_CORE).await.unwrap();
     conn.execute_batch(MIGRATION_MEMORY).await.unwrap();
+    conn.execute_batch(MIGRATION_MEMORY_COMMUNITIES).await.unwrap();
     conn.execute(
         &format!("ATTACH DATABASE 'file:{}' AS d", derived_path.to_str().unwrap()),
         (),

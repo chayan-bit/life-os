@@ -26,9 +26,9 @@ use axum::{
     Json,
 };
 use lifeos_memory::{
-    compile_context, recall, rules_for_prompt, run_sleep_cycle, BudgetSpec, HeuristicModel,
-    HeuristicPolicyLearner, NoopVectorSearcher, RecallOutcome, RecallParams, ReplayCachedModel,
-    Turn,
+    ask_network, compile_context, list_network_map, recall, rules_for_prompt, run_sleep_cycle,
+    BudgetSpec, HeuristicModel, HeuristicPolicyLearner, HeuristicSummarizer, NoopVectorSearcher,
+    RecallOutcome, RecallParams, ReplayCachedModel, Turn,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -235,9 +235,11 @@ pub async fn sleep_handler(
     let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
     let now = now_secs();
     let model = ReplayCachedModel::new(&HeuristicModel, &state.conn, now);
-    let report = run_sleep_cycle(&state.conn, &ws, &model, &HeuristicPolicyLearner, now)
-        .await
-        .map_err(internal)?;
+    let report = run_sleep_cycle(
+        &state.conn, &ws, &model, &HeuristicPolicyLearner, &HeuristicSummarizer, now,
+    )
+    .await
+    .map_err(internal)?;
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
@@ -362,4 +364,47 @@ pub async fn inspect_handler(
         None => Value::Null,
     };
     Ok(Json(json!({ "entries": entries, "stats": stats })))
+}
+
+/// GraphRAG global lens (issue #139, docs/AGENT-CORE.md §13): the community
+/// map as last rebuilt by the sleep cycle - "how is my world connected".
+pub async fn network_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<WorkspaceOnly>,
+) -> ApiResult<Json<Value>> {
+    let ws = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let communities = list_network_map(&state.conn, &ws).await.map_err(internal)?;
+    Ok(Json(json!({
+        "communities": communities.into_iter().map(|c| json!({
+            "id": c.id,
+            "summary": c.summary,
+            "size": c.size,
+            "member_ids": c.member_ids,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct NetworkAskRequest {
+    question: String,
+    workspace_id: Option<String>,
+    top_k: Option<usize>,
+}
+
+/// Map-reduce-lite over the community map: rank clusters by relevance to a
+/// thematic question and return the grounded top-k. Never calls a model -
+/// the agent composes the final answer from these community summaries.
+pub async fn network_ask_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<NetworkAskRequest>,
+) -> ApiResult<Json<Value>> {
+    if req.question.trim().is_empty() {
+        return Err(ApiError::BadRequest("question is required".into()));
+    }
+    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let top_k = req.top_k.unwrap_or(3).clamp(1, 20);
+    let hits = ask_network(&state.conn, &ws, &req.question, top_k).await.map_err(internal)?;
+    Ok(Json(json!({ "hits": hits })))
 }

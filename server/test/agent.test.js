@@ -93,6 +93,19 @@ describe("actionRegistry.classify", () => {
   it("allows config.draft - a draft is inert until a human promotes it", () => {
     expect(classify("config.draft")).toBe("allowed");
   });
+
+  // Issue #139: GraphRAG global queries expose a thematic tool, allowed +
+  // external (grounded community summaries, not agent-generated content) -
+  // same shape as memory.recall, wired to the network/ask route.
+  it("registers memory.network as allowed + external, posting to the ask route", () => {
+    expect(classify("memory.network")).toBe("allowed");
+    expect(REGISTRY["memory.network"].external).toBe(true);
+    expect(REGISTRY["memory.network"].route).toEqual({
+      method: "POST",
+      path: "/api/memory/network/ask",
+    });
+    expect(() => REGISTRY["memory.network"].inputSchema.question.parse("trading?")).not.toThrow();
+  });
 });
 
 describe("needsPlanning heuristic", () => {

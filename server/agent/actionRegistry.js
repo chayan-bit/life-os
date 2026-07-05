@@ -125,6 +125,18 @@ const BASE_REGISTRY = Object.freeze({
     route: { method: "POST", path: "/api/memory/recall" },
     external: true,
   },
+  // GraphRAG global lens (issue #139, docs/AGENT-CORE.md §13): community
+  // summaries over the whole entity graph, map-reduced against the question.
+  // Grounded material like memory.recall, not a generated answer - same
+  // untrusted-data handling.
+  "memory.network": {
+    classification: "allowed",
+    description:
+      "Thematic/global questions over the whole entity graph (which parts of my world touch X).",
+    inputSchema: { question: z.string(), top_k: z.number().optional() },
+    route: { method: "POST", path: "/api/memory/network/ask" },
+    external: true,
+  },
   // Read-only BY CONSTRUCTION (docs/SECURITY.md, browser.rs): the browser
   // actuator behind this route has click/type/submit/upload excluded from its
   // action space entirely, so it structurally cannot change external state -

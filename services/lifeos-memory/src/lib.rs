@@ -13,6 +13,8 @@
 //! - `retrieval`  activation-scored recall (RRF · recency · importance · freq) [§4]
 //! - `gate`       self-RAG gate + multi-hop detector (deterministic) [§4]
 //! - `graph`      petgraph spreading activation, 1-2 hops, tiered [§4]
+//! - `communities` GraphRAG global queries: label propagation + cluster
+//!   summaries + map-reduce-lite `ask_network`, rebuilt each sleep cycle [§13]
 //! - `consolidate` sleep jobs: segment/consolidate/importance/surprise/
 //!   decay/supersede - all writing events, never mutating [§5]
 //! - `compiler`   deterministic token-budgeted context compiler [§6]
@@ -20,6 +22,7 @@
 //! - `procedural` behavioral-rule store feeding the system prompt [§8]
 //! - `redact`     the no-secret-in-memory guard, applied at projection time
 
+pub mod communities;
 pub mod compiler;
 pub mod consolidate;
 pub mod error;
@@ -35,6 +38,10 @@ pub mod tier;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use communities::{
+    ask_network, detect_communities, list_network_map, rebuild_communities, Community,
+    CommunitySummarizer, HeuristicSummarizer, MemberSnippet, NetworkAnswerHit, NetworkCommunity,
+};
 pub use compiler::{compile_context, BudgetSpec, CompiledContext, Section, Turn};
 pub use consolidate::{run_sleep_cycle, unconsolidated_importance, SleepReport};
 pub use error::MemoryError;

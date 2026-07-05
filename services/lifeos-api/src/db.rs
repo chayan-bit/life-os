@@ -65,6 +65,10 @@ const MIGRATION_MEMORY: &str = include_str!("../../../migrations/0017_memory.sql
 /// FTS5 over memory_nodes - applied to the DERIVED file (never synced),
 /// alongside 0003, in `bootstrap_derived`.
 const MIGRATION_DERIVED_MEMORY: &str = include_str!("../../../migrations/0018_derived_memory.sql");
+/// GraphRAG community read model (issue #139, docs/AGENT-CORE.md §13) - a new
+/// `CREATE TABLE IF NOT EXISTS`, naturally idempotent and rebuildable.
+const MIGRATION_MEMORY_COMMUNITIES: &str =
+    include_str!("../../../migrations/0019_memory_communities.sql");
 
 /// The canonical DB plus its live connection. `database` is retained by the caller
 /// so the embedded-replica's background replicator stays alive (dropping it would
@@ -202,6 +206,7 @@ pub async fn run_migrations(conn: &Connection) -> Result<(), libsql::Error> {
     add_column_if_missing(conn, "events", "caused_by_event_id", MIGRATION_EVENTS_CAUSED_BY).await?;
     add_column_if_missing(conn, "events", "schema_version", MIGRATION_EVENTS_SCHEMA_VERSION).await?;
     conn.execute_batch(MIGRATION_MEMORY).await?;
+    conn.execute_batch(MIGRATION_MEMORY_COMMUNITIES).await?;
     tracing::info!("migrations applied (core + control plane)");
     Ok(())
 }

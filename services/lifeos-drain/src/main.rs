@@ -345,6 +345,7 @@ async fn run_job(
                 &job.workspace_id,
                 &model,
                 &lifeos_memory::HeuristicPolicyLearner,
+                &lifeos_memory::HeuristicSummarizer,
                 now,
             )
             .await

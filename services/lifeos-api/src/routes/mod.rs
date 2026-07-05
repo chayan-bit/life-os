@@ -81,6 +81,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/memory/tier", post(memory::tier_handler))
         .route("/api/memory/rules", get(memory::rules_handler))
         .route("/api/memory/inspect", get(memory::inspect_handler))
+        // --- GraphRAG global queries (issue #139, docs/AGENT-CORE.md §13):
+        //     community map + thematic map-reduce-lite over it ---
+        .route("/api/memory/network", get(memory::network_handler))
+        .route("/api/memory/network/ask", post(memory::network_ask_handler))
         // --- dashboards: pure SQL aggregation over events ---
         .route("/api/metrics", get(metrics::metrics))
         // --- self-extension intake + lifecycle polling (issue #76) ---

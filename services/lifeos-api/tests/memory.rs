@@ -406,3 +406,68 @@ async fn learned_rule_feeds_the_compiled_context() {
     .await;
     assert_eq!(ctx["context"]["text"], ctx2["context"]["text"]);
 }
+
+/// Issue #139 (GraphRAG global queries, docs/AGENT-CORE.md §13): the sleep
+/// cycle rebuilds a community map over two clusters, `/api/memory/network`
+/// lists both with non-empty summaries, and `/api/memory/network/ask` ranks
+/// the trading cluster first for a trading-themed question.
+#[tokio::test]
+async fn network_map_rebuilds_on_sleep_and_ask_ranks_the_relevant_cluster() {
+    let app = test_app().await;
+
+    let (_, trading) = send(
+        &app.router, "POST", "/api/entity", None,
+        Some(json!({"module": "trading", "type": "desk", "title": "Banknifty swing desk"})),
+    )
+    .await;
+    let trading_id = trading["id"].as_str().unwrap().to_string();
+    let (_, learning) = send(
+        &app.router, "POST", "/api/entity", None,
+        Some(json!({"module": "learning", "type": "topic", "title": "Market microstructure"})),
+    )
+    .await;
+    let learning_id = learning["id"].as_str().unwrap().to_string();
+
+    for i in 0..3 {
+        let (st, _) = send(
+            &app.router, "POST", "/api/event", None,
+            Some(json!({"type": "trade.closed", "actor": "user", "entity_id": trading_id,
+                        "attrs": {"note": format!("trade {i} closed")}})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    for i in 0..3 {
+        let (st, _) = send(
+            &app.router, "POST", "/api/event", None,
+            Some(json!({"type": "study.review", "actor": "user", "entity_id": learning_id,
+                        "attrs": {"note": format!("reviewed topic {i}")}})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    backdate_events(&app.db_path, 1_000).await;
+
+    let (st, report) = send(&app.router, "POST", "/api/memory/sleep", None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK, "{report:?}");
+    assert_eq!(report["communities"].as_i64().unwrap(), 2, "{report:?}");
+
+    let (st, map) = send(&app.router, "GET", "/api/memory/network", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{map:?}");
+    let communities = map["communities"].as_array().unwrap();
+    assert_eq!(communities.len(), 2);
+    assert!(communities.iter().all(|c| !c["summary"].as_str().unwrap().is_empty()));
+
+    let (st, ask) = send(
+        &app.router, "POST", "/api/memory/network/ask", None,
+        Some(json!({"question": "which parts of my world touch trading?", "top_k": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ask:?}");
+    let hits = ask["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0]["summary"].as_str().unwrap().to_lowercase().contains("trade"),
+        "{hits:?}"
+    );
+}
