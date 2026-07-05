@@ -52,3 +52,8 @@ test_*.db
 /services/.whisper-models/
 *.ggml.bin
 ggml-*.bin
+
+# Self-eval regression suite run history (issue #140) - local/CI run output,
+# not source; scenarios.json + run.js ARE committed, this log is not, to
+# avoid commit noise on every eval run.
+/server/evals/history.jsonl

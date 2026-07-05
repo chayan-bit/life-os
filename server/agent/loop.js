@@ -60,6 +60,9 @@ function addUsage(acc, stageResult) {
 // `GET /api/metrics` count agent turns without any Rust change - the
 // metrics SQL already aggregates generically over `events`, not by type.
 async function persistTurn(ctx, record) {
+  // Dry-run (issue #140, docs/AGENT-CORE.md §13): no turn trace is written -
+  // the eval runner reads the in-memory ledger/result directly instead.
+  if (ctx.dryRun) return;
   try {
     await ctx.httpFn("POST", "/api/event", {
       type: "agent.turn",
@@ -89,6 +92,7 @@ async function persistTurn(ctx, record) {
 }
 
 async function escalate(ctx, type, attrs) {
+  if (ctx.dryRun) return;
   try {
     await ctx.httpFn("POST", "/api/event", { type, actor: "agent", attrs, workspace_id: ctx.workspaceId });
   } catch {
@@ -179,6 +183,11 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     workspaceId,
     model: opts.model ?? null,
     httpFn: opts.httpFn ?? createHttpFn(workspaceId, opts.apiBase),
+    // Side-effect-free mode (issue #140, docs/AGENT-CORE.md §13): every write
+    // site in this file and executor.js/gate.js checks this flag and skips
+    // its HTTP call, so a dry-run turn's tool calls land in ctx.ledger with a
+    // synthetic result but never touch lifeos-api.
+    dryRun: Boolean(opts.dryRun),
     ledger: [],
     pendingApprovals: [],
     stepCount: 0,
@@ -201,7 +210,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
   const gate = await checkGate(ctx);
   if (!gate.ok) {
     const text = gate.reason === "kill_switch" ? "Agent paused: the kill switch is on for this workspace." : null;
-    return { success: false, runId, outcome: gate.reason, error: gate.reason, ...(text ? { text } : {}) };
+    return { success: false, runId, outcome: gate.reason, error: gate.reason, ledger: ctx.ledger, ...(text ? { text } : {}) };
   }
 
   // 1a. Cache probe (issue #127, docs/AGENT-CORE.md §10). API-key mode only,
@@ -211,7 +220,10 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
   // skip a needed mutation. No spend before the probe: this sits before
   // context assembly and before any model call.
   const isPlanningNeeded = needsPlanning(prompt);
-  const cacheEligible = isCacheMode() && !isPlanningNeeded && !looksActiony(prompt);
+  // Dry-run never serves (or stores to) the cache - a cache hit would skip
+  // the execute stage entirely, which defeats the whole point of a
+  // tool-routing eval (issue #140).
+  const cacheEligible = isCacheMode() && !isPlanningNeeded && !looksActiony(prompt) && !ctx.dryRun;
   const cacheRequest = { workspace: workspaceId, model: ctx.model, prompt, params: {} };
   if (cacheEligible) {
     const cacheResult = await cacheProbe(cacheRequest, opts.cache);
@@ -264,16 +276,24 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       plan = planned.plan;
       tokens += planned.tokens;
       usage = addUsage(usage, planned);
-      planEntityId = await persistPlan(prompt, plan, ctx);
+      // Dry-run (issue #140): the plan still guides execution, it just isn't
+      // persisted as a pipeline_run entity - nothing to update at finalize.
+      planEntityId = ctx.dryRun ? null : await persistPlan(prompt, plan, ctx);
     }
 
     // 3b. Tool-RAG: index the registry lazily (fire-and-forget-ish - never
     // fails the turn, indexTools already catches internally) then retrieve
     // the top-K relevant tools + core set for this turn's execute stage.
-    try {
-      await indexTools(REGISTRY, { httpFn: ctx.httpFn, workspaceId: ctx.workspaceId, ...opts.toolRag });
-    } catch {
-      // Defense-in-depth only; indexTools does not throw.
+    // Skipped in dry-run (issue #140) - it writes a digest entity and shells
+    // to memvec; retrieveTools already falls back to the full catalog when
+    // no index is available, which is a fine (arguably better) offering for
+    // a routing eval.
+    if (!ctx.dryRun) {
+      try {
+        await indexTools(REGISTRY, { httpFn: ctx.httpFn, workspaceId: ctx.workspaceId, ...opts.toolRag });
+      } catch {
+        // Defense-in-depth only; indexTools does not throw.
+      }
     }
     const retrieval = await retrieveTools(prompt, REGISTRY, opts.toolRag);
     ctx.toolNames = retrieval.tools;
@@ -305,7 +325,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       await escalate(ctx, "agent.step_budget_exhausted", { run_id: runId, ledger: ctx.ledger });
       const outcome = "step_budget_exhausted";
       await finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started });
-      return { success: false, runId, outcome, text, error: outcome };
+      return { success: false, runId, outcome, text, error: outcome, ledger: ctx.ledger };
     }
 
     // 5. Verify + one bounded refine round.
@@ -354,6 +374,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       runId,
       outcome,
       text,
+      ledger: ctx.ledger,
       ...(ctx.pendingApprovals.length > 0 ? { pendingApprovals: ctx.pendingApprovals } : {}),
     };
   } catch (error) {
@@ -372,9 +393,10 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       error: error.message,
     });
     // Write-back (issue #124): even a crashed turn produced ledger work worth
-    // folding into the next sleep cycle. Best-effort - never rethrows.
-    await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, "failed", "");
-    return { success: false, runId, outcome: "failed", error: error.message };
+    // folding into the next sleep cycle. Best-effort - never rethrows. Skipped
+    // in dry-run (issue #140) - same rule as the success-path finalize().
+    if (!ctx.dryRun) await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, "failed", "");
+    return { success: false, runId, outcome: "failed", error: error.message, ledger: ctx.ledger };
   }
 }
 
@@ -392,7 +414,7 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usag
           : outcome === "abstained"
             ? "abstained"
             : "failed";
-  if (plan) await updatePlanStatus(planEntityId, plan, prompt, planStatus, ctx);
+  if (plan && !ctx.dryRun) await updatePlanStatus(planEntityId, plan, prompt, planStatus, ctx);
   await persistTurn(ctx, {
     run_id: ctx.runId,
     goal: prompt,
@@ -414,6 +436,9 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usag
     // always present (empty array on a turn with no recovery activity).
     recoveries: ctx.recoveries ?? [],
   });
+  // Both writes below are skipped in dry-run (issue #140) - a routing eval
+  // must never fold synthetic scenario turns into real memory or lessons.
+  if (ctx.dryRun) return;
   await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, outcome, text);
   // Distill-after (issue #128, docs/AGENT-CORE.md §6): best-effort, bounded
   // to at most one lesson per turn, never affects the already-computed

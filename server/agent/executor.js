@@ -62,6 +62,10 @@ function wrapUntrusted(data) {
 }
 
 async function denyForbidden(ctx, toolName, args) {
+  // Dry-run (issue #140, docs/AGENT-CORE.md §13): the ledger already records
+  // the forbidden decision in runTool - this HTTP write is the only side
+  // effect left, so it is the only thing skipped here.
+  if (ctx.dryRun) return;
   try {
     await ctx.httpFn("POST", "/api/event", {
       type: "action.denied",
@@ -75,6 +79,12 @@ async function denyForbidden(ctx, toolName, args) {
 }
 
 async function runGated(ctx, toolName, args) {
+  // Dry-run (issue #140): record the call in the ledger (runTool does that
+  // regardless of this branch) WITHOUT enqueuing - no draft entity is ever
+  // created, so there is nothing pending for a human to approve.
+  if (ctx.dryRun) {
+    return { result: { status: "dry_run", tool: toolName }, ok: true };
+  }
   const body = {
     module: args.module || DEFAULT_DRAFT_MODULE,
     type: args.type || DEFAULT_DRAFT_TYPE,
@@ -165,6 +175,12 @@ async function runAllowed(ctx, toolName, entry, args) {
   const refusal = refuseIfRouteNotAllowed(entry, method, path);
   if (refusal) {
     return { result: { ...refusal, tool: toolName }, ok: false };
+  }
+  // Dry-run (issue #140): route resolution + validation above still runs (it
+  // is pure computation, catching a malformed generated-tool route even in a
+  // dry run), but the actual HTTP call - the only side effect - never fires.
+  if (ctx.dryRun) {
+    return { result: { status: "dry_run", tool: toolName }, ok: true };
   }
   const payload = body ? { ...body, workspace_id: ctx.workspaceId } : undefined;
   const res = await httpWithRetry(ctx, toolName, method, path, payload);

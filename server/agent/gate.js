@@ -71,15 +71,18 @@ export async function checkGate(ctx) {
   if (config.killSwitch) {
     // Escalate: same append-only visibility as agent.budget_exhausted below,
     // so a paused agent shows up in Observe rather than silently going quiet.
-    try {
-      await httpFn("POST", "/api/event", {
-        type: "agent.paused",
-        actor: "agent",
-        attrs: { reason: "kill_switch" },
-        workspace_id: workspaceId,
-      });
-    } catch {
-      // Escalation is best-effort; the refusal below still stands.
+    // Skipped in dry-run (issue #140) - the refusal below still stands.
+    if (!ctx.dryRun) {
+      try {
+        await httpFn("POST", "/api/event", {
+          type: "agent.paused",
+          actor: "agent",
+          attrs: { reason: "kill_switch" },
+          workspace_id: workspaceId,
+        });
+      } catch {
+        // Escalation is best-effort; the refusal below still stands.
+      }
     }
     return { ok: false, reason: "kill_switch" };
   }
@@ -95,15 +98,18 @@ export async function checkGate(ctx) {
 
   if (spent >= config.dailyTokenBudget) {
     // Escalate: an append-only marker the harness Observe lens can surface.
-    try {
-      await httpFn("POST", "/api/event", {
-        type: "agent.budget_exhausted",
-        actor: "agent",
-        attrs: { spent, budget: config.dailyTokenBudget },
-        workspace_id: workspaceId,
-      });
-    } catch {
-      // Escalation is best-effort; the refusal below still stands.
+    // Skipped in dry-run (issue #140) - the refusal below still stands.
+    if (!ctx.dryRun) {
+      try {
+        await httpFn("POST", "/api/event", {
+          type: "agent.budget_exhausted",
+          actor: "agent",
+          attrs: { spent, budget: config.dailyTokenBudget },
+          workspace_id: workspaceId,
+        });
+      } catch {
+        // Escalation is best-effort; the refusal below still stands.
+      }
     }
     return { ok: false, reason: "budget_exhausted" };
   }
