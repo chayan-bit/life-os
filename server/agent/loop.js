@@ -13,6 +13,7 @@ import { REGISTRY } from "./actionRegistry.js";
 import { indexTools, retrieveTools } from "./toolRag.js";
 import { fetchMemoryContext, ingestTurnOutcome } from "./memoryContext.js";
 import { emptyUsage } from "./usage.js";
+import { isCacheMode, looksActiony, probe as cacheProbe, store as cacheStore } from "./llmCache.js";
 
 const newRunId = () => `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -109,6 +110,35 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     return { success: false, runId, outcome: gate.reason, error: gate.reason, ...(text ? { text } : {}) };
   }
 
+  // 1a. Cache probe (issue #127, docs/AGENT-CORE.md §10). API-key mode only,
+  // and only for side-effect-free plain completions: skipped for anything
+  // `needsPlanning` flags as multi-step, and for anything `looksActiony`
+  // flags as an imperative mutation request - a cached answer must never
+  // skip a needed mutation. No spend before the probe: this sits before
+  // context assembly and before any model call.
+  const isPlanningNeeded = needsPlanning(prompt);
+  const cacheEligible = isCacheMode() && !isPlanningNeeded && !looksActiony(prompt);
+  const cacheRequest = { workspace: workspaceId, model: ctx.model, prompt, params: {} };
+  if (cacheEligible) {
+    const cacheResult = await cacheProbe(cacheRequest, opts.cache);
+    if (cacheResult.hit) {
+      const outcome = "completed";
+      await finalize(ctx, {
+        plan: null,
+        planEntityId: null,
+        prompt,
+        outcome,
+        tokens: 0,
+        usage: emptyUsage(),
+        text: cacheResult.completion,
+        refined: false,
+        started,
+        cache: cacheResult.hit,
+      });
+      return { success: true, runId, outcome, text: cacheResult.completion, cache: cacheResult.hit };
+    }
+  }
+
   try {
     // 2. Context assembly - world snapshot + lifeos-memory activation recall
     // (docs/AGENT-CORE.md §5, #124). The memory block is the compiler's own
@@ -126,7 +156,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     let planEntityId = null;
     let tokens = 0;
     let usage = emptyUsage();
-    if (needsPlanning(prompt)) {
+    if (isPlanningNeeded) {
       const planned = await generatePlan(prompt, context, ctx);
       plan = planned.plan;
       tokens += planned.tokens;
@@ -177,6 +207,14 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     }
 
     const outcome = ctx.pendingApprovals.length > 0 ? "awaiting_approval" : "completed";
+
+    // 6. Cache store (issue #127). Only a completed, probe-eligible turn that
+    // made NO tool calls - a tool-using turn is NEVER cached (its effect is a
+    // state change, not reusable text). Best-effort, workspace-scoped.
+    if (outcome === "completed" && ctx.ledger.length === 0 && cacheEligible) {
+      await cacheStore(cacheRequest, text, opts.cache);
+    }
+
     await finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started });
 
     return {
@@ -211,7 +249,7 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
 // Persists the plan status + the agent.turn row, then writes the turn's
 // outcome back to memory (issue #124) best-effort so the next sleep cycle
 // (consolidate.rs) can fold it - no new subsystem, `events` stays the path.
-async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started }) {
+async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started, cache }) {
   const planStatus = outcome === "completed" ? "completed" : outcome === "awaiting_approval" ? "awaiting_approval" : "failed";
   if (plan) await updatePlanStatus(planEntityId, plan, prompt, planStatus, ctx);
   await persistTurn(ctx, {
@@ -228,6 +266,9 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usag
     outcome,
     error: outcome === "step_budget_exhausted" ? outcome : null,
     result_preview: (text || "").slice(0, 500),
+    // Present (issue #127) only on a cache-served turn ('exact' | 'semantic');
+    // undefined elsewhere so a JSON.stringify of attrs simply omits the key.
+    cache: cache ?? undefined,
   });
   await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, outcome, text);
 }

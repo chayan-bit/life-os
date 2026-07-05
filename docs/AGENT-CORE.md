@@ -48,7 +48,7 @@ The result: the AI can *answer* about the app but cannot *work in it over multip
 Modeled on the disciplined turn lifecycle, adapted to Life OS's substrate. Bounded and cheap by default.
 
 1. **Gate check.** Honor a kill switch (`config` row) and per-workspace daily spend cap ([HARNESS-LOOP.md](./HARNESS-LOOP.md) Observe meter) before any model call - fail closed, same shape as `broker-guard` (§11).
-1a. **Cache probe (API-key mode, side-effect-free turns only).** For a plain completion, check the two-layer LLM cache (§10) before spending a token; a hit returns immediately. Skipped entirely for tool-using turns and on the free keyless-CLI path.
+1a. **Cache probe (API-key mode, side-effect-free turns only).** For a plain completion, check the two-layer LLM cache (§10) before spending a token; a hit returns immediately. Skipped entirely for tool-using turns and on the free keyless-CLI path. **Implemented (issue #127):** `loop.js` computes eligibility as `isCacheMode() && !needsPlanning(prompt) && !looksActiony(prompt)` right after the gate passes and before `buildWorldSnapshot`/`fetchMemoryContext` run, so a hit costs zero HTTP calls beyond the probe itself; a hit short-circuits straight to `finalize()` with `tokens:0`/`tier:'mac'`/`outcome:'completed'` and an `attrs.cache` stamp of `'exact'` or `'semantic'`.
 2. **Context assembly.** Pull (a) a compact world snapshot (counts of open tasks/trades/drafts/jobs for the workspace, a read over `entities`), (b) memory hits via `lifeos-memory` activation recall (§5), (c) relevant lessons/skills (§6). No re-explaining context across turns.
 3. **Plan (conditional).** A cheap heuristic decides if the request is multi-step; if so, the planner emits a short ordered plan and persists it as a `jobs`/subtask-style DAG so it is inspectable and resumable (reuse the pipeline DAG shape from [PLATFORM-SYSTEMS.md](./PLATFORM-SYSTEMS.md) §1, not a new table).
 4. **Execute (bounded).** Up to `MAX_STEPS` (default 8) tool-calling rounds. Each tool call: capability-matrix classify (`allowed | gated | forbidden`, [AGENT-CONTROL.md](./AGENT-CONTROL.md) §2) → gated ones enqueue for Telegram/PWA approval → forbidden ones refuse visibly → allowed ones execute via the existing `entity/edge/event/draft/pipeline` routes. External-origin tool results (web, inbox, provider proxy) are wrapped as untrusted content and never treated as instructions ([SECURITY.md](./SECURITY.md)).
@@ -164,6 +164,44 @@ There is already a proven precedent to copy: `services/lifeos-pipelines/src/eval
 - **Workspace-scoped.** Cache rows carry `workspace_id`; one tenant never serves another's answer (multi-tenant invariant).
 - **Cache lives in the un-synced derived DB / a local `entities` partition**, rebuilt locally, never a sync-reconciliation source ([DATA-MODEL.md](./DATA-MODEL.md) §4.3) - a stale cache row must never masquerade as canonical state.
 - **Off by default on the keyless path**, controlled by `SEMANTIC_CACHE` + `CACHE_DISTANCE_THRESHOLD`; every hit is counted in Observe so the token savings are visible.
+
+**Implemented (issue #127) - two deliberate deviations from the text above:**
+- **Both layers live in the un-synced derived DB, not an `entities` row.** The
+  "an `entities` row" phrasing above can't satisfy this section's own hard
+  constraint ("never a sync-reconciliation source") - libSQL has no
+  table-level no-sync flag ([DATA-MODEL.md](./DATA-MODEL.md) §4.3), so a
+  canonical `entities` row for the cache would itself be a sync artifact.
+  Instead `server/memvec.py` gained a new derived-DB-only table,
+  `llm_cache(key, workspace, model, prompt, completion, created_at)`, plus two
+  subcommands: `cache-put` (upserts the row and embeds the prompt into the
+  existing `entity_vec` index under id `llmcache:<key>`, mirroring Tool-RAG's
+  (#123) `tool:`-prefixed convention) and `cache-get` (exact lookup by
+  `key`+`workspace`, else a vector query over `llmcache:` ids in the same
+  workspace within `CACHE_DISTANCE_THRESHOLD`, re-verifying the resolved row's
+  workspace before ever returning it - cross-tenant serving stays impossible
+  by construction, not just by convention).
+- **`blake2b512` (node/python stdlib) instead of BLAKE3.** BLAKE3 was named
+  above for parity with `eval_gate.rs`'s Rust cache, but neither Node nor
+  Python ship BLAKE3 in stdlib, and adding a `blake3` dependency would violate
+  the machine's Nix-only package policy for this JS runtime. The hash
+  algorithm is opaque to correctness (any stable hash of
+  `model||system||prompt||params` works), so this is a naming-parity
+  deviation, not a functional one.
+
+`server/agent/llmCache.js` is the JS side: `isCacheMode()` gates everything on
+`ANTHROPIC_API_KEY` being set (a no-op on the keyless CLI path), `cacheKey()`
+hashes the raw request, `probe()`/`store()` shell `memvec.py cache-get`/
+`cache-put` (both fully mockable via `opts.cacheGetFn`/`opts.cachePutFn`, and
+both fail closed to a plain miss / a swallowed error - a cache outage never
+fails a turn). `looksActiony()` is the conservative imperative-verb denylist
+(create/update/delete/send/draft/schedule/…) that keeps mutation requests out
+of the cache. Wired into `server/agent/loop.js` at step 1a (probe, before
+context assembly - see below) and step 6 (store, only on a completed turn with
+zero tool calls). Tests: `server/test/llmCache.test.js` (the issue's six
+required scenarios, plus actiony-prompt and cache-error-proceeds; a
+`describe.skipIf`-guarded python round-trip test covers the derived-DB side
+including cross-workspace misses when `sentence-transformers`/`sqlite-vec` are
+installed locally).
 
 ## 11. World-model snapshot + first-class guardrails
 
