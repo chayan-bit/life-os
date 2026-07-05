@@ -6,6 +6,7 @@
 // touch the closed action registry.
 import { tool as sdkTool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { REGISTRY, classify } from "./actionRegistry.js";
+import { isRouteAllowed } from "../lib/routeAllowlist.js";
 import { emptyUsage, foldUsage } from "./usage.js";
 import {
   ARG_REPAIR_STATUSES,
@@ -39,6 +40,14 @@ function buildHttp(route, args) {
   }
   if (route.method === "PATCH") return { method: "PATCH", path, body: args.patch ?? args };
   return { method: "POST", path, body: args };
+}
+
+// A T2 self-authored tool (issue #134) carries `requestFn` instead of a static
+// `route` - its own `request({args, workspaceId})` computes {method, path,
+// body?} at call time. Static REGISTRY entries keep using buildHttp/route.
+function buildRequest(entry, args, workspaceId) {
+  if (typeof entry.requestFn === "function") return entry.requestFn({ args, workspaceId });
+  return buildHttp(entry.route, args);
 }
 
 // External-origin results are wrapped so the model treats them as data, never
@@ -135,8 +144,28 @@ function applySubstituteHint(ctx, toolName, res, result) {
   recordRecovery(ctx, "substitute", toolName, false);
 }
 
+// A generated tool's route is re-validated HERE, at call time, against the
+// live args - the load-time dry-run (server/agent/tools/generated/index.js)
+// only proved the tool's `example` args resolve to an allowed route; the
+// model's real args could resolve somewhere else entirely, so the executor
+// never trusts the load-time check alone. A static (hand-written) REGISTRY
+// entry has a fixed `route` already vetted by code review, so this only
+// applies to `requestFn`-carrying (generated) entries.
+function refuseIfRouteNotAllowed(entry, method, path) {
+  if (!entry.generated) return null;
+  if (isRouteAllowed(method, path)) return null;
+  return {
+    status: "forbidden",
+    reason: `generated tool route '${method} ${path}' is outside the allowlist - refused at call time`,
+  };
+}
+
 async function runAllowed(ctx, toolName, entry, args) {
-  const { method, path, body } = buildHttp(entry.route, args);
+  const { method, path, body } = buildRequest(entry, args, ctx.workspaceId);
+  const refusal = refuseIfRouteNotAllowed(entry, method, path);
+  if (refusal) {
+    return { result: { ...refusal, tool: toolName }, ok: false };
+  }
   const payload = body ? { ...body, workspace_id: ctx.workspaceId } : undefined;
   const res = await httpWithRetry(ctx, toolName, method, path, payload);
   const data = res?.data ?? null;

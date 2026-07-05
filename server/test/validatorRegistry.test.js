@@ -34,8 +34,8 @@ describe("getValidators - registry dispatch", () => {
     expect(result.valid).toBe(false);
   });
 
-  it("T2-T5 resolve to protectedSurface + a placeholder that fails closed", async () => {
-    for (const tier of ["T2", "T3", "T4", "T5"]) {
+  it("T3-T5 resolve to protectedSurface + a placeholder that fails closed", async () => {
+    for (const tier of ["T3", "T4", "T5"]) {
       expect(validatorNames(tier)).toEqual(["protectedSurface", "notImplemented"]);
       const placeholder = getValidators(tier).find((v) => v.name === "notImplemented");
       const result = await placeholder.run();
@@ -46,6 +46,10 @@ describe("getValidators - registry dispatch", () => {
 
   it("T1 resolves to protectedSurface + t1Render (issue #133 - no longer a placeholder)", () => {
     expect(validatorNames("T1")).toEqual(["protectedSurface", "t1Render"]);
+  });
+
+  it("T2 resolves to protectedSurface + t2Tool (issue #134 - no longer a placeholder)", () => {
+    expect(validatorNames("T2")).toEqual(["protectedSurface", "t2Tool"]);
   });
 });
 

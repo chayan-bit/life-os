@@ -257,18 +257,18 @@ describe("runBuildPipeline - cyclic plan fails closed before any build", () => {
   });
 });
 
-describe("runBuildPipeline - T2 validator placeholder fails closed", () => {
-  it("fails a T2 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
+describe("runBuildPipeline - T3 validator placeholder fails closed", () => {
+  it("fails a T3 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
     const plan = {
-      nodes: [{ id: "t2", tier: "T2", params: { moduleId: "learning" }, description: "R-multiple tool", dependsOn: [] }],
+      nodes: [{ id: "t3", tier: "T3", params: { crate: "lifeos-api" }, description: "weekly summary route", dependsOn: [] }],
     };
     const beforeCount = await mainLogCount();
 
-    // No validateFn injected: the real registry placeholder for T2 runs and
-    // rejects, so the node fails and nothing ships. T1 got its real
-    // validator in issue #133 - this same assertion now targets T2, which
+    // No validateFn injected: the real registry placeholder for T3 runs and
+    // rejects, so the node fails and nothing ships. T1 got its real validator
+    // in issue #133, T2 in issue #134 - this assertion now targets T3, which
     // is still a genuine placeholder.
-    const result = await runBuildPipeline("give the AI a tool to compute R-multiple", "ws_test", {
+    const result = await runBuildPipeline("add a weekly summary endpoint", "ws_test", {
       repoRoot,
       queryFn: makeQueryFn(plan, []),
       httpFn: makeHttpFn([]),
@@ -276,8 +276,67 @@ describe("runBuildPipeline - T2 validator placeholder fails closed", () => {
 
     expect(result.success).toBe(false);
     expect(result.nodes[0].status).toBe("failed");
-    expect(result.nodes[0].reason).toMatch(/not yet implemented for T2/);
+    expect(result.nodes[0].reason).toMatch(/not yet implemented for T3/);
     expect(await mainLogCount()).toBe(beforeCount);
+  });
+});
+
+describe("runBuildPipeline - T2 node builds, validates, and commits a generated tool (issue #134)", () => {
+  it("writes a valid pure-descriptor file and commits the node via the REAL t2Tool validator", async () => {
+    const plan = {
+      nodes: [{ id: "t2", tier: "T2", params: { name: "rMultiple" }, description: "R-multiple tool", dependsOn: [] }],
+    };
+    const beforeCount = await mainLogCount();
+
+    const queryFn = async function* (params) {
+      const purpose = params.options?.purpose;
+      if (purpose === "build_spec") {
+        yield { type: "result", subtype: "success", is_error: false, structured_output: SPEC };
+        return;
+      }
+      if (purpose === "build_plan") {
+        yield { type: "result", subtype: "success", is_error: false, structured_output: plan };
+        return;
+      }
+      // T2 build node: write ONE valid generated-tool descriptor file.
+      const dir = path.join(params.options.cwd, "server", "agent", "tools", "generated");
+      await fs.mkdir(dir, { recursive: true });
+      const source = [
+        'import { z } from "zod";',
+        "",
+        "const inputSchema = z.object({ tradeId: z.string() });",
+        "",
+        "export default {",
+        '  name: "rMultiple",',
+        '  description: "Compute the R-multiple for a closed trade entity.",',
+        '  classification: "allowed",',
+        "  inputSchema,",
+        '  example: { tradeId: "ent_trade_1" },',
+        "  request: ({ args }) => ({ method: \"GET\", path: `/api/entity/${args.tradeId}` }),",
+        "};",
+        "",
+      ].join("\n");
+      await fs.writeFile(path.join(dir, "rMultiple.js"), source, "utf8");
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        structured_output: { tier: "T2", files: ["server/agent/tools/generated/rMultiple.js"], summary: "ok" },
+      };
+    };
+
+    // No validateFn override: exercises the REAL t2Tool + protectedSurface
+    // validators end to end (no mocked "always pass" shortcut).
+    const result = await runBuildPipeline("give the AI a tool to compute R-multiple", "ws_test", {
+      repoRoot,
+      queryFn,
+      httpFn: makeHttpFn([]),
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.nodes[0].status).toBe("completed");
+    expect(result.nodes[0].commit).toBeTruthy();
+    expect(await mainLogCount()).toBe(beforeCount + 1);
   });
 });
 

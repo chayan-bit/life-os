@@ -54,6 +54,10 @@ describe("TIER_SCOPES glob shapes", () => {
       "services/Cargo.toml",
     ]);
   });
+
+  it("T2 targets the one generated-tool descriptor file only (issue #134)", () => {
+    expect(TIER_SCOPES.T2({ name: "rMultiple" })).toEqual(["server/agent/tools/generated/rMultiple.js"]);
+  });
 });
 
 describe("isWriteAllowed - per-tier allow", () => {
@@ -79,6 +83,12 @@ describe("isWriteAllowed - per-tier allow", () => {
     expect(isWriteAllowed("T3", { crate: "lifeos-api" }, abs("services/lifeos-vcs/src/history.rs"), ROOT)).toBe(false);
   });
 
+  it("T2 allows only its one named descriptor file, denies a sibling and the loader itself (issue #134)", () => {
+    expect(isWriteAllowed("T2", { name: "rMultiple" }, abs("server/agent/tools/generated/rMultiple.js"), ROOT)).toBe(true);
+    expect(isWriteAllowed("T2", { name: "rMultiple" }, abs("server/agent/tools/generated/otherTool.js"), ROOT)).toBe(false);
+    expect(isWriteAllowed("T2", { name: "rMultiple" }, abs("server/agent/tools/generated/index.js"), ROOT)).toBe(false);
+  });
+
   it("fails closed for an unknown tier", () => {
     expect(isWriteAllowed("T9", {}, abs("modules/x/module.js"), ROOT)).toBe(false);
   });
@@ -92,7 +102,7 @@ describe("isWriteAllowed - every protected surface denied at EVERY tier", () => 
   const tierCases = [
     ["T0", { moduleId: "habits" }],
     ["T1", { kind: "graph" }],
-    ["T2", { moduleId: "habits", crate: "lifeos-cli" }],
+    ["T2", { name: "rMultiple" }],
     ["T3", { crate: "lifeos-api" }],
     ["T4", {}],
     ["T5", { crate: "lifeos-finance" }],

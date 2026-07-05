@@ -12,6 +12,7 @@ import { isProtectedPath } from "../lib/tierScopes.js";
 import { validateStructural } from "./structural.js";
 import { validateRenderSmoke } from "./render.js";
 import { validateT1Render } from "./t1Render.js";
+import { validateT2Tool } from "./t2Tool.js";
 
 const execFile = promisify(execFileCb);
 const DEFAULT_BASE_REF = "main";
@@ -72,6 +73,7 @@ const protectedSurface = { name: "protectedSurface", run: runProtectedSurface };
 const structural = { name: "structural", run: validateStructural };
 const renderSmoke = { name: "renderSmoke", run: validateRenderSmoke };
 const t1Render = { name: "t1Render", run: validateT1Render };
+const t2Tool = { name: "t2Tool", run: validateT2Tool };
 
 function placeholder(tier) {
   return {
@@ -80,13 +82,13 @@ function placeholder(tier) {
   };
 }
 
-// T0 and T1 are fully built; T2-T5 have their protected-surface gate but
-// their tier-specific validators land with their generators (issue #133
-// landed T1's), so they fail closed until then.
+// T0-T2 are fully built; T3-T5 have their protected-surface gate but their
+// tier-specific validators land with their generators (issue #133 landed
+// T1's, issue #134 landed T2's), so they fail closed until then.
 const TIER_VALIDATORS = {
   T0: [protectedSurface, structural, renderSmoke],
   T1: [protectedSurface, t1Render],
-  T2: [protectedSurface, placeholder("T2")],
+  T2: [protectedSurface, t2Tool],
   T3: [protectedSurface, placeholder("T3")],
   T4: [protectedSurface, placeholder("T4")],
   T5: [protectedSurface, placeholder("T5")],

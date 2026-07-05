@@ -20,6 +20,7 @@ const BASE_REF = "main";
 const VALIDATOR_ARGS = {
   protectedSurface: (worktreePath, node) => ({ worktreePath, baseRef: BASE_REF }),
   t1Render: (worktreePath, node) => ({ worktreePath, params: node.params }),
+  t2Tool: (worktreePath, node) => ({ worktreePath, params: node.params }),
 };
 
 // Runs each validator for `tier` against the worktree, short-circuiting on the

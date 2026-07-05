@@ -41,12 +41,11 @@ export const TIER_SCOPES = {
     "frontend/src/core/rendererKinds.js",
   ],
 
-  // T2 Capability (agent tool) - the agentTools entry lives in the module's
-  // own manifest; the thin CLI wrapper lives in the lifeos-cli crate.
-  T2: ({ moduleId, crate = "lifeos-cli" }) => [
-    `modules/${moduleId}/module.js`,
-    `services/${crate}/src/**`,
-  ],
+  // T2 Capability (self-authored agent tool, issue #134) - ONE pure request
+  // descriptor file under the generated-tools dir; the loader
+  // (server/agent/tools/generated/index.js) auto-discovers it, so a T2 build
+  // never touches index.js itself.
+  T2: ({ name }) => [`server/agent/tools/generated/${name}.js`],
 
   // T3 Backend route / pipeline - a route in the target crate OR a pipeline
   // DAG stage.

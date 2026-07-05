@@ -44,7 +44,7 @@ export const buildNodeSummaryJsonSchema = {
 // the agent cannot claim it needs anything broader; Layer B enforces it anyway.
 export const TIER_PROMPTS = {
   T1: (node) => t1Prompt(node),
-  T2: (node) => tierPrompt("Tier 2 agent capability (tool)", node),
+  T2: (node) => t2Prompt(node),
   T3: (node) => tierPrompt("Tier 3 backend route or pipeline stage", node),
   T4: (node) => tierPrompt("Tier 4 additive migration or derived-index rebuild", node),
   T5: (node) => tierPrompt("Tier 5 subsystem (new crate)", node),
@@ -85,6 +85,53 @@ function t1Prompt(node) {
       "it, same handler as onClick) with an aria-label.",
     `Register the new kind in frontend/src/core/ModuleManifestPage.jsx's KIND_RENDERERS map ('${kind}': Generic${pascalKind}), ` +
       `and add '${kind}' to the RENDERER_KINDS array in frontend/src/core/rendererKinds.js (plain JS, no JSX/React imports).`,
+    "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
+  ].join("\n\n");
+}
+
+// T2 real generator prompt (issue #134) - a self-authored agent tool
+// (Voyager-style), written as ONE pure request descriptor file. The t2Tool
+// validator (server/validators/t2Tool.js) statically re-checks the import
+// posture, the shape, and dry-runs `request()` against the shared
+// isRouteAllowed allowlist, so a build that strays from this contract fails
+// closed downstream regardless of what this prompt asks for.
+function t2Prompt(node) {
+  const name = node.params?.name;
+  const scope = scopeDirs(node.tier, node.params).join(", ");
+  return [
+    "You are building a Tier 2 self-authored agent tool (Voyager-style) for the Life OS self-extension ladder.",
+    `Task: ${node.description}`,
+    `Write only within this tier's scope: ${scope}. Never touch anything else.`,
+    `Create exactly one file, server/agent/tools/generated/${name}.js, exporting a default PURE REQUEST DESCRIPTOR - ` +
+      "never a handler that performs I/O itself. The shape is:\n" +
+      "  { name, description, classification: 'allowed'|'gated', inputSchema: <a zod object schema>, " +
+      "example: <args satisfying inputSchema>, request: ({args, workspaceId}) => ({method, path, body?}) }",
+    "The ONLY import allowed anywhere in the file is `zod` (`import { z } from \"zod\"`). No other import/require, " +
+      "no `child_process`/`fs`/`net`/`http`/`https`/`fetch(`, no `process.env` reads, no dynamic `import(`. The " +
+      "executor performs the actual HTTP call through its own chokepoint (capability check, ledger, retry) - your " +
+      "`request` function only computes what to call, it never calls anything.",
+    "`request`'s returned `{method, path}` MUST target one of: GET/POST /api/entity(/:id), GET/POST /api/edge, " +
+      "GET /api/search, POST /api/memory/recall, POST /api/event, POST /api/browser/scrape. Anything else " +
+      "(configs, module-request, jobs, llm, agent, whatsapp, storage, travel, notion, connections, anything with " +
+      "'order'/'broker') is rejected and the tool will never be installed.",
+    "`example` is REQUIRED - concrete args your `inputSchema` accepts, used both to prove the schema round-trips " +
+      "(`inputSchema.safeParse(example)` must succeed) and to dry-run `request()` against the route allowlist.",
+    "Concrete example - a read-computation tool over trade entities (R-multiple):\n" +
+      "```js\n" +
+      'import { z } from "zod";\n\n' +
+      "const inputSchema = z.object({ tradeId: z.string() });\n\n" +
+      "export default {\n" +
+      '  name: "rMultiple",\n' +
+      '  description: "Compute the R-multiple (reward/risk) for a closed trade entity.",\n' +
+      '  classification: "allowed",\n' +
+      "  inputSchema,\n" +
+      '  example: { tradeId: "ent_trade_1" },\n' +
+      "  request: ({ args }) => ({ method: \"GET\", path: `/api/entity/${args.tradeId}` }),\n" +
+      "};\n" +
+      "```\n" +
+      "(the R-multiple itself is computed by the caller from the fetched entity's attrs - this descriptor only " +
+      "reads; it never writes.)",
+    `Write ${name}.js to solve: ${node.description}`,
     "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
   ].join("\n\n");
 }

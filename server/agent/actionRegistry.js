@@ -12,6 +12,7 @@
 // protected name always resolves to `forbidden` (fail-closed, closed set).
 // There is deliberately NO trading/order tool of any kind, anywhere.
 import { z } from "zod";
+import { loadGeneratedTools } from "./tools/generated/index.js";
 
 // Every name that would actuate a protected domain. Listed verbatim from the
 // frontend PROTECTED_TOOLS so the two layers agree on the boundary.
@@ -41,7 +42,7 @@ export const PROTECTED_TOOLS = Object.freeze([
 // `external: true` marks tools whose results carry outside-origin content
 // (search hits, recalled memory) so the executor wraps them as untrusted
 // (docs/SECURITY.md) - data, never instructions.
-export const REGISTRY = Object.freeze({
+const BASE_REGISTRY = Object.freeze({
   "entity.create": {
     classification: "allowed",
     description: "Create a generic entity (module + type + attrs row).",
@@ -179,6 +180,28 @@ export const REGISTRY = Object.freeze({
     route: { method: "POST", path: "/api/configs" },
   },
 });
+
+// T2 self-authored tools (issue #134, docs/SELF-EXTENSION-V2.md T2 row):
+// loaded once at module-load time (lazy relative to server startup, not to
+// every call) from server/agent/tools/generated/, failure-tolerant - a bad
+// file is skipped with a warning, never crashes the registry. A generated
+// tool whose name is protected or already registered is REJECTED by the
+// loader itself (`existingNames`), so it can never shadow a hand-written
+// tool or a protected domain.
+const PROTECTED_AND_BASE_NAMES = new Set([...PROTECTED_TOOLS, ...Object.keys(BASE_REGISTRY)]);
+const { tools: GENERATED_TOOLS, warnings: GENERATED_TOOL_WARNINGS } = await loadGeneratedTools({
+  existingNames: PROTECTED_AND_BASE_NAMES,
+});
+if (GENERATED_TOOL_WARNINGS.length > 0) {
+  // eslint-disable-next-line no-console -- best-effort visibility only, never fails the boot.
+  console.warn(`[actionRegistry] generated tool warnings:\n${GENERATED_TOOL_WARNINGS.join("\n")}`);
+}
+
+// The full, merged catalog: hand-written tools + validated generated tools.
+// Tool-RAG's digest (server/agent/toolRag.js::indexTools) hashes this object
+// directly, so a newly installed generated tool changes the digest and
+// triggers auto re-embed with no extra wiring.
+export const REGISTRY = Object.freeze({ ...BASE_REGISTRY, ...GENERATED_TOOLS });
 
 // Returns 'allowed' | 'gated' | 'forbidden'. Protected names and any unknown
 // name resolve to 'forbidden' - the closed-set, fail-closed default.

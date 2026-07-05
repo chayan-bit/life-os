@@ -101,7 +101,7 @@ describe("createPreToolUseHook - protected surfaces denied at EVERY tier", () =>
   const tiers = [
     ["T0", { moduleId: "habits" }],
     ["T1", { kind: "graph" }],
-    ["T2", { moduleId: "habits", crate: "lifeos-cli" }],
+    ["T2", { name: "rMultiple" }],
     ["T3", { crate: "lifeos-api" }],
     ["T4", {}],
     ["T5", { crate: "lifeos-finance" }],

@@ -18,7 +18,7 @@ export const GATED_TIERS = new Set(["T3", "T4", "T5"]);
 export const REQUIRED_PARAMS = {
   T0: ["moduleId"],
   T1: ["kind"],
-  T2: ["moduleId"],
+  T2: ["name"],
   T3: ["crate"],
   T4: [],
   T5: ["crate"],
@@ -66,7 +66,7 @@ function buildPlanPrompt(request, spec) {
   return [
     "Break this build request into a build DAG of tier-tagged nodes.",
     "Each node: a unique id, a tier (T0 manifest, T1 view, T2 tool, T3 route, T4 migration, T5 subsystem),",
-    "a params object with the keys that tier needs (T0/T2: moduleId; T1: kind; T3/T5: crate),",
+    "a params object with the keys that tier needs (T0: moduleId; T1: kind; T2: name; T3/T5: crate),",
     "a one-line description, and dependsOn (ids of nodes that must land first).",
     `Request: ${request}`,
     `Spec: ${JSON.stringify(spec)}`,

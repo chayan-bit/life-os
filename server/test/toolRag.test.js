@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { runAgentTurn } from "../agent/loop.js";
 import { CORE_TOOLS, TOOL_RAG_K, indexTools, retrieveTools } from "../agent/toolRag.js";
+import { loadGeneratedTools } from "../agent/tools/generated/index.js";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 // A minimal fake registry - mirrors the shape toolRag.js reads (name ->
 // { description }), independent of the real REGISTRY so tests can prove
@@ -160,6 +163,50 @@ describe("indexTools", () => {
 
     expect(result.reembedded).toBe(false);
     expect(result.error).toContain("memvec exploded");
+  });
+
+  // Issue #134: a newly installed T2 generated tool must change the digest
+  // and trigger a re-embed, with no extra wiring beyond loadGeneratedTools()
+  // feeding into the SAME registry indexTools already hashes (server/agent/
+  // actionRegistry.js merges generated tools into REGISTRY at module load).
+  it("a registry with a generated tool produces a different digest than without, and triggers re-embed", async () => {
+    const httpFn = makeHttp();
+    const embedFn = vi.fn(async () => {});
+    const baseRegistry = makeRegistry(["entity.create", "entity.list"]);
+
+    const withoutGenerated = await indexTools(baseRegistry, { httpFn, workspaceId: "ws_test", embedFn });
+    embedFn.mockClear();
+
+    const fixtureDir = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname), ".tmp-toolrag-generated-"));
+    try {
+      await fs.writeFile(
+        path.join(fixtureDir, "rMultiple.js"),
+        [
+          'import { z } from "zod";',
+          "",
+          "export default {",
+          '  name: "rMultiple",',
+          '  description: "Compute the R-multiple for a closed trade entity.",',
+          '  classification: "allowed",',
+          "  inputSchema: z.object({ tradeId: z.string() }),",
+          '  example: { tradeId: "ent_trade_1" },',
+          "  request: ({ args }) => ({ method: \"GET\", path: `/api/entity/${args.tradeId}` }),",
+          "};",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const { tools: generatedTools } = await loadGeneratedTools({ dir: fixtureDir });
+      const registryWithGenerated = { ...baseRegistry, ...generatedTools };
+
+      const withGenerated = await indexTools(registryWithGenerated, { httpFn: makeHttp(), workspaceId: "ws_test", embedFn });
+
+      expect(withGenerated.digest).not.toBe(withoutGenerated.digest);
+      expect(withGenerated.reembedded).toBe(true);
+      expect(embedFn).toHaveBeenCalledWith("rMultiple", registryWithGenerated.rMultiple.description, expect.anything());
+    } finally {
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
   });
 });
 
