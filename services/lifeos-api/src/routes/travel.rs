@@ -36,7 +36,7 @@ pub async fn book(State(state): State<AppState>, headers: HeaderMap, Json(req): 
     if req.trip_id.trim().is_empty() || req.provider.trim().is_empty() || req.item.trim().is_empty() {
         return Err(ApiError::BadRequest("trip_id, provider, and item are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "trip_id": req.trip_id, "provider": req.provider, "item": req.item, "cost": req.cost });
     let entity = draft_action(&state, &workspace_id, "travel", "book", attrs).await?;
     Ok(Json(entity))
@@ -73,7 +73,7 @@ pub async fn parse_emails(
     headers: HeaderMap,
     Json(req): Json<ParseEmails>,
 ) -> ApiResult<Json<ParseEmailsResult>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let mut rows = state
         .conn

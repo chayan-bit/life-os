@@ -44,7 +44,7 @@ pub async fn commit(
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let blob_ref = lifeos_vcs::hash_bytes(req.content.as_bytes());
     let size = req.content.len() as u64;
 

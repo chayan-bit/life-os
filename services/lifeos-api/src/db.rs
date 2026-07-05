@@ -297,6 +297,7 @@ mod tests {
             derived_db_path: format!("{path}.derived"),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             jwt_secret: "test".into(),
+            trust_workspace_header: true,
             agent_cwd: None,
             agent_timeout_secs: 30,
             server_dir: "server".to_string(),

@@ -16,7 +16,8 @@
 //! already calls `resolve_workspace` keeps working untouched; sessions are a
 //! new stateful layer behind it, not a replacement for it.
 
-use crate::config::DEFAULT_WORKSPACE;
+use crate::config::{Config, DEFAULT_WORKSPACE};
+use crate::error::{ApiError, ApiResult};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use axum::http::HeaderMap;
@@ -116,23 +117,63 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Resolve the workspace a request operates on, in priority order:
-/// verified JWT claim > `X-Workspace-Id` header > explicit param > default.
-pub fn resolve_workspace(headers: &HeaderMap, secret: &str, explicit: Option<&str>) -> String {
+fn header_workspace(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-workspace-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Resolve the workspace a request operates on.
+///
+/// `config.trust_workspace_header == true` (default, local-first): preserves
+/// the original soft-auth precedence exactly - verified JWT claim >
+/// `X-Workspace-Id` header > explicit param > default workspace. A valid JWT
+/// short-circuits everything else, matching the pre-flag behavior.
+///
+/// `config.trust_workspace_header == false` (shared/SaaS deployments):
+/// identity must be proven. No verified JWT -> 401. With a verified JWT, its
+/// `workspace_id` claim is authoritative; an explicit/header workspace value
+/// is accepted only when it agrees with the claim, otherwise the mismatch is
+/// rejected with 403 rather than silently overriding or being silently
+/// ignored (docs/SECURITY.md).
+pub fn resolve_workspace(
+    headers: &HeaderMap,
+    config: &Config,
+    explicit: Option<&str>,
+) -> ApiResult<String> {
     if let Some(token) = bearer(headers) {
-        if let Some(claims) = verify_token(secret, &token) {
-            return claims.workspace_id;
+        if let Some(claims) = verify_token(&config.jwt_secret, &token) {
+            if !config.trust_workspace_header {
+                let conflicting = header_workspace(headers)
+                    .filter(|h| *h != claims.workspace_id)
+                    .or_else(|| {
+                        explicit
+                            .filter(|e| !e.is_empty() && *e != claims.workspace_id)
+                            .map(|e| e.to_string())
+                    });
+                if let Some(bad) = conflicting {
+                    return Err(ApiError::Forbidden(format!(
+                        "workspace '{bad}' does not match the authenticated workspace"
+                    )));
+                }
+            }
+            return Ok(claims.workspace_id);
         }
     }
-    if let Some(h) = headers.get("x-workspace-id").and_then(|v| v.to_str().ok()) {
-        if !h.is_empty() {
-            return h.to_string();
+    if config.trust_workspace_header {
+        if let Some(h) = header_workspace(headers) {
+            return Ok(h);
         }
+        return Ok(match explicit {
+            Some(e) if !e.is_empty() => e.to_string(),
+            _ => DEFAULT_WORKSPACE.to_string(),
+        });
     }
-    match explicit {
-        Some(e) if !e.is_empty() => e.to_string(),
-        _ => DEFAULT_WORKSPACE.to_string(),
-    }
+    Err(ApiError::Unauthorized(
+        "missing or invalid authentication".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -154,27 +195,126 @@ mod tests {
         assert!(verify_token("secret-b", &token).is_none());
     }
 
+    /// Minimal `Config` for `resolve_workspace` tests - only `jwt_secret` and
+    /// `trust_workspace_header` matter here, the rest are unused by the
+    /// function under test.
+    fn test_config(secret: &str, trust_workspace_header: bool) -> Config {
+        Config {
+            db_path: "unused".into(),
+            turso_url: None,
+            turso_token: None,
+            sync_interval_secs: 60,
+            derived_db_path: "unused".into(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            jwt_secret: secret.to_string(),
+            trust_workspace_header,
+            agent_cwd: None,
+            agent_timeout_secs: 30,
+            server_dir: "server".into(),
+            nango_server_url: None,
+            nango_secret_key: None,
+            kite_api_key: None,
+            kite_api_secret: None,
+            secret_encryption_key: None,
+            gowa_base_url: None,
+            gowa_basic_auth: None,
+            gowa_webhook_secret: None,
+            browser_script_path: None,
+            vcs_blob_root: "unused".into(),
+            marketplace_signing_key: None,
+            turso_platform_api_token: None,
+            turso_org_slug: None,
+        }
+    }
+
     #[test]
     fn resolve_prefers_token_then_header_then_explicit_then_default() {
-        let secret = "s";
+        let config = test_config("s", true);
         // default
         let h = HeaderMap::new();
-        assert_eq!(resolve_workspace(&h, secret, None), DEFAULT_WORKSPACE);
+        assert_eq!(resolve_workspace(&h, &config, None).unwrap(), DEFAULT_WORKSPACE);
         // explicit
-        assert_eq!(resolve_workspace(&h, secret, Some("ws_x")), "ws_x");
+        assert_eq!(resolve_workspace(&h, &config, Some("ws_x")).unwrap(), "ws_x");
         // header beats explicit
         let mut h2 = HeaderMap::new();
         h2.insert("x-workspace-id", "ws_h".parse().unwrap());
-        assert_eq!(resolve_workspace(&h2, secret, Some("ws_x")), "ws_h");
+        assert_eq!(resolve_workspace(&h2, &config, Some("ws_x")).unwrap(), "ws_h");
         // token beats header
-        let token = issue_token(secret, "u", "ws_tok", "e");
+        let token = issue_token("s", "u", "ws_tok", "e");
         let mut h3 = HeaderMap::new();
         h3.insert("x-workspace-id", "ws_h".parse().unwrap());
         h3.insert(
             axum::http::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
-        assert_eq!(resolve_workspace(&h3, secret, Some("ws_x")), "ws_tok");
+        assert_eq!(resolve_workspace(&h3, &config, Some("ws_x")).unwrap(), "ws_tok");
+    }
+
+    #[test]
+    fn strict_mode_without_jwt_is_unauthorized() {
+        let config = test_config("s", false);
+        let h = HeaderMap::new();
+        assert!(matches!(
+            resolve_workspace(&h, &config, None),
+            Err(ApiError::Unauthorized(_))
+        ));
+
+        // Even an explicit/header workspace can't substitute for proof of
+        // identity - no DEFAULT_WORKSPACE fallback in strict mode either.
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-workspace-id", "ws_h".parse().unwrap());
+        assert!(matches!(
+            resolve_workspace(&h2, &config, Some("ws_x")),
+            Err(ApiError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn strict_mode_with_valid_jwt_uses_jwt_workspace() {
+        let config = test_config("s", false);
+        let token = issue_token("s", "u", "ws_tok", "e");
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        assert_eq!(resolve_workspace(&h, &config, None).unwrap(), "ws_tok");
+        // agreeing explicit/header values are fine
+        assert_eq!(
+            resolve_workspace(&h, &config, Some("ws_tok")).unwrap(),
+            "ws_tok"
+        );
+    }
+
+    #[test]
+    fn strict_mode_rejects_mismatching_header_despite_valid_jwt() {
+        let config = test_config("s", false);
+        let token = issue_token("s", "u", "ws_tok", "e");
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h.insert("x-workspace-id", "ws_other".parse().unwrap());
+        assert!(matches!(
+            resolve_workspace(&h, &config, None),
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn strict_mode_rejects_mismatching_explicit_despite_valid_jwt() {
+        let config = test_config("s", false);
+        let token = issue_token("s", "u", "ws_tok", "e");
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        assert!(matches!(
+            resolve_workspace(&h, &config, Some("ws_other")),
+            Err(ApiError::Forbidden(_))
+        ));
     }
 
     #[test]

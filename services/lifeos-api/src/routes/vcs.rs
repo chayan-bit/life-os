@@ -59,7 +59,7 @@ pub async fn commit(
         .decode(&req.content_base64)
         .map_err(|e| ApiError::BadRequest(format!("content_base64 is not valid base64: {e}")))?;
 
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let blob_ref =
         lifeos_vcs::store_blob(&state.vcs_store, &content).map_err(|e| ApiError::Internal(format!("blob store failed: {e}")))?;
     let size = content.len() as u64;
@@ -125,7 +125,7 @@ pub async fn checkout(
     headers: HeaderMap,
     Query(q): Query<CheckoutQuery>,
 ) -> ApiResult<Response> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     let blob_ref = match q.blob_ref {
         Some(r) => r,
         None => existing_blob_ref(&state, &workspace_id, &q.entity_id)
@@ -151,7 +151,7 @@ pub async fn history(
     headers: HeaderMap,
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Json<Vec<lifeos_vcs::VersionEntry>>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     let entries = lifeos_vcs::history(&state.conn, &workspace_id, &q.entity_id)
         .await
         .map_err(|e| ApiError::Internal(format!("history query failed: {e}")))?;
@@ -215,7 +215,7 @@ pub async fn diff(
     headers: HeaderMap,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     let entity = fetch_one(&state, &workspace_id, &q.entity_id).await?.0;
     let title = entity.title.as_deref().unwrap_or("");
     let name = entity.attrs.get("name").and_then(|v| v.as_str()).unwrap_or(title);
@@ -259,7 +259,7 @@ pub async fn list_refs(
     if q.kind != "branch" && q.kind != "tag" {
         return Err(ApiError::BadRequest("kind must be 'branch' or 'tag'".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     let refs = lifeos_vcs::list_refs(&state.conn, &workspace_id, &q.kind)
         .await
         .map_err(|e| ApiError::Internal(format!("list_refs failed: {e}")))?;
@@ -281,7 +281,7 @@ pub async fn create_branch(
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let snapshot_ref = lifeos_vcs::create_snapshot(&state.conn, &state.vcs_store, &workspace_id)
         .await
         .map_err(|e| ApiError::Internal(format!("create_snapshot failed: {e}")))?;
@@ -303,7 +303,7 @@ pub async fn create_tag(
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let snapshot_ref = lifeos_vcs::create_snapshot(&state.conn, &state.vcs_store, &workspace_id)
         .await
         .map_err(|e| ApiError::Internal(format!("create_snapshot failed: {e}")))?;
@@ -380,7 +380,7 @@ pub async fn blob(
     headers: HeaderMap,
     Query(q): Query<BlobQuery>,
 ) -> ApiResult<Response> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, q.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, q.workspace_id.as_deref())?;
     let bytes = crate::storage::read_blob(&state, &workspace_id, &q.blob_ref).await?;
     Ok(([("content-type", "application/octet-stream")], bytes).into_response())
 }

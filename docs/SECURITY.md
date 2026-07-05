@@ -162,6 +162,24 @@ same Validator 1 + Validator 2 chain this section describes.
   out, since nothing ever read it. `workspaces.plan` stays as a free-text
   label only, never checked by any route.
 
+- **Workspace resolution trust boundary (audit #5):** `resolve_workspace`
+  (`services/lifeos-api/src/auth.rs`) picks the tenant a request operates on.
+  A verified JWT's `workspace_id` claim is always checked first.
+  `LIFEOS_TRUST_WORKSPACE_HEADER` (config field `trust_workspace_header`,
+  default `true`) controls what happens without one.
+  When `true` (the local-first Mac default) an unauthenticated
+  `X-Workspace-Id` header, or an explicit `workspace_id` in the request body,
+  is trusted outright, falling back to the seeded default workspace - this
+  is the current single-user behavior and is unsafe for a shared deployment,
+  since any caller can claim any workspace.
+  When `false`, identity must be proven: a request with no verified JWT gets
+  401, never the default workspace.
+  With a verified JWT, its `workspace_id` claim is authoritative; a header or
+  body `workspace_id` that disagrees with the claim is rejected with 403
+  rather than silently honored or silently overridden.
+  **Any shared/SaaS deployment of `lifeos-api` must set
+  `LIFEOS_TRUST_WORKSPACE_HEADER=0`.**
+
 ---
 
 ## 6. Must-pass verification (security)

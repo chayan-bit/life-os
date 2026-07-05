@@ -46,7 +46,7 @@ pub async fn start_session(
 ) -> ApiResult<Json<Connection>> {
     let whatsapp = whatsapp_or_501(&state)?;
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -84,7 +84,7 @@ pub async fn qr(
 ) -> ApiResult<Json<Value>> {
     let whatsapp = whatsapp_or_501(&state)?;
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let qr_link = whatsapp.login_qr(&workspace_id).await?;
     Ok(Json(json!({ "qr_link": qr_link })))
 }
@@ -98,7 +98,7 @@ pub async fn status(
 ) -> ApiResult<Json<Value>> {
     let whatsapp = whatsapp_or_501(&state)?;
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let connected = whatsapp.status(&workspace_id).await?;
 
     if connected {
@@ -203,7 +203,7 @@ pub async fn send(
         return Err(ApiError::BadRequest("to and message are required".into()));
     }
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }

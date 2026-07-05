@@ -48,7 +48,7 @@ pub async fn create(
         return Err(ApiError::BadRequest("type is required".into()));
     }
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -120,7 +120,7 @@ pub async fn list(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Vec<Event>>> {
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
 
     let mut sql = format!("SELECT {COLS_EVENT} FROM events WHERE workspace_id = ?1");
     let mut binds: Vec<String> = vec![workspace_id];

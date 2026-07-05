@@ -35,7 +35,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let body = proxy_call(&state, &workspace_id, PROVIDER, "GET", "conversations.list", &[], None).await?;
     Ok(Json(body))
 }
@@ -57,7 +57,7 @@ pub async fn post(
     if req.channel.trim().is_empty() || req.text.trim().is_empty() {
         return Err(ApiError::BadRequest("channel and text are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "channel": req.channel, "text": req.text });
     let entity = draft_action(&state, &workspace_id, "slack", "post", attrs).await?;
     Ok(Json(entity))
@@ -82,7 +82,7 @@ pub async fn sync(
     headers: HeaderMap,
     Json(req): Json<SyncSlack>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let max_channels = req.max_channels.unwrap_or(20).min(100);
     let max_messages = req.max_messages_per_channel.unwrap_or(50).min(200);
 

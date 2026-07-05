@@ -11,7 +11,7 @@ pub async fn metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let ws = resolve_workspace(&headers, &state.config, None)?;
 
     // Roll-up over the run log.
     let mut rows = state

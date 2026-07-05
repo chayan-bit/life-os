@@ -37,7 +37,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let body =
         proxy_call(&state, &workspace_id, PROVIDER, "GET", "calendar/v3/calendars/primary/events", &[], None).await?;
     Ok(Json(body))
@@ -61,7 +61,7 @@ pub async fn create(
     if req.summary.trim().is_empty() || req.start.trim().is_empty() || req.end.trim().is_empty() {
         return Err(ApiError::BadRequest("summary, start, and end are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "summary": req.summary, "start": req.start, "end": req.end });
     let entity = draft_action(&state, &workspace_id, "calendar", "create", attrs).await?;
     Ok(Json(entity))
@@ -86,7 +86,7 @@ pub async fn move_event(
     if req.event_id.trim().is_empty() || req.start.trim().is_empty() || req.end.trim().is_empty() {
         return Err(ApiError::BadRequest("event_id, start, and end are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "event_id": req.event_id, "start": req.start, "end": req.end });
     let entity = draft_action(&state, &workspace_id, "calendar", "move", attrs).await?;
     Ok(Json(entity))
@@ -109,7 +109,7 @@ pub async fn sync(
     headers: HeaderMap,
     Json(req): Json<SyncCalendar>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let max_results = req.max_results.unwrap_or(50).min(250);
 
     let list = proxy_call(

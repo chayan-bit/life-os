@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub async fn get_workspace(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let ws = resolve_workspace(&headers, &state.config, None)?;
     let mut rows = state
         .conn
         .query(
@@ -48,7 +48,7 @@ pub async fn update_workspace(
     headers: HeaderMap,
     Json(req): Json<UpdateWorkspace>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let ws = resolve_workspace(&headers, &state.config, None)?;
     if req.name.is_none() && req.plan.is_none() {
         return Err(ApiError::BadRequest("at least one of name, plan is required".into()));
     }

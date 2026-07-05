@@ -34,9 +34,9 @@ pub async fn modules(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<StreamParams>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+) -> crate::error::ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
 
     let stream = async_stream::stream! {
         let mut last_id = String::new();
@@ -66,5 +66,5 @@ pub async fn modules(
         }
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }

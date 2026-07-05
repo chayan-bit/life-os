@@ -45,7 +45,7 @@ pub async fn provision(
     Json(req): Json<ProvisionRequest>,
 ) -> ApiResult<Json<Value>> {
     let (api_token, org) = platform_token_or_501(&state)?;
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let db_name = format!("lifeos-{}", workspace_id.replace('_', "-").to_lowercase());
     let client = reqwest::Client::new();
@@ -121,7 +121,7 @@ pub async fn provision(
 /// `GET /api/workspace/database` - the provisioned database's name/url, if
 /// any. Never returns the auth token.
 pub async fn get_database(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     let mut rows = state
         .conn
         .query(

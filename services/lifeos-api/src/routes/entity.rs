@@ -46,7 +46,7 @@ pub async fn create(
         return Err(ApiError::BadRequest("module and type are required".into()));
     }
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -117,7 +117,7 @@ pub async fn list(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Vec<Entity>>> {
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
 
     // Build a positional-parameter query (?1, ?2, ...) - never string-interpolate values.
     let mut sql = format!("SELECT {COLS_ENTITY} FROM entities WHERE workspace_id = ?1");
@@ -148,7 +148,7 @@ pub async fn get_one(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Entity>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     fetch_one(&state, &workspace_id, &id).await
 }
 
@@ -170,7 +170,7 @@ pub async fn update(
     Json(req): Json<UpdateEntity>,
 ) -> ApiResult<Json<Entity>> {
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     // Ensure it exists in this tenant before mutating.
     let _ = fetch_one(&state, &workspace_id, &id).await?;
 
@@ -229,7 +229,7 @@ pub async fn reconcile(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Entity>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     // Ensure it exists in this tenant before mutating.
     let _ = fetch_one(&state, &workspace_id, &id).await?;
     crate::reconcile::reconcile_entity(&state.conn, &workspace_id, &id).await?;

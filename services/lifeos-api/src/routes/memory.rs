@@ -37,6 +37,58 @@ fn internal(e: lifeos_memory::MemoryError) -> ApiError {
     ApiError::Internal(format!("memory engine: {e}"))
 }
 
+const MEMORY_MODEL_TIMEOUT_SECS: u64 = 60;
+
+/// Task-keyed instruction the model is asked to follow - kept identical to
+/// `lifeos_drain::ai::AgentCliModel`'s wording (audit #6) so a cycle run from
+/// either binary produces the same shape of summary.
+fn memory_model_task_instruction(task: &str) -> &'static str {
+    match task {
+        "summarize" => {
+            "Summarize these events into 2-4 factual sentences. No speculation, no invented \
+             detail - only what the events actually say."
+        }
+        "reflect" => {
+            "Write a short day-level reflection (2-4 factual sentences) synthesizing these \
+             summaries. No speculation, no invented detail."
+        }
+        _ => "Summarize the following into 2-4 factual sentences. No speculation, no invented detail.",
+    }
+}
+
+/// `lifeos_memory::MemoryModel` backed by a local agent CLI (env-gated by
+/// `LIFEOS_MEMORY_MODEL=agent`, docs/AI-MEMORY.md §5). Intentionally
+/// duplicated (not shared) from `lifeos_drain::ai::AgentCliModel`: keeping
+/// `lifeos-memory` free of the `lifeos-agents` dependency rules out putting
+/// the impl there, and `lifeos-api`/`lifeos-drain` are separate binaries with
+/// no third crate that already depends on both without adding a new
+/// cross-crate edge - so this ~40-line impl is kept in sync by hand. See that
+/// file's doc comment for the twin.
+///
+/// ANY failure (no CLI detected, timeout, empty output) falls back to
+/// `HeuristicModel`'s deterministic output for that call, so an on-demand
+/// sleep cycle never fails outright.
+struct AgentCliModel {
+    agents: std::sync::Arc<Vec<crate::agents::DetectedAgent>>,
+    cwd: Option<std::path::PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl lifeos_memory::MemoryModel for AgentCliModel {
+    async fn complete(&self, task: &str, prompt: &str) -> Result<String, lifeos_memory::MemoryError> {
+        let full_prompt = format!("{}\n\n{prompt}", memory_model_task_instruction(task));
+        let opts = lifeos_agents::RunOptions {
+            cwd: self.cwd.clone(),
+            timeout_secs: MEMORY_MODEL_TIMEOUT_SECS,
+            ..Default::default()
+        };
+        match lifeos_agents::run(&self.agents, &opts, &full_prompt).await {
+            Ok(text) if !text.trim().is_empty() => Ok(text.trim().to_string()),
+            _ => HeuristicModel.complete(task, prompt).await,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RecallRequest {
     query: String,
@@ -178,7 +230,7 @@ pub async fn recall_handler(
     if req.query.trim().is_empty() {
         return Err(ApiError::BadRequest("query is required".into()));
     }
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let (_, outcome_json) = recall_logged(&state, &ws, &req.query, &recall_params(&req)).await?;
     Ok(Json(outcome_json))
 }
@@ -204,7 +256,7 @@ pub async fn context_handler(
     if req.query.trim().is_empty() {
         return Err(ApiError::BadRequest("query is required".into()));
     }
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let params = RecallParams {
         top_k: req.top_k.unwrap_or(8).clamp(1, 50),
         ..Default::default()
@@ -253,7 +305,7 @@ pub async fn ingest_handler(
     if event_type.starts_with("memory.") {
         return Err(ApiError::BadRequest("memory.* events are reserved for the engine".into()));
     }
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !crate::db::workspace_exists(&state.conn, &ws).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{ws}'")));
     }
@@ -283,9 +335,21 @@ pub async fn sleep_handler(
     headers: HeaderMap,
     Json(req): Json<WorkspaceOnly>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let now = now_secs();
-    let model = ReplayCachedModel::new(&HeuristicModel, &state.conn, now);
+    // `LIFEOS_MEMORY_MODEL=agent` routes through the local agent-CLI router
+    // (audit #6); anything else (including unset) keeps the deterministic
+    // extractive heuristic, unchanged from before.
+    let inner_model: Box<dyn lifeos_memory::MemoryModel> =
+        if std::env::var("LIFEOS_MEMORY_MODEL").as_deref() == Ok("agent") {
+            Box::new(AgentCliModel {
+                agents: state.agents.clone(),
+                cwd: state.config.agent_cwd.clone().map(std::path::PathBuf::from),
+            })
+        } else {
+            Box::new(HeuristicModel)
+        };
+    let model = ReplayCachedModel::new(inner_model.as_ref(), &state.conn, now);
     // Give the cycle the workspace's primary backend so its decay sweep can
     // actually tier cold memories out (issue #117 auto-tiering, audit #3), not
     // just count them. FTS keeps full text, so tiered nodes stay recallable.
@@ -305,7 +369,7 @@ pub async fn rebuild_handler(
     headers: HeaderMap,
     Json(req): Json<WorkspaceOnly>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let stats = lifeos_memory::rebuild_workspace(&state.conn, &ws).await.map_err(internal)?;
     Ok(Json(serde_json::to_value(stats).unwrap_or_default()))
 }
@@ -317,7 +381,7 @@ pub async fn tier_handler(
     headers: HeaderMap,
     Json(req): Json<WorkspaceOnly>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let now = now_secs();
     let cold = lifeos_memory::find_cold_nodes(&state.conn, &ws, now, 30 * 86400, 0.4, 1)
         .await
@@ -352,7 +416,7 @@ pub async fn rules_handler(
     headers: HeaderMap,
     Query(params): Query<RulesParams>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let rules = rules_for_prompt(&state.conn, &ws, params.budget.unwrap_or(1000).clamp(50, 8000))
         .await
         .map_err(internal)?;
@@ -373,7 +437,7 @@ pub async fn inspect_handler(
     headers: HeaderMap,
     Query(params): Query<InspectParams>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let mut rows = state
         .conn
@@ -429,7 +493,7 @@ pub async fn network_handler(
     headers: HeaderMap,
     Query(params): Query<WorkspaceOnly>,
 ) -> ApiResult<Json<Value>> {
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let communities = list_network_map(&state.conn, &ws).await.map_err(internal)?;
     Ok(Json(json!({
         "communities": communities.into_iter().map(|c| json!({
@@ -459,7 +523,7 @@ pub async fn network_ask_handler(
     if req.question.trim().is_empty() {
         return Err(ApiError::BadRequest("question is required".into()));
     }
-    let ws = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let ws = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let top_k = req.top_k.unwrap_or(3).clamp(1, 20);
     let hits = ask_network(&state.conn, &ws, &req.question, top_k).await.map_err(internal)?;
     Ok(Json(json!({ "hits": hits })))

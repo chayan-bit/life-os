@@ -32,6 +32,7 @@ fn base_config(db_path: &str) -> Config {
         derived_db_path: format!("{db_path}.derived"),
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         jwt_secret: "test-secret".into(),
+        trust_workspace_header: true,
         agent_cwd: None,
         agent_timeout_secs: 30,
         server_dir: "server".to_string(),

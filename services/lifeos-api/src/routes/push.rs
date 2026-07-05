@@ -31,7 +31,7 @@ pub async fn subscribe(
     if req.endpoint.trim().is_empty() {
         return Err(ApiError::BadRequest("endpoint is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -61,7 +61,7 @@ pub async fn unsubscribe(
     headers: HeaderMap,
     Json(req): Json<UnsubscribeRequest>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     state
         .conn
         .execute(

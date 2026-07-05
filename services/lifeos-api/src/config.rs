@@ -29,6 +29,14 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     /// HMAC secret for signing/verifying `key_token` JWTs.
     pub jwt_secret: String,
+    /// When true (default, local-first), an unauthenticated `x-workspace-id`
+    /// header or body `workspace_id` is trusted outright - the current
+    /// single-user Mac behavior. When false (shared/SaaS deployments), any
+    /// explicit workspace value is honored only alongside a verified JWT, and
+    /// the JWT's own `workspace_id` claim is authoritative: a mismatching
+    /// header/body value is rejected rather than silently overridden. See
+    /// docs/SECURITY.md.
+    pub trust_workspace_header: bool,
     /// Working directory agent CLIs are spawned in (OpenDesign-style managed cwd).
     pub agent_cwd: Option<String>,
     /// Hard ceiling on how long a single agent invocation may run.
@@ -116,6 +124,16 @@ impl Config {
             "lifeos-dev-insecure-secret-change-me".to_string()
         });
 
+        let trust_workspace_header = std::env::var("LIFEOS_TRUST_WORKSPACE_HEADER")
+            .ok()
+            .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if trust_workspace_header {
+            tracing::warn!(
+                "workspace header trusted - local-first mode; set LIFEOS_TRUST_WORKSPACE_HEADER=0 for shared deployments"
+            );
+        }
+
         let agent_cwd = std::env::var("LIFEOS_AGENT_CWD").ok();
 
         let agent_timeout_secs = std::env::var("LIFEOS_AGENT_TIMEOUT_SECS")
@@ -171,6 +189,7 @@ impl Config {
             derived_db_path,
             bind_addr,
             jwt_secret,
+            trust_workspace_header,
             agent_cwd,
             agent_timeout_secs,
             server_dir,

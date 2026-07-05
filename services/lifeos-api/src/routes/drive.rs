@@ -37,7 +37,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let body = proxy_call(&state, &workspace_id, PROVIDER, "GET", "drive/v3/files", &[], None).await?;
     Ok(Json(body))
 }
@@ -61,7 +61,7 @@ pub async fn upload(
     if req.name.trim().is_empty() || req.source_ref.trim().is_empty() {
         return Err(ApiError::BadRequest("name and source_ref are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "name": req.name, "source_ref": req.source_ref });
     let entity = draft_action(&state, &workspace_id, "drive", "upload", attrs).await?;
     Ok(Json(entity))
@@ -84,7 +84,7 @@ pub async fn share(
     if req.entity_id.trim().is_empty() || req.target.trim().is_empty() {
         return Err(ApiError::BadRequest("entity_id and target are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "entity_id": req.entity_id, "target": req.target });
     let entity = draft_action(&state, &workspace_id, "drive", "share", attrs).await?;
     Ok(Json(entity))
@@ -110,7 +110,7 @@ pub async fn sync(
     headers: HeaderMap,
     Json(req): Json<SyncDrive>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let max_results = req.max_results.unwrap_or(50).min(250);
 
     let list = proxy_call(

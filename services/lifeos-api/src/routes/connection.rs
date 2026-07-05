@@ -44,7 +44,7 @@ pub async fn start_session(
         return Err(ApiError::BadRequest("provider is required".into()));
     }
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -82,7 +82,7 @@ pub async fn complete(
         return Err(ApiError::BadRequest("connection_id and provider are required".into()));
     }
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -137,7 +137,7 @@ pub async fn list(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Vec<Connection>>> {
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
 
     let mut sql = format!("SELECT {COLS_CONNECTION} FROM connections WHERE workspace_id = ?1");
     let mut binds: Vec<String> = vec![workspace_id];
@@ -158,7 +158,7 @@ pub async fn disconnect(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Connection>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, None);
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
     let existing = fetch_one(&state, &workspace_id, &id).await?.0;
 
     if let Some(nango_id) = &existing.nango_connection_id {

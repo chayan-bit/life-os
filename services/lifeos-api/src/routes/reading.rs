@@ -78,7 +78,7 @@ pub async fn save(
     if req.url.trim().is_empty() {
         return Err(ApiError::BadRequest("url is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let html = reading_or_501(&state)?.fetch(&req.url).await?;
     let (title, text) = extract(&html);
@@ -226,7 +226,7 @@ pub async fn highlight(
     if req.article_id.trim().is_empty() || req.quote.trim().is_empty() {
         return Err(ApiError::BadRequest("article_id and quote are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let exists = {
         let mut rows = state

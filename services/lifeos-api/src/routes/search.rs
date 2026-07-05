@@ -36,7 +36,7 @@ pub async fn search(
     Query(params): Query<SearchParams>,
 ) -> ApiResult<Json<Value>> {
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let match_query = build_fts_query(&params.q);

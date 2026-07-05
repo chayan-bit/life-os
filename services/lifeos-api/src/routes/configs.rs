@@ -37,7 +37,7 @@ pub async fn create(
     if req.kind.trim().is_empty() {
         return Err(ApiError::BadRequest("kind is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let id = new_id("cfg");
     let now = now_secs();
     let payload_str = serde_json::to_string(&req.payload).unwrap_or_else(|_| "{}".into());
@@ -121,7 +121,7 @@ pub async fn rollback(
     headers: HeaderMap,
     Json(req): Json<RollbackBody>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let current_ref = active_ref(&state, &workspace_id, &req.kind).await?;
 
     let mut rows = state
@@ -161,7 +161,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
 
     let mut sql = "SELECT id, workspace_id, kind, payload, status, shadow_summary, created_at, promoted_at \
                     FROM configs WHERE workspace_id = ?1"

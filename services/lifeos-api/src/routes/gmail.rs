@@ -37,7 +37,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let mut query = Vec::new();
     if let Some(q) = &params.q {
         query.push(("q", q.as_str()));
@@ -65,7 +65,7 @@ pub async fn send(
     if req.to.trim().is_empty() || req.subject.trim().is_empty() {
         return Err(ApiError::BadRequest("to and subject are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "to": req.to, "subject": req.subject, "body": req.body });
     let entity = draft_action(&state, &workspace_id, "gmail", "send", attrs).await?;
     Ok(Json(entity))
@@ -97,7 +97,7 @@ pub async fn sync(
     headers: HeaderMap,
     Json(req): Json<SyncGmail>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let max_results = req.max_results.unwrap_or(20).min(100);
 
     let list = proxy_call(

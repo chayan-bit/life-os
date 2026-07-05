@@ -12,10 +12,14 @@ use serde_json::json;
 pub enum ApiError {
     /// Bad/invalid input from the client.
     BadRequest(String),
-    /// Authentication present but invalid. Reserved for when strict bearer-token
-    /// enforcement is switched on (the base runs in soft-auth mode).
-    #[allow(dead_code)]
+    /// Authentication missing or invalid where it is required - e.g. strict
+    /// workspace resolution (`trust_workspace_header = false`) with no
+    /// verified JWT.
     Unauthorized(String),
+    /// Authenticated, but the request asked for something the proven identity
+    /// isn't allowed - e.g. an explicit/header workspace that disagrees with
+    /// the JWT's own `workspace_id` claim.
+    Forbidden(String),
     /// Resource (entity/workspace/...) does not exist.
     NotFound(String),
     /// Route is intentionally not built yet in the base (honest, not a mock).
@@ -31,6 +35,7 @@ impl ApiError {
         match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, m),

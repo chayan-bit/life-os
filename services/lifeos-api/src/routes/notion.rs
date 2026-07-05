@@ -40,7 +40,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let body = proxy_call(&state, &workspace_id, PROVIDER, "POST", "v1/search", &[], Some(json!({}))).await?;
     Ok(Json(body))
 }
@@ -62,7 +62,7 @@ pub async fn create(
     if req.parent_id.trim().is_empty() || req.title.trim().is_empty() {
         return Err(ApiError::BadRequest("parent_id and title are required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let attrs = json!({ "parent_id": req.parent_id, "title": req.title });
     let entity = draft_action(&state, &workspace_id, "notion", "create", attrs).await?;
     Ok(Json(entity))
@@ -107,7 +107,7 @@ pub async fn sync(
     headers: HeaderMap,
     Json(req): Json<SyncNotion>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let body = proxy_call(&state, &workspace_id, PROVIDER, "POST", "v1/search", &[], Some(json!({}))).await?;
     let items = body.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -220,7 +220,7 @@ pub async fn push(
     if req.entity_id.trim().is_empty() {
         return Err(ApiError::BadRequest("entity_id is required".into()));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let mut rows = state
         .conn

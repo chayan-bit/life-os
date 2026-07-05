@@ -39,7 +39,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Vec<Entity>>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let mut rows = state
         .conn
         .query(
@@ -94,7 +94,7 @@ pub async fn create(
             STORAGE_KINDS.join(", ")
         )));
     }
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     if !workspace_exists(&state.conn, &workspace_id).await? {
         return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'")));
     }
@@ -169,7 +169,7 @@ pub async fn migrate(
     headers: HeaderMap,
     Json(req): Json<MigrateRequest>,
 ) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let target = fetch_backend_config(&state, &workspace_id, &req.target_backend_id).await?;
     if target.status.as_deref() != Some("active") {
         return Err(ApiError::BadRequest(

@@ -37,7 +37,7 @@ pub async fn agent(
         return Err(ApiError::BadRequest("prompt is required".into()));
     }
     let workspace_id =
-        resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+        resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
 
     let run = tokio::process::Command::new("node")
         .arg("agent/run.js")

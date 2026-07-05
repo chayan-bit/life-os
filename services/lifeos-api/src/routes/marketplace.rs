@@ -84,7 +84,7 @@ pub async fn publish(
     structural_check(&req.manifest, &req.module_id, &req.version)?;
     let key = signing_key_or_501(&state)?;
 
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, req.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
     let manifest_bytes = serde_json::to_vec(&req.manifest)
         .map_err(|_| ApiError::BadRequest("manifest is not serializable".into()))?;
     let signature = marketplace_sign::sign(key, &manifest_bytes);
@@ -135,7 +135,7 @@ pub async fn list(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Value>> {
-    let workspace_id = resolve_workspace(&headers, &state.config.jwt_secret, params.workspace_id.as_deref());
+    let workspace_id = resolve_workspace(&headers, &state.config, params.workspace_id.as_deref())?;
     let mut sql = "SELECT id, workspace_id, module_id, version, manifest_json, signature, publisher_pubkey, created_at \
                     FROM module_packages WHERE workspace_id = ?1"
         .to_string();
