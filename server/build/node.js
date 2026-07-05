@@ -6,59 +6,36 @@
 // end. Rather than reimplement any of that, a T0 node delegates to that
 // exported function and reports it already committed.
 //
-// T1-T5 nodes get an honest minimal build here: a fresh worktree, Layer B's
+// T1-T4 nodes get an honest minimal build here: a fresh worktree, Layer B's
 // per-tier PreToolUse hook, Layer C's Seatbelt sandbox scoped to the tier's
 // writable dirs, and a per-tier prompt requiring a Zod structured summary
-// { tier, files, summary }. Their real generators (and richer prompts/schemas)
-// land per tier with #133+; validation (validate.js) still fails these closed
-// until then, so nothing ships unvalidated.
-import { z } from "zod";
+// { tier, files, summary }. T5 is a whole crate and does NOT flow through this
+// single-call path - buildNode dispatches it to the bounded supervisor +
+// subagent split in t5Subsystem.js (issue #137, docs/SELF-EXTENSION-V2.md §7).
 import { scaffoldModule } from "../scaffold.js";
 import { buildSandboxConfig } from "../lib/sandbox.js";
-import { createPreToolUseHook } from "../lib/preToolUseHook.js";
 import { scopeDirs } from "../lib/tierScopes.js";
 import { createWorktree, removeWorktree } from "../lib/worktree.js";
-import { slugify } from "../lib/slugify.js";
+import { buildT5Node } from "./t5Subsystem.js";
+import {
+  ALLOWED_TOOLS,
+  DISALLOWED_TOOLS,
+  BuildNodeSummary,
+  buildNodeSummaryJsonSchema,
+  nodeKey,
+  trackedHook,
+  consumeRole,
+} from "./buildAgent.js";
 
-const ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash"];
-const DISALLOWED_TOOLS = ["WebFetch", "WebSearch", "Bash(rm -rf *)", "Bash(git push *)", "Bash(curl *)"];
-
-export const BuildNodeSummary = z.object({
-  tier: z.string(),
-  files: z.array(z.string()),
-  summary: z.string(),
-});
-
-export const buildNodeSummaryJsonSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["tier", "files", "summary"],
-  properties: {
-    tier: { type: "string" },
-    files: { type: "array", items: { type: "string" } },
-    summary: { type: "string" },
-  },
-};
-
-// Honest, minimal per-tier prompts. Each names the tier's exact write-scope so
-// the agent cannot claim it needs anything broader; Layer B enforces it anyway.
+// Honest, minimal per-tier prompts (T1-T4 only). Each names the tier's exact
+// write-scope so the agent cannot claim it needs anything broader; Layer B
+// enforces it anyway. T5's prompts live in t5Subsystem.js (one per role).
 export const TIER_PROMPTS = {
   T1: (node) => t1Prompt(node),
   T2: (node) => t2Prompt(node),
   T3: (node) => t3Prompt(node),
   T4: (node) => t4Prompt(node),
-  T5: (node) => tierPrompt("Tier 5 subsystem (new crate)", node),
 };
-
-function tierPrompt(role, node) {
-  const scope = scopeDirs(node.tier, node.params).join(", ");
-  return [
-    `You are building a ${role} for the Life OS self-extension ladder.`,
-    `Task: ${node.description}`,
-    `Write only within this tier's scope: ${scope}. Never touch anything else.`,
-    "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
-  ].join("\n\n");
-}
 
 // T1 real generator prompt (issue #133) - a new Generic<Kind>.jsx renderer,
 // following the exact props/data-fetch contract every sibling renderer under
@@ -206,46 +183,12 @@ function t4Prompt(node) {
   ].join("\n\n");
 }
 
-// A stable, filesystem-safe worktree key per node (branch/dir name), so two
-// nodes of one run never collide.
-function nodeKey(ctx, node) {
-  return `build-${slugify(ctx.runId)}-${slugify(node.id)}`;
-}
-
-// Consumes the SDK stream for a T1-T5 build: surfaces a hook denial directly,
-// rejects a non-successful/interrupted result, and validates the tier summary.
+// Consumes the SDK stream for a T1-T4 build: surfaces a hook denial directly,
+// rejects a non-successful/interrupted result, and validates the tier summary
+// (shared consumption contract in buildAgent.js).
 async function runBuildAgent(ctx, prompt, options, hookState) {
-  let resultMessage = null;
-  for await (const message of ctx.queryFn({ prompt, options })) {
-    if (message.type === "result") resultMessage = message;
-  }
-  if (hookState.denied) {
-    throw new Error(`PreToolUse hook denied a write outside the tier scope: ${hookState.reason}`);
-  }
-  if (!resultMessage || resultMessage.subtype !== "success" || resultMessage.is_error) {
-    throw new Error(`build agent did not complete successfully (subtype: ${resultMessage?.subtype ?? "none"})`);
-  }
-  const parsed = BuildNodeSummary.safeParse(resultMessage.structured_output);
-  if (!parsed.success) {
-    throw new Error(`build node summary failed validation: ${parsed.error.message}`);
-  }
-  return parsed.data;
-}
-
-// Wraps Layer B's hook so this module can observe a denial directly, exactly as
-// scaffold.js does.
-function trackedHook(scope) {
-  const state = { denied: false, reason: null };
-  const base = createPreToolUseHook(scope);
-  const hook = async (input) => {
-    const result = await base(input);
-    if (result.hookSpecificOutput?.permissionDecision === "deny") {
-      state.denied = true;
-      state.reason = result.hookSpecificOutput.permissionDecisionReason;
-    }
-    return result;
-  };
-  return { hook, state };
+  const { data } = await consumeRole(ctx.queryFn, prompt, options, { hookState, schema: BuildNodeSummary });
+  return data;
 }
 
 // T0: delegate the whole node to scaffoldModule (its own worktree + validators
@@ -264,7 +207,7 @@ async function buildT0Node(ctx, node) {
   return { alreadyCommitted: true, moduleId: result.moduleId, summary: result.manifest };
 }
 
-// T1-T5: fresh worktree + tier-scoped agent build. Leaves the worktree in place
+// T1-T4: fresh worktree + tier-scoped agent build. Leaves the worktree in place
 // (uncommitted) for validate.js/gate.js/commit.js; the orchestrator removes it
 // on every terminal path.
 async function buildTierNode(ctx, node) {
@@ -292,9 +235,11 @@ async function buildTierNode(ctx, node) {
 }
 
 // Builds one node by tier. T0 delegates to scaffold (fully committed on
-// success); every other tier returns an uncommitted worktree for the downstream
+// success); T5 dispatches to the bounded supervisor + subagent split; every
+// other tier returns an uncommitted worktree for the downstream
 // validate -> gate -> commit stages.
 export async function buildNode(ctx, node) {
   if (node.tier === "T0") return buildT0Node(ctx, node);
+  if (node.tier === "T5") return buildT5Node(ctx, node);
   return buildTierNode(ctx, node);
 }

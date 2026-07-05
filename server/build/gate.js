@@ -29,6 +29,11 @@ async function createPendingApproval(ctx, node, runEntityId, summary) {
         pipeline_run_entity_id: runEntityId,
         node: node.id,
         tier: node.tier,
+        // T5 is the highest-blast-radius tier (a whole crate), so its approval
+        // demands an EXPLICIT typed confirmation, not a one-tap approve. The
+        // downstream approval UI/bot reads this flag (its enforcement is out of
+        // scope here - the flag is the contract). Issue #137, §4/§8.
+        requires_typed_confirm: node.tier === "T5",
         summary,
       },
       workspace_id: ctx.workspaceId,

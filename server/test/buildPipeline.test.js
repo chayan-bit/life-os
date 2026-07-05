@@ -5,6 +5,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runBuildPipeline } from "../build/pipeline.js";
+import { getValidators } from "../validators/registry.js";
+import { TIERS } from "../build/plan.js";
 import { slugify } from "../lib/slugify.js";
 
 const execFile = promisify(execFileCb);
@@ -257,27 +259,202 @@ describe("runBuildPipeline - cyclic plan fails closed before any build", () => {
   });
 });
 
-describe("runBuildPipeline - T5 validator placeholder fails closed", () => {
-  it("fails a T5 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
-    const plan = {
-      nodes: [{ id: "t5", tier: "T5", params: { crate: "lifeos-finance" }, description: "new finance subsystem crate", dependsOn: [] }],
-    };
-    const beforeCount = await mainLogCount();
+// ------- T5 subsystem build (issue #137) -------------------------------------
 
-    // No validateFn injected: the real registry placeholder for T5 runs and
-    // rejects, so the node fails and nothing ships. T1 got its real validator
-    // in issue #133, T2 in issue #134, T3 in issue #135, T4 in issue #136 -
-    // this assertion now targets T5, the last remaining placeholder.
+const T5_CRATE = "lifeos-finance";
+const CARGO_TOML_SEED = '[workspace]\nresolver = "2"\nmembers = [\n    "lifeos-api",\n]\n';
+
+// Seeds a committed services/Cargo.toml so the scaffolder's additive member
+// edit diffs cleanly (mirrors the real workspace shape).
+async function seedServicesWorkspace() {
+  await fs.mkdir(path.join(repoRoot, "services"), { recursive: true });
+  await fs.writeFile(path.join(repoRoot, "services", "Cargo.toml"), CARGO_TOML_SEED, "utf8");
+  await git(["add", "services"]);
+  await git(["commit", "-m", "seed services workspace"]);
+}
+
+// A routed T5 mock: spec/plan by purpose; supervisor by its {files,testStrategy}
+// schema; reviewer by its {approve,issues} schema; scaffolder vs tester by the
+// role word in the prompt. `opts` tunes reviewer verdicts and per-call usage.
+function makeT5QueryFn(plan, calls, opts = {}) {
+  const reviewVerdicts = opts.reviewVerdicts ?? [{ approve: true, issues: [] }];
+  const usage = opts.usage ?? { input_tokens: 1, output_tokens: 1 };
+  let reviewIdx = 0;
+  return async function* queryFn(params) {
+    const purpose = params.options?.purpose;
+    if (purpose === "build_spec") {
+      yield { type: "result", subtype: "success", is_error: false, structured_output: SPEC };
+      return;
+    }
+    if (purpose === "build_plan") {
+      yield { type: "result", subtype: "success", is_error: false, structured_output: plan };
+      return;
+    }
+    const props = params.options?.outputFormat?.schema?.properties ?? {};
+    const prompt = params.prompt ?? "";
+    if (props.testStrategy) {
+      calls.push("supervisor");
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        usage,
+        structured_output: {
+          files: [{ path: `services/${T5_CRATE}/src/lib.rs`, purpose: "core" }],
+          testStrategy: "scratch-db integration test",
+          riskNotes: "none",
+        },
+      };
+      return;
+    }
+    if (props.approve) {
+      calls.push("reviewer");
+      const verdict = reviewVerdicts[Math.min(reviewIdx, reviewVerdicts.length - 1)];
+      reviewIdx += 1;
+      yield { type: "result", subtype: "success", is_error: false, usage, structured_output: verdict };
+      return;
+    }
+    // buildNodeSummary schema: scaffolder writes the crate + additive Cargo.toml;
+    // tester writes only a scratch-DB test.
+    const crateDir = path.join(params.options.cwd, "services", T5_CRATE);
+    if (prompt.includes("scaffolder")) {
+      calls.push("scaffolder");
+      await fs.mkdir(path.join(crateDir, "src"), { recursive: true });
+      await fs.writeFile(path.join(crateDir, "Cargo.toml"), `[package]\nname = "${T5_CRATE}"\nversion = "0.1.0"\nedition = "2021"\n`, "utf8");
+      await fs.writeFile(path.join(crateDir, "src", "lib.rs"), "pub fn add(a: i64, b: i64) -> i64 { a + b }\n", "utf8");
+      const cargoToml = path.join(params.options.cwd, "services", "Cargo.toml");
+      await fs.writeFile(cargoToml, CARGO_TOML_SEED.replace('    "lifeos-api",\n', `    "lifeos-api",\n    "${T5_CRATE}",\n`), "utf8");
+      yield { type: "result", subtype: "success", is_error: false, usage, structured_output: { tier: "T5", files: [`services/${T5_CRATE}/src/lib.rs`], summary: "scaffolded" } };
+      return;
+    }
+    calls.push("tester");
+    await fs.mkdir(path.join(crateDir, "tests"), { recursive: true });
+    await fs.writeFile(path.join(crateDir, "tests", "it.rs"), '#[test]\nfn ok() { let _ = std::env::temp_dir().join("scratch.db"); assert_eq!(1, 1); }\n', "utf8");
+    yield { type: "result", subtype: "success", is_error: false, usage, structured_output: { tier: "T5", files: [`services/${T5_CRATE}/tests/it.rs`], summary: "tested" } };
+  };
+}
+
+function t5Plan() {
+  return { nodes: [{ id: "t5", tier: "T5", params: { crate: T5_CRATE }, description: "new finance subsystem crate", dependsOn: [] }] };
+}
+
+describe("runBuildPipeline - T5 subsystem builds via the bounded supervisor+3 split and gates (issue #137)", () => {
+  it("runs supervisor->scaffolder->tester->reviewer, validates via the REAL t5Crate validator, then halts awaiting_approval with requires_typed_confirm, uncommitted", async () => {
+    await seedServicesWorkspace();
+    const beforeCount = await mainLogCount();
+    const calls = [];
+    const httpCalls = [];
+
     const result = await runBuildPipeline("build a finance module with its own ingest pipeline", "ws_test", {
       repoRoot,
-      queryFn: makeQueryFn(plan, []),
-      httpFn: makeHttpFn([]),
+      queryFn: makeT5QueryFn(t5Plan(), calls),
+      httpFn: makeHttpFn(httpCalls),
+      execFn: async () => ({ stdout: "", stderr: "" }),
+    });
+
+    expect(calls).toEqual(["supervisor", "scaffolder", "tester", "reviewer"]);
+    expect(result.success).toBe(false);
+    expect(result.nodes[0].status).toBe("awaiting_approval");
+
+    const pending = httpCalls.find((c) => c.method === "POST" && c.path === "/api/entity" && c.body.type === "pending_approval");
+    expect(pending).toBeTruthy();
+    expect(pending.body.attrs.tier).toBe("T5");
+    expect(pending.body.attrs.requires_typed_confirm).toBe(true);
+    const planned = httpCalls.find((c) => c.path === "/api/event" && c.body.type === "build.t5.planned");
+    expect(planned).toBeTruthy();
+
+    // Nothing committed - the gate halts before commit.js ever runs.
+    expect(await mainLogCount()).toBe(beforeCount);
+  });
+
+  it("fails the node when the T5 validator's cargo test fails (execFn DI)", async () => {
+    await seedServicesWorkspace();
+    const beforeCount = await mainLogCount();
+    const httpCalls = [];
+
+    const result = await runBuildPipeline("build a finance module", "ws_test", {
+      repoRoot,
+      queryFn: makeT5QueryFn(t5Plan(), []),
+      httpFn: makeHttpFn(httpCalls),
+      execFn: async (cmd, args) => {
+        if (cmd === "cargo" && args[0] === "test") throw new Error("test failed");
+        return { stdout: "", stderr: "" };
+      },
     });
 
     expect(result.success).toBe(false);
     expect(result.nodes[0].status).toBe("failed");
-    expect(result.nodes[0].reason).toMatch(/not yet implemented for T5/);
+    expect(result.nodes[0].reason).toMatch(/cargo test failed/);
     expect(await mainLogCount()).toBe(beforeCount);
+  });
+
+  it("recovers via one bounded fix round when the reviewer rejects once then approves", async () => {
+    await seedServicesWorkspace();
+    const calls = [];
+
+    const result = await runBuildPipeline("build a finance module", "ws_test", {
+      repoRoot,
+      queryFn: makeT5QueryFn(t5Plan(), calls, {
+        reviewVerdicts: [{ approve: false, issues: ["missing error handling"] }, { approve: true, issues: [] }],
+      }),
+      httpFn: makeHttpFn([]),
+      execFn: async () => ({ stdout: "", stderr: "" }),
+    });
+
+    // supervisor, scaffolder, tester, reviewer(reject), scaffolder(fix), reviewer(approve)
+    expect(calls).toEqual(["supervisor", "scaffolder", "tester", "reviewer", "scaffolder", "reviewer"]);
+    expect(result.nodes[0].status).toBe("awaiting_approval");
+  });
+
+  it("fails the node on a second reviewer rejection - no third round", async () => {
+    await seedServicesWorkspace();
+    const calls = [];
+
+    const result = await runBuildPipeline("build a finance module", "ws_test", {
+      repoRoot,
+      queryFn: makeT5QueryFn(t5Plan(), calls, { reviewVerdicts: [{ approve: false, issues: ["bad"] }] }),
+      httpFn: makeHttpFn([]),
+      execFn: async () => ({ stdout: "", stderr: "" }),
+    });
+
+    expect(result.nodes[0].status).toBe("failed");
+    expect(result.nodes[0].reason).toMatch(/reviewer rejected the crate after one fix round/);
+    // Exactly two reviewer calls (initial + re-review), never a third.
+    expect(calls.filter((c) => c === "reviewer")).toHaveLength(2);
+  });
+
+  it("stops with budget_exhausted when the token ceiling is exceeded mid-sequence", async () => {
+    await seedServicesWorkspace();
+    const calls = [];
+
+    // Ceiling 10; the supervisor alone reports 100 tokens, so the budget is
+    // exhausted before the scaffolder is ever called.
+    const result = await runBuildPipeline("build a finance module", "ws_test", {
+      repoRoot,
+      budget: 10,
+      queryFn: makeT5QueryFn(t5Plan(), calls, { usage: { input_tokens: 100, output_tokens: 0 } }),
+      httpFn: makeHttpFn([]),
+      execFn: async () => ({ stdout: "", stderr: "" }),
+    });
+
+    expect(result.nodes[0].status).toBe("failed");
+    expect(result.nodes[0].reason).toMatch(/budget_exhausted/);
+    expect(calls).toEqual(["supervisor"]);
+  });
+});
+
+describe("validator registry - every tier T0-T5 resolves to real validators", () => {
+  it("has no fail-closed placeholder for any known tier", () => {
+    for (const tier of TIERS) {
+      const validators = getValidators(tier);
+      expect(validators.length).toBeGreaterThan(0);
+      expect(validators.some((v) => v.name === "notImplemented")).toBe(false);
+    }
+  });
+
+  it("still fails closed for an unknown tier", () => {
+    const validators = getValidators("T9");
+    expect(validators.some((v) => v.name === "notImplemented")).toBe(true);
   });
 });
 

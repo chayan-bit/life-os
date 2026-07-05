@@ -104,6 +104,9 @@ export async function runBuildPipeline(request, workspaceId, opts = {}) {
     // T3's real validator (server/validators/t3Route.js) shells cargo/git;
     // this is its DI seam so vitest never runs real cargo.
     execFn: opts.execFn,
+    // Per-node token ceiling for the T5 supervisor+subagent split
+    // (server/build/t5Subsystem.js); defaults to T5_TOKEN_BUDGET when absent.
+    budget: opts.budget,
   };
 
   // SPEC + PLAN, then deterministic DAG validation. Any failure here (bad

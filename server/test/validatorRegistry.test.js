@@ -34,12 +34,8 @@ describe("getValidators - registry dispatch", () => {
     expect(result.valid).toBe(false);
   });
 
-  it("T5 resolves to protectedSurface + a placeholder that fails closed (last remaining placeholder)", async () => {
-    expect(validatorNames("T5")).toEqual(["protectedSurface", "notImplemented"]);
-    const placeholder = getValidators("T5").find((v) => v.name === "notImplemented");
-    const result = await placeholder.run();
-    expect(result.valid).toBe(false);
-    expect(result.errors[0]).toBe("validator not yet implemented for T5");
+  it("T5 resolves to protectedSurface + t5Crate (issue #137 - the last placeholder is gone)", () => {
+    expect(validatorNames("T5")).toEqual(["protectedSurface", "t5Crate"]);
   });
 
   it("T1 resolves to protectedSurface + t1Render (issue #133 - no longer a placeholder)", () => {

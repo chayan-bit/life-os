@@ -15,6 +15,7 @@ import { validateT1Render } from "./t1Render.js";
 import { validateT2Tool } from "./t2Tool.js";
 import { validateT3Route } from "./t3Route.js";
 import { validateT4Migration } from "./t4Migration.js";
+import { validateT5Crate } from "./t5Crate.js";
 
 const execFile = promisify(execFileCb);
 const DEFAULT_BASE_REF = "main";
@@ -78,6 +79,7 @@ const t1Render = { name: "t1Render", run: validateT1Render };
 const t2Tool = { name: "t2Tool", run: validateT2Tool };
 const t3Route = { name: "t3Route", run: validateT3Route };
 const t4Migration = { name: "t4Migration", run: validateT4Migration };
+const t5Crate = { name: "t5Crate", run: validateT5Crate };
 
 function placeholder(tier) {
   return {
@@ -86,17 +88,17 @@ function placeholder(tier) {
   };
 }
 
-// T0-T4 are fully built; T5 has its protected-surface gate but its
-// tier-specific validator lands with its generator (issue #133 landed T1's,
-// #134 landed T2's, #135 landed T3's, #136 landed T4's), so it fails closed
-// until then.
+// Every tier T0-T5 now has a real, tier-specific validator behind the
+// protected-surface gate (issue #133 landed T1's, #134 T2's, #135 T3's, #136
+// T4's, #137 T5's) - the fail-closed placeholder is retained only for an
+// UNKNOWN tier (getValidators below), never for a known one.
 const TIER_VALIDATORS = {
   T0: [protectedSurface, structural, renderSmoke],
   T1: [protectedSurface, t1Render],
   T2: [protectedSurface, t2Tool],
   T3: [protectedSurface, t3Route],
   T4: [protectedSurface, t4Migration],
-  T5: [protectedSurface, placeholder("T5")],
+  T5: [protectedSurface, t5Crate],
 };
 
 // Ordered validator list for `tier`. Unknown tier fails closed (empty-safe:
