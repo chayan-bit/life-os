@@ -16,6 +16,7 @@ import { fetchActiveManual } from "./manual.js";
 import { distillLesson } from "./reflect.js";
 import { emptyUsage } from "./usage.js";
 import { isCacheMode, looksActiony, probe as cacheProbe, store as cacheStore } from "./llmCache.js";
+import { hasBudget, recordRecovery, wrapQueryFnWithBreaker, RECOVERY_BUDGET } from "./recovery.js";
 
 const newRunId = () => `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -88,6 +89,80 @@ async function escalate(ctx, type, attrs) {
   }
 }
 
+// Ladder step 5+6 (docs/AGENT-CORE.md §9): recovery is exhausted (or the
+// breaker is open, or a replan already happened this turn) - return the
+// partial result honestly rather than pretending nothing ran, and emit an
+// append-only escalation event so it surfaces downstream (Telegram
+// consumption is out of scope here, per the issue).
+async function degradeAndEscalate(ctx, { prompt, plan, planEntityId, started, error }) {
+  const completedTools = ctx.ledger.filter((entry) => entry.ok).map((entry) => entry.tool);
+  const reason = error?.message ?? "unknown error";
+  const text = completedTools.length
+    ? `Partially completed (${completedTools.join(", ")}) before this failed: ${reason}.`
+    : `Could not complete the request: ${reason}.`;
+  const outcome = "degraded";
+
+  await escalate(ctx, "agent.escalation", {
+    run_id: ctx.runId,
+    reason,
+    ledger: ctx.ledger,
+    breaker_open: Boolean(ctx.breakerOpen),
+    replanned: Boolean(ctx.replanned),
+  });
+  await finalize(ctx, {
+    plan,
+    planEntityId,
+    prompt,
+    outcome,
+    tokens: 0,
+    usage: emptyUsage(),
+    text,
+    refined: false,
+    started,
+    error: reason,
+  });
+  return { success: false, runId: ctx.runId, outcome, text, error: reason };
+}
+
+// Ladder step 4 (docs/AGENT-CORE.md §9): one replan, only when the breaker
+// isn't open, no replan has happened yet this turn, budget remains, and a
+// plan existed to revise. The failure context carries the completed-work
+// ledger so the replanned execute pass doesn't repeat successful steps -
+// `ctx.stepCount` already threads the remaining step budget (it is the same
+// mutable counter `runTool` enforces MAX_STEPS against). Falls through to
+// degrade+escalate on any further failure - never a second replan.
+async function recoverExecuteFailure(ctx, { prompt, context, plan, planEntityId, started, error }) {
+  const canReplan = !ctx.breakerOpen && !ctx.replanned && Boolean(plan) && hasBudget(ctx);
+  if (!canReplan) {
+    return { degraded: true, returnValue: await degradeAndEscalate(ctx, { prompt, plan, planEntityId, started, error }) };
+  }
+  ctx.replanned = true;
+
+  const completedTools = ctx.ledger.filter((entry) => entry.ok).map((entry) => entry.tool);
+  const failureContext = [
+    context,
+    `A previous attempt at this turn failed: ${error.message}`,
+    completedTools.length
+      ? `Already completed successfully this turn - preserve this work, do not repeat it: ${completedTools.join(", ")}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  try {
+    const replanned = await generatePlan(prompt, failureContext, ctx);
+    const exec = await runExecute(prompt, failureContext, replanned.plan, ctx);
+    recordRecovery(ctx, "replan", null, true);
+    return { degraded: false, exec, plan: replanned.plan, tokens: replanned.tokens, usage: replanned };
+  } catch (replanError) {
+    recordRecovery(ctx, "replan", null, false);
+    return {
+      degraded: true,
+      returnValue: await degradeAndEscalate(ctx, { prompt, plan, planEntityId, started, error: replanError }),
+    };
+  }
+}
+
 // runAgentTurn(prompt, workspaceId, opts) - the loop entry point.
 export async function runAgentTurn(prompt, workspaceId, opts = {}) {
   const started = Date.now();
@@ -96,14 +171,24 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     runId,
     workspaceId,
     model: opts.model ?? null,
-    queryFn: opts.queryFn ?? defaultQuery,
     httpFn: opts.httpFn ?? createHttpFn(workspaceId, opts.apiBase),
     ledger: [],
     pendingApprovals: [],
     stepCount: 0,
     stepBudgetExhausted: false,
     nowSecs: opts.nowSecs,
+    sleepFn: opts.sleepFn,
+    // Self-healing (issue #129, docs/AGENT-CORE.md §9): one shared budget
+    // across every recovery action this turn, plus the query circuit-breaker
+    // state the wrapped queryFn below mutates directly.
+    recoveryBudget: RECOVERY_BUDGET,
+    recoveries: [],
+    argRepaired: new Set(),
+    replanned: false,
+    breakerOpen: false,
+    queryFailures: 0,
   };
+  ctx.queryFn = wrapQueryFnWithBreaker(opts.queryFn ?? defaultQuery, ctx);
 
   // 1. Gate - fail closed before any model call.
   const gate = await checkGate(ctx);
@@ -180,8 +265,21 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     ctx.toolsOffered = retrieval.tools.length;
     ctx.toolragFallback = retrieval.fallback;
 
-    // 4. Execute (bounded).
-    const exec = await runExecute(prompt, context, plan, ctx);
+    // 4. Execute (bounded). A thrown error here (a dead model provider, a
+    // network failure that survived executor.js's own retry) enters the
+    // self-healing ladder's replan/degrade/escalate tail (issue #129,
+    // docs/AGENT-CORE.md §9) instead of failing the whole turn outright.
+    let exec;
+    try {
+      exec = await runExecute(prompt, context, plan, ctx);
+    } catch (error) {
+      const recovery = await recoverExecuteFailure(ctx, { prompt, context, plan, planEntityId, started, error });
+      if (recovery.degraded) return recovery.returnValue;
+      exec = recovery.exec;
+      plan = recovery.plan;
+      tokens += recovery.tokens;
+      usage = addUsage(usage, recovery.usage);
+    }
     tokens += exec.tokens;
     usage = addUsage(usage, exec);
     let text = exec.text;
@@ -252,8 +350,9 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
 // Persists the plan status + the agent.turn row, then writes the turn's
 // outcome back to memory (issue #124) best-effort so the next sleep cycle
 // (consolidate.rs) can fold it - no new subsystem, `events` stays the path.
-async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started, cache }) {
-  const planStatus = outcome === "completed" ? "completed" : outcome === "awaiting_approval" ? "awaiting_approval" : "failed";
+async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started, cache, error }) {
+  const planStatus =
+    outcome === "completed" ? "completed" : outcome === "awaiting_approval" ? "awaiting_approval" : outcome === "degraded" ? "degraded" : "failed";
   if (plan) await updatePlanStatus(planEntityId, plan, prompt, planStatus, ctx);
   await persistTurn(ctx, {
     run_id: ctx.runId,
@@ -267,11 +366,14 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usag
     latency_ms: Date.now() - started,
     refined,
     outcome,
-    error: outcome === "step_budget_exhausted" ? outcome : null,
+    error: error ?? (outcome === "step_budget_exhausted" ? outcome : null),
     result_preview: (text || "").slice(0, 500),
     // Present (issue #127) only on a cache-served turn ('exact' | 'semantic');
     // undefined elsewhere so a JSON.stringify of attrs simply omits the key.
     cache: cache ?? undefined,
+    // Self-healing summary (issue #129, docs/AGENT-CORE.md §9) - additive,
+    // always present (empty array on a turn with no recovery activity).
+    recoveries: ctx.recoveries ?? [],
   });
   await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, outcome, text);
   // Distill-after (issue #128, docs/AGENT-CORE.md §6): best-effort, bounded

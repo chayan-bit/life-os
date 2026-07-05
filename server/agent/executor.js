@@ -7,6 +7,15 @@
 import { tool as sdkTool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { REGISTRY, classify } from "./actionRegistry.js";
 import { emptyUsage, foldUsage } from "./usage.js";
+import {
+  ARG_REPAIR_STATUSES,
+  SUBSTITUTES,
+  hasBudget,
+  isRetryableStatus,
+  recordRecovery,
+  recoverySleep,
+  schemaHint,
+} from "./recovery.js";
 
 export const MAX_STEPS = 8;
 const MCP_SERVER_NAME = "lifeos";
@@ -74,20 +83,74 @@ async function runGated(ctx, toolName, args) {
   };
 }
 
+// One attempt at the underlying HTTP call, normalizing a throw into
+// { res: null, threw } so retry logic can treat "network error" and "5xx
+// response" uniformly.
+async function attemptHttp(ctx, method, path, payload) {
+  try {
+    return { res: await ctx.httpFn(method, path, payload), threw: null };
+  } catch (err) {
+    return { res: null, threw: err };
+  }
+}
+
+// Retry-with-backoff (ladder step 1). Only transient failures - a throw
+// (network) or a >=500 response - are retried, ONCE, budget-decrementing. A
+// 4xx is never retried; it is a client error the model needs to fix, not a
+// blip. Still throws if the retry itself throws with no graceful response to
+// fall back on - the loop's replan stage is the next line of defense.
+async function httpWithRetry(ctx, toolName, method, path, payload) {
+  const first = await attemptHttp(ctx, method, path, payload);
+  const transient = Boolean(first.threw) || isRetryableStatus(first.res?.status);
+  if (!transient || !hasBudget(ctx)) {
+    if (first.threw) throw first.threw;
+    return first.res;
+  }
+  await recoverySleep(ctx);
+  const second = await attemptHttp(ctx, method, path, payload);
+  const recovered = !second.threw && Boolean(second.res?.ok);
+  recordRecovery(ctx, "retry", toolName, recovered);
+  if (second.threw) throw second.threw;
+  return second.res;
+}
+
+// Argument repair (ladder step 2). No extra model call: the schema hint rides
+// the same error result the model already sees. Budget is spent at most once
+// per tool per turn so a persistently malformed call can't spiral.
+function applyArgRepairHint(ctx, toolName, entry, res, result) {
+  result.repair_hint = `${schemaHint(entry)}. Server said: ${JSON.stringify(res?.data)}`;
+  ctx.argRepaired = ctx.argRepaired ?? new Set();
+  if (ctx.argRepaired.has(toolName) || !hasBudget(ctx)) return;
+  ctx.argRepaired.add(toolName);
+  recordRecovery(ctx, "arg_repair", toolName, false);
+}
+
+// Tool substitute (ladder step 3). Only fires once retry is exhausted (a
+// >=500 response survives both attempts) and only for read tools with a
+// registered equivalent - write/gated tools are never in SUBSTITUTES.
+function applySubstituteHint(ctx, toolName, res, result) {
+  const substitute = SUBSTITUTES[toolName];
+  if (!substitute || !isRetryableStatus(res?.status) || !hasBudget(ctx)) return;
+  result.substitute_hint = `try ${substitute}`;
+  recordRecovery(ctx, "substitute", toolName, false);
+}
+
 async function runAllowed(ctx, toolName, entry, args) {
   const { method, path, body } = buildHttp(entry.route, args);
   const payload = body ? { ...body, workspace_id: ctx.workspaceId } : undefined;
-  const res = await ctx.httpFn(method, path, payload);
+  const res = await httpWithRetry(ctx, toolName, method, path, payload);
   const data = res?.data ?? null;
-  return {
-    result: {
-      status: res?.ok ? "ok" : "error",
-      tool: toolName,
-      data: entry.external ? undefined : data,
-      untrusted: entry.external ? wrapUntrusted(data) : undefined,
-    },
-    ok: Boolean(res?.ok),
+  const result = {
+    status: res?.ok ? "ok" : "error",
+    tool: toolName,
+    data: entry.external ? undefined : data,
+    untrusted: entry.external ? wrapUntrusted(data) : undefined,
   };
+  if (!res?.ok) {
+    if (ARG_REPAIR_STATUSES.has(res?.status)) applyArgRepairHint(ctx, toolName, entry, res, result);
+    else if (isRetryableStatus(res?.status)) applySubstituteHint(ctx, toolName, res, result);
+  }
+  return { result, ok: Boolean(res?.ok) };
 }
 
 // The single chokepoint. Classifies, enforces the step budget, executes, and
