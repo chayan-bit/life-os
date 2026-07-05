@@ -80,6 +80,36 @@ v2 replaces the single "edit one manifest" prompt with a pipeline driven by the 
 
 Every stage writes `events` (run_id, tier, node, outcome) so the whole build is visible in `harness observe` and replayable - the same auditability Tier 0 already has, extended across the DAG.
 
+**Implemented (issue #132):** `server/build/` is the pipeline.
+`spec.js` (`generateSpec`) restates the request as a Zod `BuildSpec`;
+`plan.js` (`generateBuildPlan` + `validatePlan`) emits the DAG and
+deterministically post-validates it - per-tier required params present,
+plus a Kahn topological sort that rejects unknown deps and cycles (fail
+closed before any worktree is created).
+The DAG persists as a `pipelines`/`pipeline_run` entity
+(`attrs.pipeline_id = "build:<runId>"`, `origin: "build"`, `nodes: [...]`),
+the same route + shape the agent planner uses, PATCHed as the build
+progresses (inspectable + resumable-by-inspection).
+`node.js` builds one node per worktree: **T0 delegates to the existing
+`scaffoldModule`** end to end (its worktree + structured manifest + all
+three T0 validators + commit are reused, not reimplemented); T1-T5 get an
+honest minimal build (Layer B hook + Layer C sandbox scoped by tier, a
+per-tier prompt, a Zod `{ tier, files, summary }` structured output).
+`validate.js` runs `getValidators(tier)` (§9) - a fail discards the
+worktree, marks the node `failed`, and the orchestrator (`pipeline.js`)
+skips its transitive dependents (`reason: "dependency failed"`).
+`commit.js` merges each passing node as one conventional commit
+(`feat: <tier> <description> (build:<runId>)`) via the additively-extended
+`commitAndMerge`, and emits `build.node.completed|failed|gated` +
+`build.completed` events (stamped with `tier`/`outcome` like the agent
+loop's run-log rows). `pipeline.js::runBuildPipeline(request, workspaceId,
+opts)` is the orchestrator (DI: `queryFn`/`httpFn`/`validateFn`), sequential
+in topo order; `run.js` is the CLI (`node build/run.js <prompt>
+<workspaceId>`, same last-JSON-line stdout contract as `scaffold.js`).
+Partial success is honest: committed nodes STAY, and `{ success, runId,
+nodes: [{ id, tier, status, commit? }], summary }` never reports a
+failed/skipped/gated node as installed.
+
 ---
 
 ## 5. The four never-generable surfaces (fail-closed at every tier)
@@ -127,6 +157,19 @@ This is a bounded supervisor+3 pattern, **not** Founder OS's 12-path swarm - the
 - **Eval-gate on T3/T5** blocks a low-quality ship and posts the judge's rationale to Telegram ([HARNESS-LOOP.md](./HARNESS-LOOP.md) §2).
 - **Offline path unchanged:** `/addmodule` while the Mac is off still enqueues to `module_requests`; the `lifeos-drain` poller runs the identical local pipeline on wake and notifies ([SELF-EXTENSION.md](./SELF-EXTENSION.md) §1b) - the ladder does not change the cloud-only-enqueues invariant.
 
+**Implemented (issue #132) - approval-only gate boundary:** `server/build/gate.js`
+gates every T3+ node that passed validation by creating a
+`pipelines`/`pending_approval` entity linked to the run row, emitting
+`build.node.gated`, and halting the node `awaiting_approval` (it is never
+committed). This is **APPROVAL-only today**: the sampled Haiku eval-judge
+(HARNESS-LOOP.md §2) lives only inside the Rust pipeline runner
+(`services/lifeos-pipelines`) with no callable surface from this JS
+pipeline - the same "wiring only" boundary #125 hit - so the judge score is
+not consulted at the gate here. **Resume-on-approval** (re-building the
+node's worktree and committing it once a human approves) is deferred to a
+follow-up; the gated node's worktree is discarded, and the absence of a
+commit is the safe default.
+
 ---
 
 ## 9. Validator registry (per-tier gates)
@@ -161,6 +204,19 @@ Every validator keeps Tier 0's discipline: run in a disposable worktree against 
   - A build attempting to write security/gating config, `broker-guard`, a connection, or a secret **fails closed at Layer B**, at every tier.
   - A multi-tier "finance module with ingest" build runs its DAG, commits passing nodes, and surfaces any failed node honestly rather than a false "installed".
   - Offline `/addmodule` of a multi-tier build queues, drains on wake, and notifies with the true per-node outcome.
+
+**Implemented (issue #132):** the JS orchestration landed in `server/build/`
+(§4 note) reusing `scaffold.js`'s exports (T0 delegates to `scaffoldModule`;
+`commitAndMerge` extended additively so `scaffold.test.js` stays green
+unmodified). On the Rust side, `lifeos-drain`'s `ScaffoldJsBuilder` now spawns
+`node build/run.js` for a claimed `module_requests` row, gated by
+`LIFEOS_BUILD_PIPELINE` (default on; `0` falls back to plain `scaffold.js`);
+its last-JSON-line parse tolerates both the scaffold `{moduleId}` and the
+pipeline `{runId, nodes, summary}` shapes, and a success still calls the
+existing `complete_module_request`. Still deferred: the T1-T5 generators and
+their real validators (they fail closed until #133+), the eval-judge at the
+gate and resume-on-approval (§8 note), `lifeos-pipelines` dispatching the DAG
+itself, and the frontend build-progress view.
 
 ---
 

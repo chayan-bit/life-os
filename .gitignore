@@ -27,6 +27,8 @@ __pycache__/
 # Build & cache
 dist/
 build/
+# server/build/ is source (the self-extension build pipeline, #132), not output.
+!server/build/
 .cache/
 .wrangler/
 

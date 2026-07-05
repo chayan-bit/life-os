@@ -33,8 +33,19 @@ export async function removeWorktree(repoRoot, worktreePath, branch) {
 // merges into `main` mid-build, so `--ff-only` always applies here - if it
 // ever doesn't, that's a real conflict worth surfacing loudly, not papering
 // over with a merge commit.
-export async function commitAndMerge(repoRoot, worktreePath, branch, moduleId) {
-  await execFile("git", ["add", path.join("modules", moduleId)], { cwd: worktreePath });
-  await execFile("git", ["commit", "-m", `feat: self-extension - ${moduleId} module`], { cwd: worktreePath });
+//
+// `opts` is optional and backward-compatible: Tier-0 callers (scaffold.js)
+// pass only `moduleId` and get the historic behavior (stage `modules/<id>`,
+// commit the self-extension message). The multi-tier build pipeline
+// (server/build/commit.js) passes `opts.addPaths` (a build node's scope is not
+// always under `modules/`) and `opts.message` (the per-tier conventional
+// commit), reusing the identical add -> commit -> ff-merge mechanics.
+export async function commitAndMerge(repoRoot, worktreePath, branch, moduleId, opts = {}) {
+  const addPaths = opts.addPaths ?? [path.join("modules", moduleId)];
+  const message = opts.message ?? `feat: self-extension - ${moduleId} module`;
+  for (const addPath of addPaths) {
+    await execFile("git", ["add", addPath], { cwd: worktreePath });
+  }
+  await execFile("git", ["commit", "-m", message], { cwd: worktreePath });
   await execFile("git", ["merge", "--ff-only", branch], { cwd: repoRoot });
 }

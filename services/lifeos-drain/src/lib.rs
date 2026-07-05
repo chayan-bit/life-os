@@ -423,48 +423,72 @@ pub trait ModuleBuilder: Send + Sync {
     async fn build(&self, prompt: &str, workspace_id: &str) -> Result<String, String>;
 }
 
-/// Spawns `node scaffold.js <prompt> <workspaceId>` (issue #78's CLI
-/// contract) and parses its last stdout line as the JSON
-/// `scaffoldModule` already returns.
+/// Spawns the Node build entry (`build/run.js` by default, the multi-tier
+/// spec->plan->DAG->validate->gate->commit pipeline of issue #132; or the plain
+/// single-manifest `scaffold.js` of issue #78 when `build_pipeline` is off) as
+/// `node <script> <prompt> <workspaceId>` and parses its last stdout line as
+/// the JSON the entry already returns. Both entries share the same last-line
+/// JSON contract, so the parse below handles either shape.
 pub struct ScaffoldJsBuilder {
     pub server_dir: String,
+    /// `LIFEOS_BUILD_PIPELINE` (default on): route claimed module requests
+    /// through the full pipeline; set to `0` to fall back to plain scaffold.js.
+    pub build_pipeline: bool,
+}
+
+/// The Node entry script for the chosen build path - the one place the pipeline
+/// vs. plain-scaffold switch resolves, kept pure so it is directly unit-tested.
+pub fn entry_script(build_pipeline: bool) -> &'static str {
+    if build_pipeline {
+        "build/run.js"
+    } else {
+        "scaffold.js"
+    }
+}
+
+/// Extracts the installed-identifier / error from a build entry's last stdout
+/// JSON line, tolerant of both shapes: scaffold.js returns `{success, moduleId,
+/// error}`; build/run.js returns `{success, runId, nodes, summary, error?}`. On
+/// success prefer `moduleId`, else the `runId`; on failure prefer `error`, else
+/// the honest `summary`.
+fn parse_build_result(last_line: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(last_line)
+        .map_err(|e| format!("build output was not valid JSON: {e} (line: {last_line})"))?;
+
+    let field = |key: &str| parsed.get(key).and_then(|v| v.as_str()).map(String::from);
+
+    if parsed.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        field("moduleId")
+            .or_else(|| field("runId"))
+            .ok_or_else(|| "build reported success but no moduleId/runId".to_string())
+    } else {
+        Err(field("error")
+            .or_else(|| field("summary"))
+            .unwrap_or_else(|| "build reported failure with no error message".to_string()))
+    }
 }
 
 #[async_trait]
 impl ModuleBuilder for ScaffoldJsBuilder {
     async fn build(&self, prompt: &str, workspace_id: &str) -> Result<String, String> {
+        let script = entry_script(self.build_pipeline);
         let output = tokio::process::Command::new("node")
-            .arg("scaffold.js")
+            .arg(script)
             .arg(prompt)
             .arg(workspace_id)
             .current_dir(&self.server_dir)
             .output()
             .await
-            .map_err(|e| format!("failed to spawn node scaffold.js: {e}"))?;
+            .map_err(|e| format!("failed to spawn node {script}: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
         let Some(last_line) = last_line else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("scaffold.js produced no output (stderr: {stderr})"));
+            return Err(format!("{script} produced no output (stderr: {stderr})"));
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(last_line)
-            .map_err(|e| format!("scaffold.js output was not valid JSON: {e} (line: {last_line})"))?;
-
-        if parsed.get("success").and_then(|v| v.as_bool()) == Some(true) {
-            parsed
-                .get("moduleId")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .ok_or_else(|| "scaffold.js reported success but no moduleId".to_string())
-        } else {
-            Err(parsed
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("scaffold.js reported failure with no error message")
-                .to_string())
-        }
+        parse_build_result(last_line)
     }
 }
 
@@ -818,6 +842,38 @@ mod tests {
         assert_eq!(notifier.calls.lock().unwrap().len(), 0);
 
         let _ = std::fs::remove_file("test_run_build_no_chat.db");
+    }
+
+    #[test]
+    fn entry_script_switches_between_pipeline_and_plain_scaffold() {
+        assert_eq!(entry_script(true), "build/run.js");
+        assert_eq!(entry_script(false), "scaffold.js");
+    }
+
+    #[test]
+    fn parse_build_result_reads_the_pipeline_and_scaffold_shapes() {
+        // scaffold.js success shape.
+        assert_eq!(
+            parse_build_result(r#"{"success":true,"moduleId":"widgets"}"#).unwrap(),
+            "widgets"
+        );
+        // build/run.js success shape (no moduleId) falls back to runId.
+        assert_eq!(
+            parse_build_result(r#"{"success":true,"runId":"build_1","nodes":[],"summary":"1/1"}"#).unwrap(),
+            "build_1"
+        );
+        // Explicit error is surfaced verbatim.
+        assert_eq!(
+            parse_build_result(r#"{"success":false,"error":"plan rejected: cycle"}"#).unwrap_err(),
+            "plan rejected: cycle"
+        );
+        // Partial pipeline failure with no `error` falls back to the honest summary.
+        assert_eq!(
+            parse_build_result(r#"{"success":false,"runId":"b","nodes":[],"summary":"1/2 nodes committed"}"#).unwrap_err(),
+            "1/2 nodes committed"
+        );
+        // Non-JSON fails closed.
+        assert!(parse_build_result("not json").is_err());
     }
 
     #[test]

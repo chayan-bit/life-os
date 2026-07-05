@@ -102,7 +102,14 @@ async fn main() {
     println!("lifeos-drain: worker {worker_id} on {db_path} (poll {poll:?}, {cfg:?})");
 
     let server_dir = std::env::var("LIFEOS_SERVER_DIR").unwrap_or_else(|_| "server".to_string());
-    let builder = ScaffoldJsBuilder { server_dir };
+    // LIFEOS_BUILD_PIPELINE (default on): route claimed module requests through
+    // the full multi-tier build pipeline (#132, `build/run.js`); set to `0` for
+    // the plain single-manifest `scaffold.js` escape hatch (#78).
+    let build_pipeline = std::env::var("LIFEOS_BUILD_PIPELINE").map(|v| v != "0").unwrap_or(true);
+    if !build_pipeline {
+        println!("lifeos-drain: LIFEOS_BUILD_PIPELINE=0, module builds use plain scaffold.js");
+    }
+    let builder = ScaffoldJsBuilder { server_dir, build_pipeline };
     let notifier: Box<dyn Notifier> = match std::env::var("TELEGRAM_BOT_TOKEN") {
         Ok(token) if !token.is_empty() => Box::new(TelegramNotifier::new(token)),
         _ => {

@@ -13,7 +13,7 @@
 | **lifeos-vcs** | Tight hashing/IO loops, large-file throughput, memory-safe object store. | `blake3`, `fastcdc`, `jj-lib`, `object_store`, `rusqlite` |
 | **lifeos-ingest** | Media→text orchestration, transcription throughput. | `whisper-rs`, `reqwest` (Haiku vision captioning), `pdf-extract`, `zip`+`quick-xml` (docx), `tesseract` CLI subprocess (OCR), (opt) `candle` CLIP |
 | **lifeos-pipelines** | Hot event loop dispatching agent DAGs + Life OS Actions. | `tokio`, libSQL client; shells to Agent SDK |
-| **lifeos-drain** | Atomic job claim + reaper; crash recovery. | libSQL client, `tokio` |
+| **lifeos-drain** | Atomic job claim + reaper; crash recovery; claims `module_requests` and spawns the Node build entry (`build/run.js` multi-tier pipeline by default, `scaffold.js` when `LIFEOS_BUILD_PIPELINE=0`). | libSQL client, `tokio` |
 | **broker-guard** | Fail-closed PreToolUse guard; "illegal states unrepresentable" for trade-order denial. | small std-only binary |
 | **bin/lifeos** | Thin allow-listed CLI (one statically-linked binary beats curl wrappers). | `clap`, `reqwest` |
 | **marketplace sign/verify** | ed25519 signing inside lifeos-api. | `ed25519-dalek` |
