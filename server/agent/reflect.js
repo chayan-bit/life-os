@@ -56,8 +56,9 @@ function buildLessonPrompt(goal, resultText) {
 // a substantive (completed) turn whose prompt reads as corrective. One cheap
 // structured-output call decides whether there is a durable lesson; if so,
 // emits exactly ONE `feedback.given` event carrying `attrs.feedback` (the
-// exact field `HeuristicPolicyLearner` reads) and `attrs.confidence` for
-// forward compatibility with a learned policy. Best-effort: never throws,
+// exact field `HeuristicPolicyLearner` reads) and `attrs.confidence`, which
+// `HeuristicPolicyLearner` now reads too (clamped to [0.3, 0.95]) instead of
+// discarding it in favor of a fixed default. Best-effort: never throws,
 // never affects the turn result already computed by the caller.
 export async function distillLesson(queryFn, prompt, outcome, resultText, opts = {}) {
   if (outcome !== "completed") return;

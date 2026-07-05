@@ -39,7 +39,7 @@
 //! `action` jobs for any declared rule that fires.
 
 use libsql::Builder;
-use lifeos_drain::ai::{AgentCliCaptioner, AgentCliJudge, AgentCliStageRunner};
+use lifeos_drain::ai::{AgentCliCaptioner, AgentCliJudge, AgentCliModel, AgentCliStageRunner};
 use lifeos_drain::{
     claim_job, claim_next_module_request, complete_job, dispatch, fail_job, notify_pipeline_gated,
     reap_stuck, run_module_build, Dispatch, DrainConfig, NoopNotifier, Notifier, ScaffoldJsBuilder,
@@ -223,6 +223,7 @@ async fn main() {
                     notifier.as_ref(),
                     telegram_admin_chat_id.as_deref(),
                     &sleep_backend,
+                    &cli_agents,
                 )
                 .await
             }
@@ -274,6 +275,7 @@ async fn run_job(
     notifier: &dyn Notifier,
     telegram_admin_chat_id: Option<&str>,
     sleep_backend: &dyn lifeos_vcs::StorageBackend,
+    cli_agents: &std::sync::Arc<Vec<lifeos_agents::DetectedAgent>>,
 ) {
     println!("lifeos-drain: claimed {} (kind={})", job.id, job.kind);
     let result = match dispatch(&job.kind) {
@@ -340,13 +342,22 @@ async fn run_job(
             }
         }
         Dispatch::MemorySleep => {
-            // One consolidation cycle (issue #115). The deterministic
-            // heuristic model goes through the BLAKE3 replay cache, so a
-            // later rebuild replays this cycle's summaries verbatim; a
-            // Haiku-backed MemoryModel slots in via the same trait when
-            // consolidation quality is worth the API spend.
+            // One consolidation cycle (issue #115). The chosen model goes
+            // through the BLAKE3 replay cache, so a later rebuild replays
+            // this cycle's summaries verbatim regardless of which model
+            // produced them. `LIFEOS_MEMORY_MODEL=agent` (audit #6, see
+            // `lifeos_drain::ai::AgentCliModel`'s doc comment) routes
+            // through the local agent-CLI router with a heuristic fallback;
+            // anything else (including unset) keeps the deterministic
+            // extractive heuristic, unchanged from before.
             let now = now_secs();
-            let model = lifeos_memory::ReplayCachedModel::new(&lifeos_memory::HeuristicModel, conn, now);
+            let inner_model: Box<dyn lifeos_memory::MemoryModel> =
+                if std::env::var("LIFEOS_MEMORY_MODEL").as_deref() == Ok("agent") {
+                    Box::new(AgentCliModel { agents: cli_agents.clone() })
+                } else {
+                    Box::new(lifeos_memory::HeuristicModel)
+                };
+            let model = lifeos_memory::ReplayCachedModel::new(inner_model.as_ref(), conn, now);
             match lifeos_memory::run_sleep_cycle(
                 conn,
                 &job.workspace_id,

@@ -14,6 +14,17 @@ use crate::error::MemoryError;
 use crate::project::EventRecord;
 use libsql::{params, Connection};
 
+/// Confidence bounds a caller-supplied `attrs.confidence` is clamped into -
+/// wide enough to matter, narrow enough that no single feedback event can
+/// make a rule either dead-on-arrival (<=0) or immediately unbeatable (>=1).
+const MIN_LEARNED_CONFIDENCE: f64 = 0.3;
+const MAX_LEARNED_CONFIDENCE: f64 = 0.95;
+
+/// Default confidence when an event carries no parseable `attrs.confidence` -
+/// unchanged from before this event type honored an explicit value.
+const DEFAULT_FEEDBACK_CONFIDENCE: f64 = 0.7;
+const DEFAULT_OTHER_CONFIDENCE: f64 = 0.5;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleDelta {
     Add { rule: String, confidence: f64, source_event_ids: Vec<String> },
@@ -44,9 +55,20 @@ impl PolicyLearner for HeuristicPolicyLearner {
             let feedback = ev.attrs.get("feedback").and_then(|v| v.as_str());
             let is_feedback_event = ev.event_type == "feedback.given";
             if let Some(text) = feedback.filter(|t| !t.trim().is_empty()) {
+                let default_confidence =
+                    if is_feedback_event { DEFAULT_FEEDBACK_CONFIDENCE } else { DEFAULT_OTHER_CONFIDENCE };
+                // reflect.js emits an LLM-judged `attrs.confidence` alongside
+                // the feedback text; honor it (clamped) instead of silently
+                // discarding it in favor of the fixed default (audit #6).
+                let confidence = ev
+                    .attrs
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .map(|c| c.clamp(MIN_LEARNED_CONFIDENCE, MAX_LEARNED_CONFIDENCE))
+                    .unwrap_or(default_confidence);
                 deltas.push(RuleDelta::Add {
                     rule: text.trim().to_string(),
-                    confidence: if is_feedback_event { 0.7 } else { 0.5 },
+                    confidence,
                     source_event_ids: vec![ev.id.clone()],
                 });
             }
@@ -114,8 +136,38 @@ mod tests {
         ];
         let deltas = learner.derive_rule_deltas(&events);
         assert_eq!(deltas.len(), 2);
-        assert!(matches!(&deltas[0], RuleDelta::Add { rule, .. } if rule == "always lead with the TLDR"));
+        assert!(matches!(&deltas[0], RuleDelta::Add { rule, confidence, .. }
+            if rule == "always lead with the TLDR" && (*confidence - 0.7).abs() < 1e-9));
         assert!(matches!(&deltas[1], RuleDelta::Retire { rule_id, .. } if rule_id == "mr_x"));
+    }
+
+    #[test]
+    fn absent_confidence_keeps_the_old_fixed_defaults() {
+        let learner = HeuristicPolicyLearner;
+        let events = vec![
+            ev("e1", "feedback.given", json!({"feedback": "lead with the TLDR"})),
+            ev("e2", "note.captured", json!({"feedback": "include the regime"})),
+        ];
+        let deltas = learner.derive_rule_deltas(&events);
+        assert!(matches!(&deltas[0], RuleDelta::Add { confidence, .. } if (*confidence - 0.7).abs() < 1e-9));
+        assert!(matches!(&deltas[1], RuleDelta::Add { confidence, .. } if (*confidence - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn explicit_confidence_is_honored_and_clamped_to_both_ends() {
+        let learner = HeuristicPolicyLearner;
+        let events = vec![
+            // Within bounds: used verbatim, ignoring the fixed default.
+            ev("e1", "feedback.given", json!({"feedback": "a", "confidence": 0.42})),
+            // Above the max: clamped down.
+            ev("e2", "feedback.given", json!({"feedback": "b", "confidence": 1.0})),
+            // Below the min: clamped up.
+            ev("e3", "feedback.given", json!({"feedback": "c", "confidence": 0.0})),
+        ];
+        let deltas = learner.derive_rule_deltas(&events);
+        assert!(matches!(&deltas[0], RuleDelta::Add { confidence, .. } if (*confidence - 0.42).abs() < 1e-9));
+        assert!(matches!(&deltas[1], RuleDelta::Add { confidence, .. } if (*confidence - 0.95).abs() < 1e-9));
+        assert!(matches!(&deltas[2], RuleDelta::Add { confidence, .. } if (*confidence - 0.3).abs() < 1e-9));
     }
 
     #[tokio::test]

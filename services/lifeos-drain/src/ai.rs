@@ -13,11 +13,13 @@
 use async_trait::async_trait;
 use lifeos_agents::{DetectedAgent, RunOptions};
 use lifeos_ingest::Captioner;
+use lifeos_memory::{HeuristicModel, MemoryError, MemoryModel};
 use lifeos_pipelines::{Judge, PipelineStageRunner, StageResult, StageSpec};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 const STAGE_TIMEOUT_SECS: u64 = 300;
+const MEMORY_MODEL_TIMEOUT_SECS: u64 = 60;
 const JUDGE_RUBRIC: &str = "You are an output quality judge. \
 Score the following stage output 1-5 on whether it is complete, non-empty, and usable as-is \
 (5 = ship it, 1 = empty or unusable). \
@@ -162,6 +164,56 @@ impl Captioner for AgentCliCaptioner {
     }
 }
 
+/// Task-keyed instruction the model is asked to follow (audit #6: consolidation
+/// summaries stayed extractive-only despite comments promising a Haiku-backed
+/// drop-in). Kept as a pure function so the wording is directly testable.
+fn task_instruction(task: &str) -> &'static str {
+    match task {
+        "summarize" => {
+            "Summarize these events into 2-4 factual sentences. No speculation, no invented \
+             detail - only what the events actually say."
+        }
+        "reflect" => {
+            "Write a short day-level reflection (2-4 factual sentences) synthesizing these \
+             summaries. No speculation, no invented detail."
+        }
+        _ => "Summarize the following into 2-4 factual sentences. No speculation, no invented detail.",
+    }
+}
+
+/// `lifeos_memory::MemoryModel` backed by a local agent CLI (env-gated by
+/// `LIFEOS_MEMORY_MODEL=agent`, see docs/AI-MEMORY.md §5). `lifeos-memory`
+/// itself stays free of the `lifeos-agents` dependency (it must remain a pure
+/// event-sourcing engine testable without any CLI on PATH), so this impl
+/// lives here in the consumer instead. A near-identical, intentionally
+/// duplicated impl lives in `lifeos-api/src/routes/memory.rs`'s
+/// `sleep_handler` - `lifeos-api` and `lifeos-drain` are separate binaries
+/// with no third crate that already depends on both `lifeos-agents` and
+/// `lifeos-memory` without adding a new cross-crate edge, so the ~40 lines
+/// are kept in sync by hand rather than sharing a home neither crate should
+/// depend on. See that file's comment for the twin.
+///
+/// ANY failure (no CLI detected, timeout, empty output) falls back to
+/// `HeuristicModel`'s deterministic output for that call - a consolidation
+/// cycle must never fail outright, and the caller's `ReplayCachedModel`
+/// wrapper still caches whatever this produces, so replay stays
+/// byte-identical either way.
+pub struct AgentCliModel {
+    pub agents: Arc<Vec<DetectedAgent>>,
+}
+
+#[async_trait]
+impl MemoryModel for AgentCliModel {
+    async fn complete(&self, task: &str, prompt: &str) -> Result<String, MemoryError> {
+        let full_prompt = format!("{}\n\n{prompt}", task_instruction(task));
+        let opts = RunOptions { timeout_secs: MEMORY_MODEL_TIMEOUT_SECS, ..Default::default() };
+        match lifeos_agents::run(&self.agents, &opts, &full_prompt).await {
+            Ok(text) if !text.trim().is_empty() => Ok(text.trim().to_string()),
+            _ => HeuristicModel.complete(task, prompt).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +263,27 @@ mod tests {
         assert!(judge.score("content").await.is_err());
         let captioner = AgentCliCaptioner { agents };
         assert!(captioner.caption(b"png", "image/png").await.is_err());
+    }
+
+    /// Same "no CLI on PATH" seam as `cli_lanes_fail_loudly_with_no_agents`
+    /// (an empty `agents` vec makes `lifeos_agents::run` fail without
+    /// spawning a real subprocess) - but `MemoryModel::complete` must never
+    /// propagate that error: it should fall back to `HeuristicModel`'s
+    /// deterministic output instead (audit #6, "never fail the sleep cycle").
+    #[tokio::test]
+    async fn agent_cli_model_falls_back_to_heuristic_when_no_agent_is_detected() {
+        let model = AgentCliModel { agents: Arc::new(Vec::new()) };
+        let prompt = "first fact\nsecond fact";
+
+        let got = model.complete("summarize", prompt).await.unwrap();
+        let expected = HeuristicModel.complete("summarize", prompt).await.unwrap();
+        assert_eq!(got, expected, "falls back to the heuristic model's exact output");
+    }
+
+    #[test]
+    fn task_instruction_is_task_specific_and_forbids_speculation() {
+        assert!(task_instruction("summarize").contains("No speculation"));
+        assert!(task_instruction("reflect").contains("reflection"));
+        assert!(task_instruction("unknown-task").contains("No speculation"));
     }
 }

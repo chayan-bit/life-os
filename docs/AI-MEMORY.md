@@ -139,6 +139,9 @@ When it is present, the decay sweep tiers cold nodes out on cadence (bounded to 
 Life OS's mitigation is structural and not implemented by any current system: **raw events are never deleted, every summary carries `source_event_ids` + a `confidence`/source-count**, so a bad consolidation is auditable and correctable by recompute.
 This is a genuine design advantage, again falling out of the append-only spine.
 
+The `MemoryModel` behind a sleep cycle is env-selected: `LIFEOS_MEMORY_MODEL=agent` routes `summarize`/`reflect` calls through the local agent-CLI router (`AgentCliModel`, falling back to the extractive `HeuristicModel` on any CLI failure or empty output); unset or any other value keeps the deterministic `HeuristicModel`, unchanged from before.
+`HeuristicPolicyLearner` honors an explicit `attrs.confidence` on a feedback event (clamped to `[0.3, 0.95]`) instead of always using the fixed `0.7`/`0.5` defaults, so an LLM-judged confidence from `reflect.js`'s lesson distillation actually reaches the learned rule.
+
 ---
 
 ## 6. The context compiler - hybrid-deterministic working memory
