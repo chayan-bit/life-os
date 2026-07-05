@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { runAgentTurn } from "../agent/loop.js";
-import { fetchMemoryContext, ingestTurnOutcome } from "../agent/memoryContext.js";
+import { fetchMemoryContext, fetchRecentTurns, ingestTurnOutcome, RECENT_TURNS_K } from "../agent/memoryContext.js";
+
+// A realistic `context_handler` (services/lifeos-api/src/routes/memory.rs)
+// response: `context` is the serialized Rust `CompiledContext` struct
+// (services/lifeos-memory/src/compiler.rs) - `{ text, sections, tokens_used,
+// budget_tokens }` - not a bare string.
+function compiledContext(text, overrides = {}) {
+  return { text, sections: [], tokens_used: text ? text.length : 0, budget_tokens: 2000, ...overrides };
+}
 
 // Mirrors agent.test.js's fake HTTP layer: records every call, replies via an
 // optional route list, and defaults reads/writes to a canned success so no
@@ -16,7 +24,7 @@ function makeHttp(routes = []) {
       return { ok: false, status: 404, data: null };
     }
     if (path === "/api/memory/context") {
-      return { ok: true, status: 200, data: { context: null, recall: { outcome: "skipped" } } };
+      return { ok: true, status: 200, data: { context: compiledContext(""), recall: { outcome: "skipped" } } };
     }
     if (path === "/api/memory/ingest") {
       return { ok: true, status: 200, data: { event_id: "evt_1" } };
@@ -63,25 +71,47 @@ const turnEvents = (httpFn, type) =>
   httpFn.calls.filter((c) => c.method === "POST" && c.path === "/api/event" && c.body?.type === type);
 
 describe("fetchMemoryContext", () => {
-  it("posts the workspace-scoped query and returns the compiler's labeled block", async () => {
+  it("posts the workspace-scoped query with recent turns and returns the compiler's labeled block", async () => {
     const httpFn = vi.fn(async () => ({
       ok: true,
       status: 200,
-      data: { context: "compiled working memory", recall: { top_activation: 0.9 } },
+      data: { context: compiledContext("compiled working memory"), recall: { top_activation: 0.9 } },
     }));
+    const recentTurns = [{ role: "agent", content: "earlier goal -> completed" }];
 
-    const { block, recall } = await fetchMemoryContext(httpFn, "ws_test", "what did I say about the launch?");
+    const { block, recall } = await fetchMemoryContext(
+      httpFn,
+      "ws_test",
+      "what did I say about the launch?",
+      recentTurns,
+    );
 
     expect(httpFn).toHaveBeenCalledWith("POST", "/api/memory/context", {
       query: "what did I say about the launch?",
       workspace_id: "ws_test",
-      recent_turns: [],
+      recent_turns: recentTurns,
       budget_tokens: 2000,
       top_k: 8,
     });
     expect(block).toContain("## Memory (activation recall)");
     expect(block).toContain("compiled working memory");
     expect(recall).toEqual({ top_activation: 0.9 });
+  });
+
+  it("defaults recent_turns to [] when the caller passes none", async () => {
+    const httpFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      data: { context: compiledContext("fact"), recall: null },
+    }));
+
+    await fetchMemoryContext(httpFn, "ws_test", "goal");
+
+    expect(httpFn).toHaveBeenCalledWith(
+      "POST",
+      "/api/memory/context",
+      expect.objectContaining({ recent_turns: [] }),
+    );
   });
 
   it("returns a null block on any error, never throwing", async () => {
@@ -94,12 +124,103 @@ describe("fetchMemoryContext", () => {
     expect(result).toEqual({ block: null, recall: null });
   });
 
-  it("returns a null block when the compiler has nothing to say", async () => {
-    const httpFn = vi.fn(async () => ({ ok: true, status: 200, data: { context: "", recall: null } }));
+  it("returns a null block when the compiled context object's text is empty", async () => {
+    const httpFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      data: { context: compiledContext(""), recall: null },
+    }));
 
     const result = await fetchMemoryContext(httpFn, "ws_test", "goal");
 
     expect(result.block).toBeNull();
+  });
+
+  it("returns a null block when the compiled context object's text is whitespace-only", async () => {
+    const httpFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      data: { context: compiledContext("   \n  "), recall: null },
+    }));
+
+    const result = await fetchMemoryContext(httpFn, "ws_test", "goal");
+
+    expect(result.block).toBeNull();
+  });
+
+  it("returns a labeled block when the compiled context object carries text", async () => {
+    const httpFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      data: { context: compiledContext("Known fact: dark mode preferred"), recall: { hits: 1 } },
+    }));
+
+    const result = await fetchMemoryContext(httpFn, "ws_test", "goal");
+
+    expect(result.block).toBe("## Memory (activation recall)\nKnown fact: dark mode preferred");
+  });
+
+  it("still handles a bare string context (backward tolerance)", async () => {
+    const httpFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      data: { context: "compiled working memory", recall: { hits: 1 } },
+    }));
+
+    const result = await fetchMemoryContext(httpFn, "ws_test", "goal");
+
+    expect(result.block).toBe("## Memory (activation recall)\ncompiled working memory");
+  });
+});
+
+describe("fetchRecentTurns", () => {
+  it("GETs agent.turn events bounded to RECENT_TURNS_K and maps them oldest-to-newest", async () => {
+    // GET /api/event returns newest-first (ORDER BY ts DESC); fetchRecentTurns
+    // must reverse it to the oldest-to-newest order the compiler expects.
+    const events = [
+      { attrs: { goal: "third goal" }, outcome: "completed" },
+      { attrs: { goal: "second goal" }, outcome: "failed" },
+      { attrs: { goal: "first goal" }, outcome: "completed" },
+    ];
+    const httpFn = vi.fn(async (method, path) => {
+      expect(method).toBe("GET");
+      expect(path).toBe(`/api/event?type=agent.turn&limit=${RECENT_TURNS_K}`);
+      return { ok: true, status: 200, data: events };
+    });
+
+    const turns = await fetchRecentTurns(httpFn, "ws_test");
+
+    expect(turns).toEqual([
+      { role: "agent", content: "first goal -> completed" },
+      { role: "agent", content: "second goal -> failed" },
+      { role: "agent", content: "third goal -> completed" },
+    ]);
+  });
+
+  it("bounds the fetch to a custom k when passed", async () => {
+    const httpFn = vi.fn(async () => ({ ok: true, status: 200, data: [] }));
+
+    await fetchRecentTurns(httpFn, "ws_test", 3);
+
+    expect(httpFn).toHaveBeenCalledWith("GET", "/api/event?type=agent.turn&limit=3");
+  });
+
+  it("degrades to [] on any failure, never throwing", async () => {
+    const httpFn = vi.fn(async () => {
+      throw new Error("event store unavailable");
+    });
+
+    const turns = await fetchRecentTurns(httpFn, "ws_test");
+
+    expect(turns).toEqual([]);
+  });
+
+  it("degrades to [] when the response is not ok or not an array", async () => {
+    const httpFn = vi.fn(async () => ({ ok: false, status: 500, data: null }));
+
+    const turns = await fetchRecentTurns(httpFn, "ws_test");
+
+    expect(turns).toEqual([]);
   });
 });
 
@@ -135,7 +256,11 @@ describe("runAgentTurn - memory injection", () => {
     const httpFn = makeHttp([
       {
         match: (m, p) => p === "/api/memory/context",
-        reply: () => ({ ok: true, status: 200, data: { context: `Known fact: ${SEEDED_FACT}`, recall: { hits: 1 } } }),
+        reply: () => ({
+          ok: true,
+          status: 200,
+          data: { context: compiledContext(`Known fact: ${SEEDED_FACT}`), recall: { hits: 1 } },
+        }),
       },
     ]);
     const queryFn = makeQueryFn({ text: "used the fact" });
@@ -209,7 +334,11 @@ describe("runAgentTurn - memory injection", () => {
     const httpFn = makeHttp([
       {
         match: (m, p) => p === "/api/memory/context",
-        reply: () => ({ ok: true, status: 200, data: { context: `Rules:\n- ${RULE_TEXT}`, recall: { hits: 1 } } }),
+        reply: () => ({
+          ok: true,
+          status: 200,
+          data: { context: compiledContext(`Rules:\n- ${RULE_TEXT}`), recall: { hits: 1 } },
+        }),
       },
     ]);
     const queryFn = makeQueryFn({ text: "kept it short" });
@@ -252,6 +381,55 @@ describe("runAgentTurn - memory injection", () => {
 
     expect(result.success).toBe(true);
     expect(queryFn.prompts.some((p) => p.includes("## Operating manual"))).toBe(false);
+  });
+
+  it("threads recent agent.turn events into the memory/context POST body, oldest-to-newest, bounded to RECENT_TURNS_K", async () => {
+    const priorEvents = [
+      { attrs: { goal: "second prior goal" }, outcome: "completed" },
+      { attrs: { goal: "first prior goal" }, outcome: "failed" },
+    ];
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p === `/api/event?type=agent.turn&limit=${RECENT_TURNS_K}`,
+        reply: () => ({ ok: true, status: 200, data: priorEvents }),
+      },
+      {
+        match: (m, p) => p === "/api/memory/context",
+        reply: () => ({ ok: true, status: 200, data: { context: compiledContext(""), recall: null } }),
+      },
+    ]);
+    const queryFn = makeQueryFn({ text: "done" });
+
+    const result = await runAgentTurn("do the next thing", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    const contextCall = httpFn.calls.find((c) => c.path === "/api/memory/context");
+    expect(contextCall.body.recent_turns).toEqual([
+      { role: "agent", content: "first prior goal -> failed" },
+      { role: "agent", content: "second prior goal -> completed" },
+    ]);
+  });
+
+  it("degrades to an empty recent_turns array (not a thrown error) when the agent.turn event fetch fails", async () => {
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p === `/api/event?type=agent.turn&limit=${RECENT_TURNS_K}`,
+        reply: () => {
+          throw new Error("event store unavailable");
+        },
+      },
+      {
+        match: (m, p) => p === "/api/memory/context",
+        reply: () => ({ ok: true, status: 200, data: { context: compiledContext(""), recall: null } }),
+      },
+    ]);
+    const queryFn = makeQueryFn({ text: "done anyway" });
+
+    const result = await runAgentTurn("do something", "ws_test", { queryFn, httpFn });
+
+    expect(result.success).toBe(true);
+    const contextCall = httpFn.calls.find((c) => c.path === "/api/memory/context");
+    expect(contextCall.body.recent_turns).toEqual([]);
   });
 
   it("gate-refused turn makes no memory calls at all", async () => {

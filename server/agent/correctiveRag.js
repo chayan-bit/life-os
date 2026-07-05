@@ -104,9 +104,9 @@ function withWebSuggestion(block) {
 // and the loop's `memory_injected` metric must reflect the latter, not the
 // former. Never throws - a rewrite or re-fetch failure degrades to the
 // original memory result.
-export async function correctiveRetrieve(deps, ctx, prompt) {
+export async function correctiveRetrieve(deps, ctx, prompt, recentTurns = []) {
   const { httpFn, workspaceId, queryFn } = deps;
-  const first = await fetchMemoryContext(httpFn, workspaceId, prompt);
+  const first = await fetchMemoryContext(httpFn, workspaceId, prompt, recentTurns);
   const grade = gradeRecall(first.recall);
   const rag = { grade, rewritten: false, regraded: null, web_suggested: false };
 
@@ -120,7 +120,7 @@ export async function correctiveRetrieve(deps, ctx, prompt) {
   try {
     const { query: rewritten } = await rewriteQuery(queryFn, prompt, ctx);
     rag.rewritten = true;
-    const second = await fetchMemoryContext(httpFn, workspaceId, rewritten);
+    const second = await fetchMemoryContext(httpFn, workspaceId, rewritten, recentTurns);
     block = second.block ?? block;
     recall = second.recall ?? recall;
     regraded = gradeRecall(recall);

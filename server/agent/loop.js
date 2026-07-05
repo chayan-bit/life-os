@@ -11,7 +11,7 @@ import { critique } from "./critic.js";
 import { createHttpFn } from "./http.js";
 import { REGISTRY } from "./actionRegistry.js";
 import { indexTools, retrieveTools } from "./toolRag.js";
-import { fetchMemoryContext, ingestTurnOutcome } from "./memoryContext.js";
+import { fetchMemoryContext, fetchRecentTurns, ingestTurnOutcome } from "./memoryContext.js";
 import { correctiveRetrieve, isQuestionTurn, buildAbstentionResponse } from "./correctiveRag.js";
 import { fetchActiveManual } from "./manual.js";
 import { distillLesson } from "./reflect.js";
@@ -255,9 +255,18 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     // re-retrieve/cite cycle only applies to question turns - an imperative
     // request never needs a citation instruction or a web-fallback nudge.
     const isQuestion = isQuestionTurn(prompt);
+    // Best-effort, once per turn (docs/AGENT-CORE.md §5): both the plain and
+    // corrective-RAG context paths below share this same window so a
+    // rewritten re-fetch doesn't re-read a different slice of history.
+    const recentTurns = await fetchRecentTurns(ctx.httpFn, ctx.workspaceId);
     const memory = isQuestion
-      ? await correctiveRetrieve({ httpFn: ctx.httpFn, workspaceId: ctx.workspaceId, queryFn: ctx.queryFn }, ctx, prompt)
-      : await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt);
+      ? await correctiveRetrieve(
+          { httpFn: ctx.httpFn, workspaceId: ctx.workspaceId, queryFn: ctx.queryFn },
+          ctx,
+          prompt,
+          recentTurns,
+        )
+      : await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt, recentTurns);
     ctx.memoryInjected = isQuestion ? Boolean(memory.hasContent) : Boolean(memory.block);
     ctx.recall = memory.recall;
     ctx.rag = isQuestion ? memory.rag : null;
