@@ -13,6 +13,7 @@ pub mod ids;
 pub mod integrations;
 pub mod kite;
 pub mod marketplace_sign;
+pub mod memvec_search;
 pub mod models;
 pub mod nango;
 pub mod reading;

@@ -31,9 +31,11 @@ pub struct VectorHit {
 }
 
 /// Semantic ANN lane. vec0/sqlite-vec is owned by memvec.py (not loadable
-/// from the Rust libSQL build), so the searcher is injected: the API wires a
-/// subprocess-backed impl when LIFEOS_MEMVEC is set, tests wire fakes, and
-/// `NoopVectorSearcher` degrades recall gracefully to lexical-only.
+/// from the Rust libSQL build), so the searcher is injected: `lifeos-api` wires
+/// a subprocess-backed `MemvecSearcher` (shared with `/api/search`, scoped to a
+/// `mem:<ws>` vector label) when LIFEOS_MEMVEC is set, tests wire fakes, and
+/// `NoopVectorSearcher` degrades recall gracefully to lexical-only when it is
+/// unset or the subprocess fails.
 #[async_trait]
 pub trait VectorSearcher: Send + Sync {
     async fn search(

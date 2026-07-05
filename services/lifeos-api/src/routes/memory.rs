@@ -61,6 +61,36 @@ fn recall_params(req: &RecallRequest) -> RecallParams {
     }
 }
 
+/// Restore the vector lane behind LIFEOS_MEMVEC: real memvec searcher when
+/// configured, else the graceful Noop (lexical-only) - the pre-#1 behavior.
+fn vector_searcher(state: &AppState) -> Box<dyn lifeos_memory::VectorSearcher> {
+    match crate::memvec_search::SubprocessMemvec::from_env(&state.config.derived_db_path) {
+        Some(runner) => Box::new(crate::memvec_search::MemvecSearcher::new(Box::new(runner))),
+        None => Box::new(NoopVectorSearcher),
+    }
+}
+
+/// Re-read a node's current content + tiered state (after promote-on-access
+/// restored it in the DB) so the recall RESPONSE carries the full text, not the
+/// pre-promote stub.
+async fn read_node_content(
+    state: &AppState,
+    workspace_id: &str,
+    id: &str,
+) -> ApiResult<Option<(String, Option<String>)>> {
+    let mut rows = state
+        .conn
+        .query(
+            "SELECT content, tiered_ref FROM memory_nodes WHERE workspace_id = ?1 AND id = ?2",
+            libsql::params![workspace_id, id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some((row.get::<String>(0)?, row.get::<Option<String>>(1)?))),
+        None => Ok(None),
+    }
+}
+
 /// Run recall and append the ledger event that makes it inspectable.
 async fn recall_logged(
     state: &AppState,
@@ -70,12 +100,22 @@ async fn recall_logged(
 ) -> ApiResult<(RecallOutcome, Value)> {
     // Incremental projection keeps recall fresh without a per-write hook.
     lifeos_memory::project_workspace(&state.conn, workspace_id).await.map_err(internal)?;
-    let outcome = recall(&state.conn, workspace_id, query, now_secs(), params, &NoopVectorSearcher)
-        .await
-        .map_err(internal)?;
+    // Best-effort: embed any not-yet-embedded nodes so the vector lane has
+    // material to search (no-op when LIFEOS_MEMVEC is unset).
+    let _ = crate::memvec_search::embed_new_nodes(
+        &state.conn,
+        &state.config.derived_db_path,
+        workspace_id,
+    )
+    .await;
+    let searcher = vector_searcher(state);
+    let mut outcome =
+        recall(&state.conn, workspace_id, query, now_secs(), params, searcher.as_ref())
+            .await
+            .map_err(internal)?;
 
     // Promote-on-access (issue #117): recalled cold memories come back warm.
-    if let RecallOutcome::Recalled { memories, .. } = &outcome {
+    if let RecallOutcome::Recalled { memories, .. } = &mut outcome {
         let tiered: Vec<String> = memories
             .iter()
             .filter(|m| m.tiered_ref.is_some())
@@ -88,6 +128,17 @@ async fn recall_logged(
                     .is_ok()
                 {
                     break;
+                }
+            }
+            // Reflect the just-restored full content in THIS response: recall
+            // scored off the stubbed row, so the in-memory outcome still holds
+            // the stub until we re-read the promoted node.
+            for m in memories.iter_mut().filter(|m| m.tiered_ref.is_some()) {
+                if let Some((content, tiered_ref)) =
+                    read_node_content(state, workspace_id, &m.id).await?
+                {
+                    m.content = content;
+                    m.tiered_ref = tiered_ref;
                 }
             }
         }

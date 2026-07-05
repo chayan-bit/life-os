@@ -18,11 +18,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Reciprocal-rank-fusion constant (Cormack et al.; same as memory-recall).
 const RRF_K: f64 = 60.0;
-const VECTOR_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -102,45 +100,20 @@ async fn lexical_ids(
     Ok(ids)
 }
 
-/// Best-effort semantic neighbours via the memvec subprocess. `None` means the
-/// vector lane was unavailable (no LIFEOS_MEMVEC, missing deps, or a failure) -
-/// the caller then runs lexical-only. `Some(vec![])` means it ran and found
-/// nothing.
+/// Best-effort semantic neighbours via the shared memvec subprocess seam
+/// (`crate::memvec_search`). Entity vectors use the plain `<ws>` label (memory
+/// vectors are partitioned under `mem:<ws>`, so they never surface here).
+/// `None` means the lane was unavailable (no LIFEOS_MEMVEC, missing deps, or a
+/// failure) - the caller then runs lexical-only; `Some(vec![])` means it ran
+/// and found nothing.
 async fn semantic_ids(
     state: &AppState,
     workspace_id: &str,
     query: &str,
     limit: u32,
 ) -> Option<Vec<String>> {
-    let memvec = std::env::var("LIFEOS_MEMVEC").ok().filter(|s| !s.is_empty())?;
-    let derived = state.config.derived_db_path.clone();
-    let q = query.to_string();
-    let ws = workspace_id.to_string();
-
-    let child = tokio::process::Command::new("python3")
-        .arg(&memvec)
-        .arg("query")
-        .args(["--db", &derived])
-        .args(["--workspace", &ws])
-        .args(["--k", &limit.to_string()])
-        .args(["--text", &q])
-        .stdin(std::process::Stdio::null())
-        .output();
-
-    let output = tokio::time::timeout(VECTOR_TIMEOUT, child).await.ok()?.ok()?;
-    if !output.status.success() {
-        tracing::warn!("memvec query failed (search degraded to lexical-only)");
-        return None;
-    }
-    // Expected stdout: one `id\tdistance` per line, best first.
-    let text = String::from_utf8_lossy(&output.stdout);
-    let ids = text
-        .lines()
-        .filter_map(|l| l.split('\t').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    Some(ids)
+    let runner = crate::memvec_search::SubprocessMemvec::from_env(&state.config.derived_db_path)?;
+    crate::memvec_search::query_ids(&runner, workspace_id, query, limit).await
 }
 
 /// Reciprocal-rank fusion across several ranked id lists (best-first).

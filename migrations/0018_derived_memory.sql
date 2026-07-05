@@ -36,3 +36,19 @@ CREATE TRIGGER IF NOT EXISTS memory_idx_au AFTER UPDATE ON memory_idx BEGIN
     VALUES ('delete', old.rowid, old.content);
     INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
+
+-- Embedding-state marker for the semantic (memvec) lane. A memory node's
+-- vector lives in the memvec-owned entity_vec index under a `mem:<ws>` label;
+-- this table records which node ids have already been embedded so the API's
+-- best-effort embed step only shells memvec for genuinely-new nodes. It lives
+-- in the derived (never-synced) DB because embedding state is per-machine
+-- derived state, exactly like the FTS index above. Node ids are
+-- content-deterministic (BLAKE3 of workspace_id|event_id), so an embedding
+-- stays valid across a rebuild and this marker never needs invalidating.
+CREATE TABLE IF NOT EXISTS memory_embedded (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    embedded_ts  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_embedded_ws ON memory_embedded (workspace_id);

@@ -407,6 +407,26 @@ async fn learned_rule_feeds_the_compiled_context() {
     assert_eq!(ctx["context"]["text"], ctx2["context"]["text"]);
 }
 
+/// Audit #1: with LIFEOS_MEMVEC unset (the test default), the newly-wired
+/// vector lane must degrade to lexical-only - recall still works, never errors.
+/// This is the "recall degrades cleanly when the semantic lane is absent" guard
+/// for the MemvecSearcher wiring.
+#[tokio::test]
+async fn recall_degrades_cleanly_without_the_vector_lane() {
+    let app = test_app().await;
+    ingest(&app.router, "terminal", None, "the release loop promotes candidate configs after eval").await;
+
+    let (st, body) = send(
+        &app.router, "POST", "/api/memory/recall", None,
+        Some(json!({"query": "how does the release loop promote configs?", "no_gate": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["outcome"], "recalled", "lexical-only recall must still succeed: {body:?}");
+    let contents: Vec<String> = recalled(&body).into_iter().map(|(_, c, _)| c).collect();
+    assert!(contents.iter().any(|c| c.contains("release loop")), "{contents:?}");
+}
+
 /// Issue #139 (GraphRAG global queries, docs/AGENT-CORE.md §13): the sleep
 /// cycle rebuilds a community map over two clusters, `/api/memory/network`
 /// lists both with non-empty summaries, and `/api/memory/network/ask` ranks
