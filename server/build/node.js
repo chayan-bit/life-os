@@ -46,7 +46,7 @@ export const TIER_PROMPTS = {
   T1: (node) => t1Prompt(node),
   T2: (node) => t2Prompt(node),
   T3: (node) => t3Prompt(node),
-  T4: (node) => tierPrompt("Tier 4 additive migration or derived-index rebuild", node),
+  T4: (node) => t4Prompt(node),
   T5: (node) => tierPrompt("Tier 5 subsystem (new crate)", node),
 };
 
@@ -166,6 +166,43 @@ function t3Prompt(node) {
       `study a sibling test file under services/${crate}/tests/ before writing this one. NEVER point the test ` +
       "at the real `lifeos.db`, a `~/` path, or a hardcoded `/Users/...` path.",
     "When done, your structured output must summarize what you wrote: the tier, the list of files you changed, and a one-line summary.",
+  ].join("\n\n");
+}
+
+// T4 real generator prompt (issue #136) - ONE additive migration file. The
+// t4Migration validator (server/validators/t4Migration.js) independently
+// re-checks file discipline, statement shape, and proves no-rewrite via a
+// scratch apply, so a build that strays from this contract fails closed
+// downstream regardless of what this prompt asks for.
+function t4Prompt(node) {
+  const { name } = node.params ?? {};
+  const scope = scopeDirs(node.tier, node.params).join(", ");
+  return [
+    "You are building a Tier 4 additive migration for the Life OS self-extension ladder.",
+    `Task: ${node.description}`,
+    `Write only within this tier's scope: ${scope}. Never touch anything else.`,
+    `Create exactly ONE new file, migrations/<NNNN>_${name}.sql, where <NNNN> is the next migration number ` +
+      "(current highest existing migrations/<NNNN>_*.sql number, plus one, zero-padded to 4 digits - study the " +
+      "migrations/ directory to find the current max before naming your file).",
+    "Every statement in the file MUST be one of these additive shapes, and nothing else:\n" +
+      "  - `ALTER TABLE <table> ADD COLUMN <col> <type> GENERATED ALWAYS AS (<expr>) VIRTUAL` (a computed, " +
+      "expression-indexable column lifted from existing data, e.g. from a JSON attrs blob)\n" +
+      "  - a plain nullable `ALTER TABLE <table> ADD COLUMN <col> <type>` (no `NOT NULL` without a `DEFAULT` - " +
+      "SQLite rejects that combination, and this pipeline does)\n" +
+      "  - `CREATE INDEX IF NOT EXISTS <idx> ON <table> (<cols-or-expr>)` (including an expression index)\n" +
+      "  - `CREATE VIRTUAL TABLE IF NOT EXISTS <name> USING fts5(...)`",
+    "FORBIDDEN, unconditionally: DROP, DELETE, UPDATE, TRUNCATE, RENAME, CREATE TRIGGER, and any non-virtual " +
+      "CREATE TABLE. Any statement that rewrites or removes existing data or schema is rejected outright - when " +
+      "in doubt, do not write it.",
+    "Never target a table owned by a rebuild path, never a migration: `entity_vec`, `entity_vec_meta`, " +
+      "`llm_cache` (server/memvec.py's semantic index) or `entities_idx`, `entities_fts`, `memory_idx`, " +
+      "`memory_fts` (lifeos-api's lexical index, migrations/0003 and 0018) - those are rebuilt wholesale, not " +
+      "migrated.",
+    "Study migrations/0017_memory.sql and migrations/0018_derived_memory.sql for this repo's exact style " +
+      "(header comment naming the issue/purpose, `IF NOT EXISTS` guards, GENERATED VIRTUAL column pattern), and " +
+      "the `add_column_if_missing` idempotency note in services/lifeos-api/src/db.rs's module doc for why a plain " +
+      "ADD COLUMN is NOT re-applied blindly at runtime (that guard lives in application code, not in your SQL file).",
+    "Your structured output must summarize: the tier, the single file you wrote (its path), and a one-line summary.",
   ].join("\n\n");
 }
 

@@ -16,13 +16,15 @@ const BASE_REF = "main";
 // Each named validator gets exactly the args shape its `run` function
 // expects; a validator with no entry here (the fail-closed placeholders) is
 // called bare. Adding a tier-specific validator (e.g. t1Render, #133) only
-// needs one new line here, not a growing if/else chain. t3Route additionally
-// takes `ctx.execFn` (opts.execFn DI) so tests never shell real cargo.
+// needs one new line here, not a growing if/else chain. t3Route/t4Migration
+// additionally take `ctx.execFn` (opts.execFn DI) so tests never shell real
+// cargo/sqlite3.
 const VALIDATOR_ARGS = {
   protectedSurface: (worktreePath, node) => ({ worktreePath, baseRef: BASE_REF }),
   t1Render: (worktreePath, node) => ({ worktreePath, params: node.params }),
   t2Tool: (worktreePath, node) => ({ worktreePath, params: node.params }),
   t3Route: (worktreePath, node, ctx) => ({ worktreePath, params: node.params, opts: { execFn: ctx.execFn } }),
+  t4Migration: (worktreePath, node, ctx) => ({ worktreePath, params: node.params, opts: { execFn: ctx.execFn } }),
 };
 
 // Runs each validator for `tier` against the worktree, short-circuiting on the

@@ -60,10 +60,19 @@ export const TIER_SCOPES = {
     `services/${crate}/tests/${name}_integration.rs`,
   ],
 
-  // T4 Migration / derived - an additive migration file or a derived-index
-  // rebuild. Protected migrations (§5) are still denied even though the scope
-  // names `migrations/**`, because deny wins.
-  T4: () => ["migrations/**", "services/lifeos-derived/**"],
+  // T4 Migration (issue #136) - exactly ONE new additive migration file.
+  // `<NNNN>` can't be resolved inside a static glob (it's "current max + 1" at
+  // build time), so the scope is a single-file wildcard on the number; the
+  // t4Migration validator (server/validators/t4Migration.js) is what actually
+  // enforces "exactly one new file, correctly numbered." Narrowed to
+  // canonical `migrations/` only (not `services/lifeos-derived/**`, which
+  // does not exist as a crate/DB in this repo - the derived DB's DDL is baked
+  // into lifeos-api/src/db.rs as separate include_str! constants applied to a
+  // physically distinct file, not read generically from `migrations/`; see
+  // t4Migration.js's module doc for the honest scoping note). Protected
+  // migrations (§5, e.g. 0002/0011) are still denied even though the scope
+  // names `migrations/*`, because deny wins.
+  T4: ({ name }) => [`migrations/*_${name}.sql`],
 
   // T5 Subsystem - a whole new crate dir plus its Cargo.toml workspace entry.
   T5: ({ crate }) => [`services/${crate}/**`, "services/Cargo.toml"],

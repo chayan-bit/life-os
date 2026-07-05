@@ -115,7 +115,7 @@ describe("isWriteAllowed - every protected surface denied at EVERY tier", () => 
     ["T1", { kind: "graph" }],
     ["T2", { name: "rMultiple" }],
     ["T3", { crate: "lifeos-api", name: "week" }],
-    ["T4", {}],
+    ["T4", { name: "habit_streak" }],
     ["T5", { crate: "lifeos-finance" }],
   ];
   const protectedProbes = [
@@ -150,16 +150,23 @@ describe("isWriteAllowed - every protected surface denied at EVERY tier", () => 
 
 describe("evaluateWrite - reason naming", () => {
   it("names the protected surface that fired (deny wins over a tier allow)", () => {
-    // T4's scope names migrations/**, yet a protected migration still denies.
-    const verdict = evaluateWrite({ tier: "T4", params: {}, root: ROOT }, abs("migrations/0002_control_plane.sql"));
+    // T4's scope names migrations/*_<name>.sql, yet a protected migration
+    // still denies even if its name happened to match the glob.
+    const verdict = evaluateWrite({ tier: "T4", params: { name: "control_plane" }, root: ROOT }, abs("migrations/0002_control_plane.sql"));
     expect(verdict.allowed).toBe(false);
     expect(verdict.reason).toMatch(/protected surface/);
     expect(verdict.reason).toMatch(/0002_control_plane\.sql/);
   });
 
-  it("allows an additive migration that is not protected", () => {
-    const verdict = evaluateWrite({ tier: "T4", params: {}, root: ROOT }, abs("migrations/0099_habit_streak.sql"));
+  it("allows an additive migration matching the tier's name param", () => {
+    const verdict = evaluateWrite({ tier: "T4", params: { name: "habit_streak" }, root: ROOT }, abs("migrations/0099_habit_streak.sql"));
     expect(verdict.allowed).toBe(true);
+  });
+
+  it("denies a migration file whose name does not match the tier's name param", () => {
+    const verdict = evaluateWrite({ tier: "T4", params: { name: "habit_streak" }, root: ROOT }, abs("migrations/0099_other_name.sql"));
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toMatch(/outside T4 write-scope/);
   });
 
   it("reports an outside-scope denial with the tier named", () => {

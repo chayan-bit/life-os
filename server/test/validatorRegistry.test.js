@@ -34,14 +34,12 @@ describe("getValidators - registry dispatch", () => {
     expect(result.valid).toBe(false);
   });
 
-  it("T4-T5 resolve to protectedSurface + a placeholder that fails closed", async () => {
-    for (const tier of ["T4", "T5"]) {
-      expect(validatorNames(tier)).toEqual(["protectedSurface", "notImplemented"]);
-      const placeholder = getValidators(tier).find((v) => v.name === "notImplemented");
-      const result = await placeholder.run();
-      expect(result.valid).toBe(false);
-      expect(result.errors[0]).toBe(`validator not yet implemented for ${tier}`);
-    }
+  it("T5 resolves to protectedSurface + a placeholder that fails closed (last remaining placeholder)", async () => {
+    expect(validatorNames("T5")).toEqual(["protectedSurface", "notImplemented"]);
+    const placeholder = getValidators("T5").find((v) => v.name === "notImplemented");
+    const result = await placeholder.run();
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toBe("validator not yet implemented for T5");
   });
 
   it("T1 resolves to protectedSurface + t1Render (issue #133 - no longer a placeholder)", () => {
@@ -54,6 +52,10 @@ describe("getValidators - registry dispatch", () => {
 
   it("T3 resolves to protectedSurface + t3Route (issue #135 - no longer a placeholder)", () => {
     expect(validatorNames("T3")).toEqual(["protectedSurface", "t3Route"]);
+  });
+
+  it("T4 resolves to protectedSurface + t4Migration (issue #136 - no longer a placeholder)", () => {
+    expect(validatorNames("T4")).toEqual(["protectedSurface", "t4Migration"]);
   });
 });
 

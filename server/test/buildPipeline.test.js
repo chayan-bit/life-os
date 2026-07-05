@@ -257,18 +257,18 @@ describe("runBuildPipeline - cyclic plan fails closed before any build", () => {
   });
 });
 
-describe("runBuildPipeline - T4 validator placeholder fails closed", () => {
-  it("fails a T4 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
+describe("runBuildPipeline - T5 validator placeholder fails closed", () => {
+  it("fails a T5 node against the not-yet-implemented registry validator (until its own generator lands)", async () => {
     const plan = {
-      nodes: [{ id: "t4", tier: "T4", params: {}, description: "additive due-date column", dependsOn: [] }],
+      nodes: [{ id: "t5", tier: "T5", params: { crate: "lifeos-finance" }, description: "new finance subsystem crate", dependsOn: [] }],
     };
     const beforeCount = await mainLogCount();
 
-    // No validateFn injected: the real registry placeholder for T4 runs and
+    // No validateFn injected: the real registry placeholder for T5 runs and
     // rejects, so the node fails and nothing ships. T1 got its real validator
-    // in issue #133, T2 in issue #134, T3 in issue #135 - this assertion now
-    // targets T4, which is still a genuine placeholder.
-    const result = await runBuildPipeline("make due date a fast-queryable field", "ws_test", {
+    // in issue #133, T2 in issue #134, T3 in issue #135, T4 in issue #136 -
+    // this assertion now targets T5, the last remaining placeholder.
+    const result = await runBuildPipeline("build a finance module with its own ingest pipeline", "ws_test", {
       repoRoot,
       queryFn: makeQueryFn(plan, []),
       httpFn: makeHttpFn([]),
@@ -276,7 +276,78 @@ describe("runBuildPipeline - T4 validator placeholder fails closed", () => {
 
     expect(result.success).toBe(false);
     expect(result.nodes[0].status).toBe("failed");
-    expect(result.nodes[0].reason).toMatch(/not yet implemented for T4/);
+    expect(result.nodes[0].reason).toMatch(/not yet implemented for T5/);
+    expect(await mainLogCount()).toBe(beforeCount);
+  });
+});
+
+describe("runBuildPipeline - T4 node builds, validates via the REAL t4Migration validator, and gates (issue #136)", () => {
+  it("writes one additive migration file, validates it with the real sqlite3 CLI (execFn DI), then halts awaiting_approval without committing", async () => {
+    const name = "due_date";
+    const plan = {
+      nodes: [{ id: "m", tier: "T4", params: { name }, description: "make due date a fast-queryable field", dependsOn: [] }],
+    };
+    // Seed one pre-existing migration on main (0001_core.sql, a non-virtual
+    // CREATE TABLE) so the T4 build's own file can be a purely additive 0002
+    // - a repo's very first-ever migration can't be additive-only by
+    // definition, so this mirrors the real migrations/ directory's shape.
+    await fs.mkdir(path.join(repoRoot, "migrations"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, "migrations", "0001_core.sql"), "CREATE TABLE entities (id TEXT PRIMARY KEY);\n", "utf8");
+    await git(["add", "migrations"]);
+    await git(["commit", "-m", "seed 0001_core.sql"]);
+
+    const beforeCount = await mainLogCount();
+    const httpCalls = [];
+
+    const queryFn = async function* (params) {
+      const purpose = params.options?.purpose;
+      if (purpose === "build_spec") {
+        yield { type: "result", subtype: "success", is_error: false, structured_output: SPEC };
+        return;
+      }
+      if (purpose === "build_plan") {
+        yield { type: "result", subtype: "success", is_error: false, structured_output: plan };
+        return;
+      }
+      // T4 build node: write ONE additive migration file - exactly the
+      // t4Migration validator's file-discipline + statement-shape + scratch-
+      // apply expectations.
+      const migrationsDir = path.join(params.options.cwd, "migrations");
+      await fs.mkdir(migrationsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(migrationsDir, `0002_${name}.sql`),
+        "ALTER TABLE entities ADD COLUMN due_text TEXT;\n" +
+          "CREATE INDEX IF NOT EXISTS idx_entities_id ON entities (id);\n",
+        "utf8",
+      );
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        structured_output: { tier: "T4", files: [`migrations/0002_${name}.sql`], summary: "ok" },
+      };
+    };
+
+    // No validateFn override: exercises the REAL t4Migration + protectedSurface
+    // validators end to end, shelling the real sqlite3 CLI (no execFn DI
+    // needed here since sqlite3 - unlike cargo - is fast enough to run for
+    // real in this test).
+    const result = await runBuildPipeline("make due date a fast-queryable field", "ws_test", {
+      repoRoot,
+      queryFn,
+      httpFn: makeHttpFn(httpCalls),
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.nodes[0].status).toBe("awaiting_approval");
+
+    const pending = httpCalls.find((c) => c.method === "POST" && c.path === "/api/entity" && c.body.type === "pending_approval");
+    expect(pending).toBeTruthy();
+    expect(pending.body.attrs.tier).toBe("T4");
+    const gated = httpCalls.find((c) => c.path === "/api/event" && c.body.type === "build.node.gated");
+    expect(gated).toBeTruthy();
+
+    // Nothing committed - the gate halts before commit.js ever runs.
     expect(await mainLogCount()).toBe(beforeCount);
   });
 });
