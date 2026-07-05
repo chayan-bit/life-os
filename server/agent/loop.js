@@ -12,11 +12,17 @@ import { createHttpFn } from "./http.js";
 import { REGISTRY } from "./actionRegistry.js";
 import { indexTools, retrieveTools } from "./toolRag.js";
 import { fetchMemoryContext, ingestTurnOutcome } from "./memoryContext.js";
+import { correctiveRetrieve, isQuestionTurn, buildAbstentionResponse } from "./correctiveRag.js";
 import { fetchActiveManual } from "./manual.js";
 import { distillLesson } from "./reflect.js";
 import { emptyUsage } from "./usage.js";
 import { isCacheMode, looksActiony, probe as cacheProbe, store as cacheStore } from "./llmCache.js";
 import { hasBudget, recordRecovery, wrapQueryFnWithBreaker, RECOVERY_BUDGET } from "./recovery.js";
+
+// A genuinely low-confidence answer to a weak/no-context question turn
+// abstains rather than fabricating (docs/AGENT-CORE.md §12) - the single
+// cheapest defense against hallucinated actuation.
+const ABSTAIN_THRESHOLD = 0.4;
 
 const newRunId = () => `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -73,6 +79,7 @@ async function persistTurn(ctx, record) {
         tools_offered: ctx.toolsOffered ?? null,
         toolrag_fallback: ctx.toolragFallback ?? null,
         memory_injected: ctx.memoryInjected ?? false,
+        rag: ctx.rag ?? null,
       },
       workspace_id: ctx.workspaceId,
     });
@@ -232,8 +239,16 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     // token-budgeted output, appended verbatim - never a re-query, never a
     // raw dump.
     const worldSnapshot = await buildWorldSnapshot(ctx);
-    const memory = await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt);
-    ctx.memoryInjected = Boolean(memory.block);
+    // Corrective-RAG (issue #130, docs/AGENT-CORE.md §12): the grade/rewrite/
+    // re-retrieve/cite cycle only applies to question turns - an imperative
+    // request never needs a citation instruction or a web-fallback nudge.
+    const isQuestion = isQuestionTurn(prompt);
+    const memory = isQuestion
+      ? await correctiveRetrieve({ httpFn: ctx.httpFn, workspaceId: ctx.workspaceId, queryFn: ctx.queryFn }, ctx, prompt)
+      : await fetchMemoryContext(ctx.httpFn, ctx.workspaceId, prompt);
+    ctx.memoryInjected = isQuestion ? Boolean(memory.hasContent) : Boolean(memory.block);
+    ctx.recall = memory.recall;
+    ctx.rag = isQuestion ? memory.rag : null;
     const manual = await fetchActiveManual(ctx.httpFn, ctx.workspaceId);
     const context = [worldSnapshot, memory.block, manual].filter(Boolean).join("\n\n");
 
@@ -294,10 +309,12 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
     }
 
     // 5. Verify + one bounded refine round.
+    let critiqueVerdict = null;
     if (ctx.pendingApprovals.length === 0) {
       const verdict = await critique(prompt, text, ctx);
       tokens += verdict.tokens;
       usage = addUsage(usage, verdict);
+      critiqueVerdict = verdict.critique;
       if (!verdict.critique.ok && verdict.critique.fixable) {
         const redo = await runExecute(prompt, context, plan, ctx, verdict.critique.issue);
         tokens += redo.tokens;
@@ -307,7 +324,21 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
       }
     }
 
-    const outcome = ctx.pendingApprovals.length > 0 ? "awaiting_approval" : "completed";
+    // Confidence-based abstention (docs/AGENT-CORE.md §12): only for question
+    // turns whose final memory grade never reached "sufficient", only on a
+    // genuinely low critic confidence, and never on a turn that already
+    // executed a tool successfully - real work is reported, not discarded.
+    const toolsExecuted = ctx.ledger.some((entry) => entry.ok);
+    const finalGrade = ctx.rag ? ctx.rag.regraded ?? ctx.rag.grade : null;
+    const weakContext = finalGrade === "weak" || finalGrade === "none";
+    const lowConfidence = Boolean(critiqueVerdict) && critiqueVerdict.confidence < ABSTAIN_THRESHOLD;
+    const shouldAbstain =
+      ctx.pendingApprovals.length === 0 && isQuestion && weakContext && lowConfidence && !toolsExecuted;
+    if (shouldAbstain) {
+      text = buildAbstentionResponse(critiqueVerdict.issue);
+    }
+
+    const outcome = ctx.pendingApprovals.length > 0 ? "awaiting_approval" : shouldAbstain ? "abstained" : "completed";
 
     // 6. Cache store (issue #127). Only a completed, probe-eligible turn that
     // made NO tool calls - a tool-using turn is NEVER cached (its effect is a
@@ -352,7 +383,15 @@ export async function runAgentTurn(prompt, workspaceId, opts = {}) {
 // (consolidate.rs) can fold it - no new subsystem, `events` stays the path.
 async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usage, text, refined, started, cache, error }) {
   const planStatus =
-    outcome === "completed" ? "completed" : outcome === "awaiting_approval" ? "awaiting_approval" : outcome === "degraded" ? "degraded" : "failed";
+    outcome === "completed"
+      ? "completed"
+      : outcome === "awaiting_approval"
+        ? "awaiting_approval"
+        : outcome === "degraded"
+          ? "degraded"
+          : outcome === "abstained"
+            ? "abstained"
+            : "failed";
   if (plan) await updatePlanStatus(planEntityId, plan, prompt, planStatus, ctx);
   await persistTurn(ctx, {
     run_id: ctx.runId,
