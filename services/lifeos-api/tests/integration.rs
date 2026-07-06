@@ -545,6 +545,194 @@ async fn metrics_breaks_down_events_by_tier_and_phase() {
     assert_eq!(body["events_by_phase"]["verify"], 1);
 }
 
+/// Issue #145 (Observe dashboard): `agent.turn` rows already carry
+/// tokens/gated/outcome on their run-log columns - `/api/metrics` rolls them
+/// up into turn totals + a gated-vs-allowed split, scoped to `agent.turn`
+/// only (not every gated row in the workspace).
+#[tokio::test]
+async fn metrics_rolls_up_agent_turns_gated_vs_allowed() {
+    let app = test_app().await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "agent.turn", "tokens_in": 10, "tokens_out": 5,
+            "outcome": "completed", "gated": 0,
+        })),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "agent.turn", "tokens_in": 3, "tokens_out": 2,
+            "outcome": "awaiting_approval", "gated": 1,
+        })),
+    )
+    .await;
+    let (st, body) = send(&app.router, "GET", "/api/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["agent_turns_total"], 2);
+    assert_eq!(body["agent_turns_gated"], 1);
+    assert_eq!(body["agent_turns_allowed"], 1);
+}
+
+/// The two-layer LLM cache (issue #127) stamps `attrs.cache` ('exact' |
+/// 'semantic') only on a cache-served turn; everything else has no `cache`
+/// key. `/api/metrics` breaks agent.turn down by that field so the frontend
+/// can compute a hit rate.
+#[tokio::test]
+async fn metrics_breaks_down_cache_hits_by_result() {
+    let app = test_app().await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "agent.turn", "attrs": {"cache": "exact"}})),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "agent.turn", "attrs": {"cache": "semantic"}})),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "agent.turn", "attrs": {}})),
+    )
+    .await;
+    let (st, body) = send(&app.router, "GET", "/api/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["cache_by_result"]["exact"], 1);
+    assert_eq!(body["cache_by_result"]["semantic"], 1);
+    assert_eq!(body["cache_by_result"]["none"], 1);
+}
+
+/// The self-healing ladder (issue #129) folds one `{ kind, tool, ok }` entry
+/// per recovery action into `attrs.recoveries` on the turn's own `agent.turn`
+/// event - never a separate event type. `/api/metrics` sums those arrays.
+#[tokio::test]
+async fn metrics_sums_recovery_actions_across_agent_turns() {
+    let app = test_app().await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "agent.turn",
+            "attrs": {"recoveries": [
+                {"kind": "retry", "tool": "search.query", "ok": true},
+                {"kind": "arg_repair", "tool": "entity.get", "ok": false},
+            ]},
+        })),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "agent.turn",
+            "attrs": {"recoveries": [{"kind": "retry", "tool": "memory.recall", "ok": true}]},
+        })),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "agent.turn", "attrs": {"recoveries": []}})),
+    )
+    .await;
+    let (st, body) = send(&app.router, "GET", "/api/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["recovery_action_count"], 3);
+    assert_eq!(body["recovery_turns_count"], 2);
+    assert_eq!(body["recovery_by_kind"]["retry"], 2);
+    assert_eq!(body["recovery_by_kind"]["arg_repair"], 1);
+}
+
+/// Build events (server/build/commit.js::emitBuildEvent) stamp `type`,
+/// `run_id`, `outcome`, and `attrs.node`/`attrs.tier` per node - `/api/metrics`
+/// surfaces the most recent ones plus a completed-run outcome breakdown so a
+/// dashboard can list "recent build runs with per-node status" without a new
+/// endpoint.
+#[tokio::test]
+async fn metrics_lists_recent_build_node_runs_and_outcomes() {
+    let app = test_app().await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "build.node.completed", "run_id": "build_1", "outcome": "completed",
+            "attrs": {"node": "t1-schema", "tier": "T1", "outcome": "completed"},
+        })),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "build.node.failed", "run_id": "build_1", "outcome": "failed",
+            "attrs": {"node": "t2-api", "tier": "T2", "outcome": "failed", "error": "boom"},
+        })),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "build.completed", "run_id": "build_1", "outcome": "failed"})),
+    )
+    .await;
+    let (st, body) = send(&app.router, "GET", "/api/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let recent = body["recent_build_nodes"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["run_id"], "build_1");
+    assert!(recent.iter().any(|n| n["node"] == "t1-schema" && n["outcome"] == "completed"));
+    assert!(recent.iter().any(|n| n["node"] == "t2-api" && n["outcome"] == "failed"));
+    assert_eq!(body["build_runs_by_outcome"]["failed"], 1);
+}
+
+/// Agent turns bucket by calendar day (from the `ts` unix-seconds column) so
+/// the dashboard can chart turns + tokens in/out over time without pulling
+/// the raw event log client-side.
+#[tokio::test]
+async fn metrics_buckets_agent_turns_by_day() {
+    let app = test_app().await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "agent.turn", "tokens_in": 7, "tokens_out": 4})),
+    )
+    .await;
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({"type": "agent.turn", "tokens_in": 3, "tokens_out": 1})),
+    )
+    .await;
+    let (st, body) = send(&app.router, "GET", "/api/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let days = body["turns_by_day"].as_array().unwrap();
+    assert_eq!(days.len(), 1);
+    assert_eq!(days[0]["turns"], 2);
+    assert_eq!(days[0]["tokens_in"], 10);
+    assert_eq!(days[0]["tokens_out"], 5);
+    assert!(days[0]["day"].as_str().unwrap().len() == 10); // YYYY-MM-DD
+}
+
 #[tokio::test]
 async fn planned_routes_are_honest() {
     let app = test_app().await;

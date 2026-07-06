@@ -37,7 +37,8 @@ import {
   MessageSquare,
   BookOpen,
   Plane,
-  Inbox
+  Inbox,
+  Activity
 } from 'lucide-react';
 
 export default function Layout({ children, onLogout }) {
@@ -151,6 +152,7 @@ export default function Layout({ children, onLogout }) {
         { name: 'Approvals', href: '/approvals', icon: Inbox },
         { name: 'Agent Ledger', href: '/agent-ledger', icon: History },
         { name: 'Memory', href: '/memory', icon: Brain },
+        { name: 'Observe', href: '/observe', icon: Activity },
       ],
     },
     // Hot-installed modules (issue #29): appear here the instant the SSE
