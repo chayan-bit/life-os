@@ -61,11 +61,37 @@ pub struct ActionRule {
 
 /// Static rule registry - see module doc for why this isn't manifest-driven
 /// yet. Seeded with the 3 examples docs/PLATFORM-SYSTEMS.md §6 documents.
+///
+/// Trigger audit (issue #93 follow-up, finding 23): the only rule below
+/// whose `on` matched a kind the codebase actually emits was
+/// `thumbnail_caption_draft`, and even that one was misspelled -
+/// `routes/files.rs`/`lifeos_vcs::commit::commit_version` emit `version.created`
+/// (generic, module-agnostic - every `file`/asset commit gets one), never a
+/// module-namespaced `asset.version_created`. Fixed below.
+///
+/// `equity_curve_journal` (`trade.closed`) and `topic_quiz` (`topic.due`)
+/// are left as their originally-declared triggers: neither event kind is
+/// emitted anywhere in this codebase today. Entity status transitions
+/// (e.g. a `trade` moving to `closed`, or spaced-repetition scheduling a
+/// `topic` into `review_due`) only ever produce the generic
+/// `entity.updated` event via `routes/entity.rs::update` - there is no
+/// code path that synthesizes a domain-typed event from a status change,
+/// and `modules/trading/module.js` / `modules/learning/module.js` only
+/// *declare* `trade.closed`/`topic.due`(-adjacent `study.review`) in their
+/// manifest `events` arrays without a bridge wiring them up (the same
+/// deferred manifest-to-emitter gap this module's own doc comment calls
+/// out for `pipelines`). Renaming these to `entity.updated` would be worse
+/// than leaving them dead: that event fires for every entity in every
+/// module, so the rule would misfire constantly instead of never firing.
+/// Correctly wiring them needs either a real emitter added at the trading/
+/// learning write path, or a richer `if` condition than this engine's
+/// single-field-equality check supports (matching `module`+`type`+
+/// `status` on a generic `entity.updated`) - both are out of scope here.
 pub fn action_registry() -> Vec<ActionRule> {
     vec![
         ActionRule {
             id: "thumbnail_caption_draft",
-            on: "asset.version_created",
+            on: "version.created",
             if_attr: None,
             run_kind: "action",
             run: || json!({ "tool": "asset.thumbnail_caption_draft" }),
@@ -344,6 +370,18 @@ mod tests {
         assert!(!rule_matches(rule, "trade.opened", &json!({})));
     }
 
+    /// Finding 23: `thumbnail_caption_draft` was wired to `asset.version_created`,
+    /// a kind nothing ever emits. `routes/files.rs`/`commit::commit_version`
+    /// emit `version.created` for every file/asset commit - the rule must
+    /// fire on that real kind, and must not fire on the old, never-emitted one.
+    #[test]
+    fn thumbnail_rule_matches_the_real_version_created_kind() {
+        let rule = &action_registry()[0];
+        assert_eq!(rule.id, "thumbnail_caption_draft");
+        assert!(rule_matches(rule, "version.created", &json!({})));
+        assert!(!rule_matches(rule, "asset.version_created", &json!({})));
+    }
+
     #[test]
     fn rule_matches_respects_if_attr() {
         let rule = ActionRule {
@@ -377,6 +415,28 @@ mod tests {
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["rule_id"], "equity_curve_journal");
         assert_eq!(payload["run"]["tool"], "trading.equity_curve_and_journal");
+    }
+
+    /// End-to-end version of `thumbnail_rule_matches_the_real_version_created_kind`:
+    /// a `version.created` event (the kind `routes/files.rs` actually emits
+    /// on every commit) must make it all the way through the engine to a
+    /// queued `action` job for `thumbnail_caption_draft`.
+    #[tokio::test]
+    async fn real_version_created_event_fires_the_thumbnail_rule() {
+        let conn = fresh_conn("/tmp/lifeos-actions-test-version-created.db").await;
+        conn.execute("INSERT INTO workspaces (id, name) VALUES ('ws1','w')", ()).await.unwrap();
+        insert_event(&conn, "evt_0001", "ws1", "version.created", &json!({}), 100).await;
+
+        let n = process_workspace_events(&conn, "ws1", 101).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(job_count(&conn, "ws1").await, 1);
+
+        let mut rows = conn.query("SELECT payload FROM jobs", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let payload: String = row.get(0).unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["rule_id"], "thumbnail_caption_draft");
+        assert_eq!(payload["run"]["tool"], "asset.thumbnail_caption_draft");
     }
 
     #[tokio::test]

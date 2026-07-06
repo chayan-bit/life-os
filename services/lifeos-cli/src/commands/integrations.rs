@@ -89,3 +89,67 @@ fn drafted_summary(v: &Value) -> String {
     let id = v.get("id").and_then(Value::as_str).unwrap_or("?");
     format!("drafted {id} - pending approval")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Client;
+    use crate::output::Output;
+    use crate::test_support::{settings, MockServer};
+
+    const OUT: Output = Output { json: false };
+
+    #[test]
+    fn drafted_summary_reports_the_id_and_pending_state() {
+        let v = json!({"id": "draft_1"});
+        assert_eq!(drafted_summary(&v), "drafted draft_1 - pending approval");
+        assert_eq!(drafted_summary(&json!({})), "drafted ? - pending approval");
+    }
+
+    #[tokio::test]
+    async fn gmail_list_proxies_a_free_read_with_the_query() {
+        let server = MockServer::start("200 OK", "[]");
+        let client = Client::new(settings(&server.base_url));
+
+        gmail(&client, OUT, GmailCmd::List { q: Some("from:boss".into()) }).await.unwrap();
+
+        let req = server.last_request();
+        let request_line = req.lines().next().unwrap_or_default();
+        assert!(request_line.starts_with("GET /api/gmail/list?"), "unexpected request line: {request_line}");
+        assert!(request_line.contains("q=from"));
+    }
+
+    #[tokio::test]
+    async fn gmail_send_only_ever_posts_a_draft_payload() {
+        let server = MockServer::start("200 OK", r#"{"id":"draft_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        gmail(
+            &client,
+            OUT,
+            GmailCmd::Send { to: "a@b.com".into(), subject: "hi".into(), body: None },
+        )
+        .await
+        .unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("POST /api/gmail/send"), "unexpected request line: {req}");
+        assert!(req.contains(r#""to":"a@b.com""#));
+        assert!(req.contains(r#""subject":"hi""#));
+    }
+
+    #[tokio::test]
+    async fn slack_post_hits_the_post_endpoint_with_channel_and_text() {
+        let server = MockServer::start("200 OK", r#"{"id":"draft_2"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        slack(&client, OUT, SlackCmd::Post { channel: "#general".into(), text: "hi team".into() })
+            .await
+            .unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("POST /api/slack/post"), "unexpected request line: {req}");
+        assert!(req.contains("\"channel\":\"#general\""));
+        assert!(req.contains(r#""text":"hi team""#));
+    }
+}

@@ -244,3 +244,221 @@ fn count_summary(noun: &str, v: &Value) -> String {
         None => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{EdgeCmd, EntityCmd, EventCmd, JobCmd};
+    use crate::client::Client;
+    use crate::output::Output;
+    use crate::test_support::{settings, MockServer};
+
+    const OUT: Output = Output { json: false };
+
+    #[tokio::test]
+    async fn entity_create_posts_module_type_and_optional_fields() {
+        let server = MockServer::start("200 OK", r#"{"id":"ent_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        entity(
+            &client,
+            OUT,
+            EntityCmd::Create {
+                module: "tasks".into(),
+                r#type: "task".into(),
+                title: Some("write tests".into()),
+                status: None,
+                parent_id: None,
+                attrs: Some(r#"{"due":1700000000}"#.into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("POST /api/entity"), "unexpected request line: {req}");
+        assert!(req.contains(r#""module":"tasks""#));
+        assert!(req.contains(r#""type":"task""#));
+        assert!(req.contains(r#""title":"write tests""#));
+        assert!(req.contains(r#""due":1700000000"#));
+    }
+
+    #[tokio::test]
+    async fn entity_create_rejects_non_object_attrs_without_calling_the_api() {
+        let server = MockServer::start("200 OK", r#"{"id":"ent_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        let err = entity(
+            &client,
+            OUT,
+            EntityCmd::Create {
+                module: "tasks".into(),
+                r#type: "task".into(),
+                title: None,
+                status: None,
+                parent_id: None,
+                attrs: Some("[1,2,3]".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, CliError::Local(_)));
+    }
+
+    #[tokio::test]
+    async fn entity_get_issues_a_get_to_the_entity_by_id_path() {
+        let server = MockServer::start("200 OK", r#"{"id":"ent_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        entity(&client, OUT, EntityCmd::Get { id: "ent_1".into() }).await.unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("GET /api/entity/ent_1"), "unexpected request line: {req}");
+    }
+
+    #[tokio::test]
+    async fn entity_list_forwards_filters_as_query_params() {
+        let server = MockServer::start("200 OK", "[]");
+        let client = Client::new(settings(&server.base_url));
+
+        entity(
+            &client,
+            OUT,
+            EntityCmd::List {
+                module: Some("tasks".into()),
+                r#type: None,
+                status: Some("open".into()),
+                parent_id: None,
+                limit: Some(10),
+                offset: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = server.last_request();
+        let request_line = req.lines().next().unwrap_or_default();
+        assert!(request_line.starts_with("GET /api/entity?"), "unexpected request line: {request_line}");
+        assert!(request_line.contains("module=tasks"));
+        assert!(request_line.contains("status=open"));
+        assert!(request_line.contains("limit=10"));
+        assert!(!request_line.contains("parent_id="));
+    }
+
+    #[tokio::test]
+    async fn entity_update_rejects_an_empty_update_without_calling_the_api() {
+        let server = MockServer::start("200 OK", r#"{"id":"ent_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        let err = entity(
+            &client,
+            OUT,
+            EntityCmd::Update { id: "ent_1".into(), title: None, status: None, attrs: None },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, CliError::Local(_)));
+    }
+
+    #[tokio::test]
+    async fn entity_update_patches_the_entity_by_id_path() {
+        let server = MockServer::start("200 OK", r#"{"id":"ent_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        entity(
+            &client,
+            OUT,
+            EntityCmd::Update {
+                id: "ent_1".into(),
+                title: None,
+                status: Some("done".into()),
+                attrs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("PATCH /api/entity/ent_1"), "unexpected request line: {req}");
+        assert!(req.contains(r#""status":"done""#));
+    }
+
+    #[tokio::test]
+    async fn edge_create_posts_src_rel_and_optional_dst() {
+        let server = MockServer::start("200 OK", r#"{"id":"edge_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        edge(
+            &client,
+            OUT,
+            EdgeCmd::Create {
+                src_id: "ent_1".into(),
+                rel: "blocks".into(),
+                dst_id: Some("ent_2".into()),
+                dst_ref: None,
+                state: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("POST /api/edge"), "unexpected request line: {req}");
+        assert!(req.contains(r#""src_id":"ent_1""#));
+        assert!(req.contains(r#""rel":"blocks""#));
+        assert!(req.contains(r#""dst_id":"ent_2""#));
+    }
+
+    #[tokio::test]
+    async fn event_create_posts_type_and_parsed_attrs() {
+        let server = MockServer::start("200 OK", r#"{"id":"evt_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        event(
+            &client,
+            OUT,
+            EventCmd::Create {
+                r#type: "task.completed".into(),
+                entity_id: Some("ent_1".into()),
+                actor: None,
+                attrs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("POST /api/event"), "unexpected request line: {req}");
+        assert!(req.contains(r#""type":"task.completed""#));
+        assert!(req.contains(r#""entity_id":"ent_1""#));
+    }
+
+    #[tokio::test]
+    async fn job_create_rejects_invalid_payload_json_without_calling_the_api() {
+        let server = MockServer::start("200 OK", r#"{"id":"job_1"}"#);
+        let client = Client::new(settings(&server.base_url));
+
+        let err = job(
+            &client,
+            OUT,
+            JobCmd::Create { kind: "action".into(), payload: Some("not json".into()), priority: None },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, CliError::Local(_)));
+    }
+
+    #[tokio::test]
+    async fn job_list_hits_the_plural_jobs_endpoint() {
+        let server = MockServer::start("200 OK", "[]");
+        let client = Client::new(settings(&server.base_url));
+
+        job(&client, OUT, JobCmd::List { status: None, kind: None, limit: None }).await.unwrap();
+
+        let req = server.last_request();
+        assert!(req.starts_with("GET /api/jobs"), "unexpected request line: {req}");
+    }
+}
