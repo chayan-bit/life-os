@@ -66,6 +66,7 @@ pub async fn metrics(
 
     let agent_turns = agent_turns_gated_split(&state, &ws).await?;
     let recovery = recovery_totals(&state, &ws).await?;
+    let strategy_leaderboard = strategy_leaderboard(&state, &ws).await?;
 
     Ok(Json(json!({
         "workspace_id": ws,
@@ -105,6 +106,10 @@ pub async fn metrics(
         "recovery_action_count": recovery.0,
         "recovery_turns_count": recovery.1,
         "recovery_by_kind": recovery_by_kind(&state, &ws).await?,
+        // Strategy optimizer leaderboard (issue #138 library, #156 wiring) -
+        // flattened across every live decision group (rag.rewrite,
+        // planner.prompt) so the Observe dashboard can render one table.
+        "strategy_leaderboard": strategy_leaderboard,
         "recent_build_nodes": recent_build_nodes(&state, &ws).await?,
         "build_runs_by_outcome": group_count_nullable_where(
             &state, "outcome", "events", &ws, "type = 'build.completed'",
@@ -275,6 +280,37 @@ async fn recovery_by_kind(state: &AppState, ws: &str) -> ApiResult<Value> {
         map.insert(key, json!(count));
     }
     Ok(Value::Object(map))
+}
+
+/// Strategy optimizer leaderboard (issue #138's epsilon-greedy library, #156
+/// wiring): every `agent.strategy.outcome` event carries `attrs.group` /
+/// `attrs.variant` / `attrs.success` (see `server/agent/strategy.js`'s
+/// `recordOutcome` - the exact event `type` string this reads). Flattened
+/// across every decision group into one array, sorted the same way
+/// `strategy.js::leaderboard()` sorts a single group (rate desc, then plays
+/// desc) with `group` added first since this spans all of them at once.
+async fn strategy_leaderboard(state: &AppState, ws: &str) -> ApiResult<Value> {
+    let sql = "SELECT json_extract(attrs, '$.group') AS grp, \
+                      json_extract(attrs, '$.variant') AS variant, \
+                      COUNT(*) AS plays, \
+                      COALESCE(SUM(json_extract(attrs, '$.success')), 0) AS successes, \
+                      CAST(COALESCE(SUM(json_extract(attrs, '$.success')), 0) AS REAL) / COUNT(*) AS rate \
+               FROM events \
+               WHERE workspace_id = ?1 AND type = 'agent.strategy.outcome' \
+               GROUP BY grp, variant \
+               ORDER BY grp ASC, rate DESC, plays DESC";
+    let mut rows = state.conn.query(sql, libsql::params![ws]).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(json!({
+            "group": row.get::<String>(0)?,
+            "variant": row.get::<String>(1)?,
+            "plays": row.get::<i64>(2)?,
+            "successes": row.get::<i64>(3)?,
+            "rate": row.get::<f64>(4)?,
+        }));
+    }
+    Ok(Value::Array(out))
 }
 
 /// Most recent per-node build events (issue #145): `build.node.completed` /

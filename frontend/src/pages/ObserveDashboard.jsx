@@ -76,6 +76,7 @@ export default function ObserveDashboard() {
     { label: 'Gated', value: metrics?.agent_turns_gated || 0 },
   ];
   const recoveryByKind = objectToBars(metrics?.recovery_by_kind);
+  const strategyLeaderboard = metrics?.strategy_leaderboard || [];
   const recentBuildNodes = metrics?.recent_build_nodes || [];
   const buildRunsByOutcome = metrics?.build_runs_by_outcome || {};
 
@@ -180,6 +181,40 @@ export default function ObserveDashboard() {
                   <Bar dataKey="value" fill={COLORS[4]} />
                 </BarChart>
               </ResponsiveContainer>
+            )}
+          </Card>
+
+          <Card title="Strategy optimizer leaderboard">
+            {strategyLeaderboard.length === 0 ? (
+              <Empty>
+                No strategy decisions recorded yet (rag.rewrite / planner.prompt decision groups,
+                see server/agent/strategy.js - issue #156).
+              </Empty>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs font-mono">
+                  <thead>
+                    <tr className="text-left text-neo-text-muted">
+                      <th className="pr-3 py-1">Group</th>
+                      <th className="pr-3 py-1">Variant</th>
+                      <th className="pr-3 py-1">Plays</th>
+                      <th className="pr-3 py-1">Wins</th>
+                      <th className="pr-3 py-1">Rate</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {strategyLeaderboard.map((row, i) => (
+                      <tr key={`${row.group}-${row.variant}-${i}`} className="border-t border-neo-border/30">
+                        <td className="pr-3 py-1">{row.group}</td>
+                        <td className="pr-3 py-1 font-bold">{row.variant}</td>
+                        <td className="pr-3 py-1">{row.plays}</td>
+                        <td className="pr-3 py-1">{row.successes}</td>
+                        <td className="pr-3 py-1">{Math.round((row.rate || 0) * 100)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </Card>
 

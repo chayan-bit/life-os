@@ -149,6 +149,37 @@ describe("leaderboard", () => {
   });
 });
 
+describe("A/B proof (#156): forced outcome events shift the leader", () => {
+  it("flips both chooseVariant's exploit pick and the leaderboard's top row when the forced outcomes flip", () => {
+    const rng = () => 0.99; // above epsilon - always exploit, never explore
+
+    const forcedForB = [
+      makeOutcome("ab_group", "a", false),
+      makeOutcome("ab_group", "a", false),
+      makeOutcome("ab_group", "a", false),
+      makeOutcome("ab_group", "b", true),
+      makeOutcome("ab_group", "b", true),
+      makeOutcome("ab_group", "b", true),
+    ];
+    expect(chooseVariant(forcedForB, ["a", "b"], { rng })).toBe("b");
+    expect(leaderboard(forcedForB, "ab_group")[0].variant).toBe("b");
+
+    // Same group, same variant names, only the recorded outcomes flip - the
+    // leader flips with them, proving the leader is a function of logged
+    // outcomes and not of variant declaration order or a fixed default.
+    const forcedForA = [
+      makeOutcome("ab_group", "a", true),
+      makeOutcome("ab_group", "a", true),
+      makeOutcome("ab_group", "a", true),
+      makeOutcome("ab_group", "b", false),
+      makeOutcome("ab_group", "b", false),
+      makeOutcome("ab_group", "b", false),
+    ];
+    expect(chooseVariant(forcedForA, ["a", "b"], { rng })).toBe("a");
+    expect(leaderboard(forcedForA, "ab_group")[0].variant).toBe("a");
+  });
+});
+
 describe("simulated convergence", () => {
   it("shifts selection frequency toward the best variant over many rounds while still occasionally exploring", () => {
     const variants = ["a", "b"];

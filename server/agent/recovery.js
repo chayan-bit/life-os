@@ -23,6 +23,36 @@ export const SUBSTITUTES = Object.freeze({
   "entity.get": "entity.list",
 });
 
+// Issue #156, decision group 3 of 3 ("recovery.order"): deliberately NOT
+// wired to the strategy optimizer - documented here per the issue's own
+// honesty clause ("if reordering is not safely variant-izable, document why
+// 3 is unsafe, with a test proving current behavior unchanged").
+//
+// Two independent reasons, either one alone would already rule it out:
+//
+// 1. Ownership: the actual sequencing of retry vs. arg-repair vs. substitute
+//    is dispatched in executor.js's `runAllowed`/`httpWithRetry`
+//    (ARG_REPAIR_STATUSES vs. isRetryableStatus branching, and
+//    `httpWithRetry` always exhausting its one retry before
+//    `applySubstituteHint` is even reached) - not in this file. #156's own
+//    concurrency split assigns executor.js to another worker; a chooseVariant
+//    call in *this* file could not change what actually runs there.
+//
+// 2. Even set ownership aside, retry-vs-substitute is not a free choice of
+//    equally-valid orderings the way a rewrite-prompt wording or a plan
+//    phrasing is. The steps are gated on mutually exclusive HTTP status
+//    branches (400/422 -> repair; >=500 -> retry, then substitute-hint only
+//    if still failing) - swapping "substitute-first" in would spend the
+//    substitute-hint budget on transient failures a bare retry would have
+//    silently recovered, a real behavior/safety regression, not a neutral
+//    style variant. SUBSTITUTES is restricted to read-only tools specifically
+//    so the hint is safe to append *after* retry has already failed - moving
+//    it earlier changes that invariant, it doesn't just re-flavor it.
+//
+// test/recovery.test.js's "recovery ladder ordering (#156)" describe block
+// locks in the current fixed order (retry, with its backoff sleep, always
+// precedes the substitute hint) as a regression guard.
+
 export function isRetryableStatus(status) {
   return typeof status === "number" && status >= 500;
 }

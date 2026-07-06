@@ -4,6 +4,7 @@
 // the lifeos-pipelines StageSpec shape, NOT a new table).
 import { z } from "zod";
 import { emptyUsage, foldUsage } from "./usage.js";
+import { chooseVariant, loadOutcomes } from "./strategy.js";
 
 const MIN_MULTI_IMPERATIVES = 2;
 const MIN_SOLO_IMPERATIVES = 3;
@@ -49,6 +50,33 @@ export const planJsonSchema = {
   },
 };
 
+// Strategy optimizer wiring (issue #156, decision group 2 of 3): two honest
+// phrasings of the very same request, both requesting the identical
+// stages/tool/description JSON contract (PlanSchema/planJsonSchema above
+// never change by variant) - only the instruction wording differs, so a
+// losing variant costs nothing but phrasing, never a malformed plan.
+export const PLANNER_PROMPT_GROUP = "planner.prompt";
+export const PLANNER_PROMPT_VARIANTS = ["stages", "checklist"];
+
+const PLAN_INSTRUCTIONS = {
+  stages: [
+    "Break the user's request into a short ordered plan of stages.",
+    "Each stage: a short name, the single tool it will call (or null for a reasoning-only step), and a one-line description.",
+  ],
+  checklist: [
+    "Turn the user's request into a short ordered checklist of concrete action items, most-important-first.",
+    "Each checklist item still needs exactly the same three fields as a plan stage: a short name, the single tool it will call (or null for a reasoning-only step), and a one-line description of what it accomplishes.",
+  ],
+};
+
+// Loads this turn's planner.prompt outcomes and picks a variant via #138's
+// epsilon-greedy chooseVariant - a thin wrapper kept separate from
+// generatePlan so it's directly unit-testable without a full queryFn mock.
+export async function choosePlannerVariant(ctx) {
+  const outcomes = await loadOutcomes(ctx.httpFn, ctx.workspaceId, PLANNER_PROMPT_GROUP);
+  return chooseVariant(outcomes, PLANNER_PROMPT_VARIANTS);
+}
+
 const countMatches = (text, re) => (text.match(re) || []).length;
 
 // Deterministic, no model call: numbered steps, or multiple imperatives joined
@@ -64,18 +92,21 @@ export function needsPlanning(prompt) {
   return false;
 }
 
-function buildPlanPrompt(goal, worldSnapshot) {
-  return [
-    "Break the user's request into a short ordered plan of stages.",
-    "Each stage: a short name, the single tool it will call (or null for a reasoning-only step), and a one-line description.",
-    worldSnapshot,
-    `Request: ${goal}`,
-  ].join("\n\n");
+function buildPlanPrompt(goal, worldSnapshot, variant = "stages") {
+  const instructions = PLAN_INSTRUCTIONS[variant] ?? PLAN_INSTRUCTIONS.stages;
+  return [...instructions, worldSnapshot, `Request: ${goal}`].join("\n\n");
 }
 
 // Runs the structured-output planner call and returns a validated plan, or
-// throws if the model's structured output is malformed.
+// throws if the model's structured output is malformed. The planner.prompt
+// variant (#156) is chosen once per turn and stamped on `ctx.plannerVariant`
+// - a second call within the same turn (e.g. the recovery ladder's one
+// replan, loop.js::recoverExecuteFailure) reuses it rather than re-rolling,
+// so the eventual outcome record attributes cleanly to a single choice.
 export async function generatePlan(goal, worldSnapshot, ctx) {
+  if (!ctx.plannerVariant) {
+    ctx.plannerVariant = await choosePlannerVariant(ctx);
+  }
   const options = {
     purpose: "plan",
     outputFormat: { type: "json_schema", schema: planJsonSchema },
@@ -83,7 +114,10 @@ export async function generatePlan(goal, worldSnapshot, ctx) {
   };
   let structured = null;
   let usage = emptyUsage();
-  for await (const message of ctx.queryFn({ prompt: buildPlanPrompt(goal, worldSnapshot), options })) {
+  for await (const message of ctx.queryFn({
+    prompt: buildPlanPrompt(goal, worldSnapshot, ctx.plannerVariant),
+    options,
+  })) {
     if (message.type === "result") {
       structured = message.structured_output;
       usage = foldUsage(usage, message.usage);

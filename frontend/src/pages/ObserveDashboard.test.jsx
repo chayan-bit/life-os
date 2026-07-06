@@ -25,6 +25,11 @@ const FULL_METRICS = {
   recovery_action_count: 3,
   recovery_turns_count: 2,
   recovery_by_kind: { retry: 2, arg_repair: 1 },
+  strategy_leaderboard: [
+    { group: 'rag.rewrite', variant: 'entity_focus', plays: 3, successes: 3, rate: 1 },
+    { group: 'rag.rewrite', variant: 'plain', plays: 2, successes: 1, rate: 0.5 },
+    { group: 'planner.prompt', variant: 'checklist', plays: 1, successes: 1, rate: 1 },
+  ],
   recent_build_nodes: [
     { run_id: 'build_1', node: 't1-schema', tier: 'T1', outcome: 'completed', type: 'build.node.completed', ts: 100 },
     { run_id: 'build_1', node: 't2-api', tier: 'T2', outcome: 'failed', type: 'build.node.failed', ts: 101 },
@@ -44,6 +49,7 @@ const EMPTY_METRICS = {
   recovery_action_count: 0,
   recovery_turns_count: 0,
   recovery_by_kind: {},
+  strategy_leaderboard: [],
   recent_build_nodes: [],
   build_runs_by_outcome: {},
 };
@@ -103,6 +109,7 @@ describe('ObserveDashboard', () => {
     expect(screen.getByText(/No cache-eligible turns yet/i)).toBeTruthy();
     expect(screen.getByText(/No recovery actions recorded yet/i)).toBeTruthy();
     expect(screen.getByText(/No build runs recorded yet/i)).toBeTruthy();
+    expect(screen.getByText(/No strategy decisions recorded yet/i)).toBeTruthy();
   });
 
   it('renders the eval card note explaining there is no events-backed data yet', async () => {
@@ -121,6 +128,13 @@ describe('ObserveDashboard', () => {
     expect(screen.getByText('t1-schema')).toBeTruthy();
     expect(screen.getByText('completed')).toBeTruthy();
     expect(screen.getByText('failed')).toBeTruthy();
+
+    // Strategy optimizer leaderboard (issue #156): both decision groups'
+    // top variants render, with the higher-rate rag.rewrite variant present.
+    expect(screen.getAllByText('rag.rewrite').length).toBe(2);
+    expect(screen.getByText('planner.prompt')).toBeTruthy();
+    expect(screen.getByText('entity_focus')).toBeTruthy();
+    expect(screen.getByText('checklist')).toBeTruthy();
   });
 
   it('calls GET /api/metrics on mount and again on refresh', async () => {

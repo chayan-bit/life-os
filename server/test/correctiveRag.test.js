@@ -6,6 +6,7 @@ import {
   correctiveRetrieve,
   gradeRecall,
   isQuestionTurn,
+  RAG_REWRITE_GROUP,
   rewriteQuery,
 } from "../agent/correctiveRag.js";
 
@@ -220,6 +221,113 @@ describe("correctiveRetrieve", () => {
 
     expect(result.rag.web_suggested).toBe(true);
     expect(result.block).toContain("web.scrape");
+  });
+});
+
+// Issue #156: wires #138's epsilon-greedy strategy.js to the rewrite-style
+// choice correctiveRetrieve already makes once per weak/none-graded turn.
+describe("correctiveRetrieve - strategy optimizer wiring (#156, group: rag.rewrite)", () => {
+  function makeStrategyHttp({ outcomeRows = [], contextReply } = {}) {
+    return makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.includes("type=agent.strategy.outcome"),
+        reply: () => ({ ok: true, status: 200, data: outcomeRows }),
+      },
+      { match: (m, p) => p === "/api/memory/context", reply: contextReply },
+    ]);
+  }
+
+  it("picks the cold (never-recorded) variant deterministically and folds its instruction into the rewrite prompt", async () => {
+    // "plain" and "expansion" already have a logged play each; "entity_focus"
+    // is the only unseen variant, so rule 1 (explore any 0-play variant
+    // first) picks it with no reliance on rng - fully deterministic.
+    const httpFn = makeStrategyHttp({
+      outcomeRows: [
+        { attrs: { group: RAG_REWRITE_GROUP, variant: "plain", success: true } },
+        { attrs: { group: RAG_REWRITE_GROUP, variant: "expansion", success: false } },
+      ],
+      contextReply: () => ({ ok: true, status: 200, data: { context: null, recall: { outcome: "skipped" } } }),
+    });
+    const queryFn = makeQueryFn({ rewrite: { query: "sharper query" } });
+
+    await correctiveRetrieve({ httpFn, workspaceId: "ws_test", queryFn }, {}, "who won the match?");
+
+    const rewritePrompt = queryFn.prompts[0];
+    expect(rewritePrompt).toMatch(/named entities/i);
+  });
+
+  it("uses the plain (baseline) instruction when the group has no logged outcomes yet", async () => {
+    const httpFn = makeStrategyHttp({
+      outcomeRows: [],
+      contextReply: () => ({ ok: true, status: 200, data: { context: null, recall: { outcome: "skipped" } } }),
+    });
+    const queryFn = makeQueryFn({ rewrite: { query: "sharper query" } });
+
+    await correctiveRetrieve({ httpFn, workspaceId: "ws_test", queryFn }, {}, "who won the match?");
+
+    const rewritePrompt = queryFn.prompts[0];
+    expect(rewritePrompt).not.toMatch(/named entities/i);
+    expect(rewritePrompt).not.toMatch(/synonyms/i);
+  });
+
+  it("records an agent.strategy.outcome event for rag.rewrite with success=true once the rewrite regrades sufficient", async () => {
+    let contextCalls = 0;
+    const httpFn = makeStrategyHttp({
+      outcomeRows: [],
+      contextReply: (m, p, body) => {
+        contextCalls += 1;
+        if (body.query === "sharper query") {
+          return {
+            ok: true,
+            status: 200,
+            data: { context: "- (src=ev2) launch is in Q3", recall: { outcome: "recalled", memories: [{ id: "m1" }, { id: "m2" }] } },
+          };
+        }
+        return { ok: true, status: 200, data: { context: null, recall: { outcome: "skipped" } } };
+      },
+    });
+    const queryFn = makeQueryFn({ rewrite: { query: "sharper query" } });
+
+    await correctiveRetrieve({ httpFn, workspaceId: "ws_test", queryFn }, {}, "when does it ship?");
+
+    const outcomePost = httpFn.calls.find(
+      (c) => c.method === "POST" && c.path === "/api/event" && c.body?.type === "agent.strategy.outcome",
+    );
+    expect(outcomePost).toBeTruthy();
+    expect(outcomePost.body.attrs).toEqual({ group: RAG_REWRITE_GROUP, variant: "plain", success: true });
+  });
+
+  it("records success=false when the rewrite is still weak after regrading", async () => {
+    const httpFn = makeStrategyHttp({
+      outcomeRows: [],
+      contextReply: () => ({ ok: true, status: 200, data: { context: null, recall: { outcome: "skipped" } } }),
+    });
+    const queryFn = makeQueryFn({ rewrite: { query: "still no hits query" } });
+
+    await correctiveRetrieve({ httpFn, workspaceId: "ws_test", queryFn }, {}, "who won the match?");
+
+    const outcomePost = httpFn.calls.find(
+      (c) => c.method === "POST" && c.path === "/api/event" && c.body?.type === "agent.strategy.outcome",
+    );
+    expect(outcomePost).toBeTruthy();
+    expect(outcomePost.body.attrs).toEqual({ group: RAG_REWRITE_GROUP, variant: "plain", success: false });
+  });
+
+  it("never records an outcome when the first recall was already sufficient (no rewrite happened)", async () => {
+    const httpFn = makeStrategyHttp({
+      outcomeRows: [],
+      contextReply: () => ({
+        ok: true,
+        status: 200,
+        data: { context: "- (src=ev1) launch is in Q3", recall: { outcome: "recalled", memories: [{ id: "m1" }, { id: "m2" }] } },
+      }),
+    });
+    const queryFn = makeQueryFn();
+
+    await correctiveRetrieve({ httpFn, workspaceId: "ws_test", queryFn }, {}, "when does launch ship?");
+
+    const outcomePost = httpFn.calls.find((c) => c.method === "POST" && c.body?.type === "agent.strategy.outcome");
+    expect(outcomePost).toBeFalsy();
   });
 });
 

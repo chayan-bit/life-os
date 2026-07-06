@@ -73,6 +73,14 @@ async fn test_app_with_marketplace() -> TestApp {
     let _ = std::fs::remove_file(&db_path);
     let mut config = base_config(&db_path);
     config.marketplace_signing_key = Some(lifeos_api::marketplace_sign::generate_signing_key());
+    // Install now re-runs the Tier-0 validator by shelling
+    // server/validators/validatePackage.js (issue #147); point server_dir at
+    // the repo-root server/ dir so that subprocess resolves.
+    config.server_dir = std::fs::canonicalize(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../server"),
+    )
+    .map(|p| p.to_string_lossy().to_string())
+    .unwrap_or_else(|_| "server".to_string());
     let state = build_state(config).await.expect("build state");
     TestApp {
         router: routes::router(state),
@@ -733,6 +741,73 @@ async fn metrics_buckets_agent_turns_by_day() {
     assert!(days[0]["day"].as_str().unwrap().len() == 10); // YYYY-MM-DD
 }
 
+/// Issue #156: the strategy optimizer (issue #138's epsilon-greedy library,
+/// `server/agent/strategy.js`) logs one `agent.strategy.outcome` event per
+/// decision with `attrs.{group,variant,success}` - `/api/metrics` flattens
+/// those into a per-(group,variant) leaderboard, sorted by rate desc then
+/// plays desc within each group, matching `strategy.js::leaderboard()`.
+#[tokio::test]
+async fn metrics_builds_a_strategy_leaderboard_from_outcome_events() {
+    let app = test_app().await;
+    for success in [true, false] {
+        send(
+            &app.router,
+            "POST",
+            "/api/event",
+            Some(json!({
+                "type": "agent.strategy.outcome",
+                "attrs": {"group": "rag.rewrite", "variant": "plain", "success": success},
+            })),
+        )
+        .await;
+    }
+    for _ in 0..3 {
+        send(
+            &app.router,
+            "POST",
+            "/api/event",
+            Some(json!({
+                "type": "agent.strategy.outcome",
+                "attrs": {"group": "rag.rewrite", "variant": "entity_focus", "success": true},
+            })),
+        )
+        .await;
+    }
+    send(
+        &app.router,
+        "POST",
+        "/api/event",
+        Some(json!({
+            "type": "agent.strategy.outcome",
+            "attrs": {"group": "planner.prompt", "variant": "checklist", "success": true},
+        })),
+    )
+    .await;
+
+    let (st, body) = send(&app.router, "GET", "/api/metrics", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let board = body["strategy_leaderboard"].as_array().unwrap();
+    assert_eq!(board.len(), 3);
+
+    let rag_rows: Vec<&Value> = board.iter().filter(|r| r["group"] == "rag.rewrite").collect();
+    assert_eq!(rag_rows.len(), 2);
+    // entity_focus (3/3 = 1.0 rate) outranks plain (1/2 = 0.5 rate) - proves
+    // the leaderboard is a function of logged outcomes, not insertion order.
+    assert_eq!(rag_rows[0]["variant"], "entity_focus");
+    assert_eq!(rag_rows[0]["plays"], 3);
+    assert_eq!(rag_rows[0]["successes"], 3);
+    assert_eq!(rag_rows[0]["rate"], 1.0);
+    assert_eq!(rag_rows[1]["variant"], "plain");
+    assert_eq!(rag_rows[1]["plays"], 2);
+    assert_eq!(rag_rows[1]["successes"], 1);
+    assert_eq!(rag_rows[1]["rate"], 0.5);
+
+    let planner_row = board.iter().find(|r| r["group"] == "planner.prompt").unwrap();
+    assert_eq!(planner_row["variant"], "checklist");
+    assert_eq!(planner_row["plays"], 1);
+    assert_eq!(planner_row["rate"], 1.0);
+}
+
 #[tokio::test]
 async fn planned_routes_are_honest() {
     let app = test_app().await;
@@ -1178,19 +1253,21 @@ async fn marketplace_publish_verify_install_and_tamper_detection() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(verified["valid"], false);
 
-    // Install re-verifies the stored package and records the event.
-    let (st, installed) = send(
+    // Install now re-runs the Tier-0 validator (issue #147): this minimal
+    // manifest verifies its signature but is NOT a structurally-complete T0
+    // module (no name/icon/color/entityTypes, views isn't view objects), so
+    // install rejects it with 400 rather than activating an unrenderable
+    // module. The full valid-install + entity-persistence path is covered
+    // end-to-end in tests/marketplace.rs.
+    let (st, rejected) = send(
         &app.router,
         "POST",
         "/api/marketplace/install",
         Some(json!({"package_id": package_id})),
     )
     .await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(installed["installed"], true);
-
-    let (_, events) = send(&app.router, "GET", "/api/event?type=marketplace.installed", None).await;
-    assert_eq!(events.as_array().unwrap().len(), 1);
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert!(rejected["error"].as_str().unwrap().contains("failed validation"), "{rejected:?}");
 
     // Installing an unknown package -> 404.
     let (st, _) = send(

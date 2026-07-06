@@ -284,6 +284,50 @@ describe("degrade + escalate (ladder step 5-6)", () => {
   });
 });
 
+describe("recovery ladder ordering (#156, group 3 of 3 - not variant-ized)", () => {
+  // See the comment on SUBSTITUTES in recovery.js for the full rationale:
+  // the retry-before-substitute sequencing is dispatched in executor.js
+  // (owned by another worker per #156's concurrency split) and is gated on
+  // mutually exclusive HTTP status branches, not a free choice of equally
+  // valid orderings - so it is deliberately left out of the strategy
+  // optimizer. This test locks in that the current fixed order is unchanged
+  // by this issue's work: retry (and its backoff sleep) always fires before
+  // the substitute hint is even considered.
+  it("always retries (with backoff) before ever attaching a substitute hint, unchanged by #156", async () => {
+    const httpFn = makeHttp([
+      {
+        match: (m, p) => m === "GET" && p.startsWith("/api/entity/ent_1"),
+        reply: () => ({ ok: false, status: 503, data: { error: "still down" } }),
+      },
+    ]);
+    const sleepFn = vi.fn(async () => {});
+    let resultSeen = null;
+    const queryFn = vi.fn(async function* ({ options }) {
+      if (options.purpose !== "execute") {
+        yield { type: "result", result: "ok", structured_output: { ok: true, issue: null, fixable: false }, usage: { input_tokens: 1, output_tokens: 1 } };
+        return;
+      }
+      resultSeen = await options._callTool("entity.get", { id: "ent_1" });
+      yield { type: "result", result: "done", usage: { input_tokens: 5, output_tokens: 5 } };
+    });
+
+    await runAgentTurn("get that entity", "ws_test", { queryFn, httpFn, sleepFn });
+
+    expect(sleepFn).toHaveBeenCalledWith(RETRY_BACKOFF_MS);
+    expect(String(resultSeen?.substitute_hint ?? resultSeen)).toMatch(/entity\.list/);
+    const turn = lastTurn(httpFn);
+    // The ledger is append-only in call order, so this array's order IS the
+    // ladder's execution order: the "retry" entry (recorded unconditionally
+    // by executor.js's httpWithRetry, win or lose) is pushed before the
+    // "substitute" entry (recorded only once retry's own attempt is spent) -
+    // proving retry always precedes substitute, exactly as it did before #156.
+    expect(turn.attrs.recoveries).toEqual([
+      { kind: "retry", tool: "entity.get", ok: false },
+      { kind: "substitute", tool: "entity.get", ok: false },
+    ]);
+  });
+});
+
 describe("circuit breaker", () => {
   it("opens after two consecutive queryFn throws and stops calling the model", async () => {
     const httpFn = makeHttp();

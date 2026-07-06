@@ -5,7 +5,7 @@
 import { query as defaultQuery } from "@anthropic-ai/claude-agent-sdk";
 import { checkGate } from "./gate.js";
 import { buildWorldSnapshot } from "./worldSnapshot.js";
-import { needsPlanning, generatePlan, persistPlan, updatePlanStatus } from "./planner.js";
+import { needsPlanning, generatePlan, persistPlan, updatePlanStatus, PLANNER_PROMPT_GROUP } from "./planner.js";
 import { runExecute } from "./executor.js";
 import { critique } from "./critic.js";
 import { createHttpFn } from "./http.js";
@@ -18,6 +18,7 @@ import { distillLesson } from "./reflect.js";
 import { emptyUsage } from "./usage.js";
 import { isCacheMode, looksActiony, probe as cacheProbe, store as cacheStore } from "./llmCache.js";
 import { hasBudget, recordRecovery, wrapQueryFnWithBreaker, RECOVERY_BUDGET } from "./recovery.js";
+import { recordOutcome } from "./strategy.js";
 
 // A genuinely low-confidence answer to a weak/no-context question turn
 // abstains rather than fabricating (docs/AGENT-CORE.md §12) - the single
@@ -449,6 +450,13 @@ async function finalize(ctx, { plan, planEntityId, prompt, outcome, tokens, usag
   // must never fold synthetic scenario turns into real memory or lessons.
   if (ctx.dryRun) return;
   await ingestTurnOutcome(ctx.httpFn, ctx.workspaceId, prompt, outcome, text);
+  // planner.prompt decision group (#156, group 2 of 3): only stamped when
+  // this turn actually planned (ctx.plannerVariant set by generatePlan).
+  // Success = the plan executed to its resolution without needing the
+  // recovery ladder's one replan and without degrading.
+  if (ctx.plannerVariant) {
+    await recordOutcome(ctx.httpFn, ctx.workspaceId, PLANNER_PROMPT_GROUP, ctx.plannerVariant, !ctx.replanned && outcome !== "degraded");
+  }
   // Distill-after (issue #128, docs/AGENT-CORE.md §6): best-effort, bounded
   // to at most one lesson per turn, never affects the already-computed
   // turn result.
