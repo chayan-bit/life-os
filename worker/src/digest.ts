@@ -8,9 +8,14 @@ import type { WorkerDb } from "@lifeos/db/client/worker";
 import { listPendingApprovals } from "./approvals.js";
 import { formatPendingApproval, inbox, pnl, today } from "./commands.js";
 
-export async function buildDigest(db: WorkerDb, workspaceId: string, nowSecs: number): Promise<string> {
+// `tz` (finding 41, correctness audit): "due today" must follow the user's
+// calendar day, not UTC's - see commands.ts's `dayWindow` for why. Optional
+// and forwarded straight to `today()`, which falls back to the same default
+// (Asia/Kolkata) when omitted - index.ts's `scheduled` handler passes
+// `env.LIFEOS_TZ` here; this module's own tests can omit it.
+export async function buildDigest(db: WorkerDb, workspaceId: string, nowSecs: number, tz?: string): Promise<string> {
   const [dueToday, blocked, realizedPnl, pending] = await Promise.all([
-    today(db, workspaceId, nowSecs),
+    today(db, workspaceId, nowSecs, tz),
     // No `task.blocked` event exists yet - "uncategorized captures" is the
     // closest analog to "blocked items" until one does, same note as
     // docs/PLATFORM-SYSTEMS.md §3's #65 entry.

@@ -311,13 +311,16 @@ describe("createBot - gated approve/deny (issue #66)", () => {
 });
 
 describe("createBot - typed-confirm gate (issue #142)", () => {
+  // A T5 gate's real status is server/build/gate.js's "awaiting_approval",
+  // not "pending_approval" (finding 13) - see worker/test/approvals.test.ts's
+  // matching note for why seeding the wrong-but-plausible status matters.
   async function seedTypedGate(workspaceId = WS) {
     const { createEntity } = await import("../src/entities.js");
     return createEntity(db, workspaceId, {
       module: "pipelines",
       type: "pending_approval",
       title: "T5 crate",
-      status: "pending_approval",
+      status: "awaiting_approval",
       attrs: { requires_typed_confirm: true, node: "t5" },
     });
   }
@@ -353,7 +356,7 @@ describe("createBot - typed-confirm gate (issue #142)", () => {
     expect(captured.answeredCallbacks[0]).toMatch(/Requires typed confirmation - reply with: t5/);
     expect(captured.messages[0].text).toContain(`[confirm:${gate.id}]`);
     const stillPending = await getEntityByIdForTest(gate.id);
-    expect(stillPending).toBe("pending_approval");
+    expect(stillPending).toBe("awaiting_approval");
   });
 
   it("replying with the exact phrase approves the gate", async () => {
@@ -377,7 +380,7 @@ describe("createBot - typed-confirm gate (issue #142)", () => {
     await bot.handleUpdate(replyUpdate("wrong", `confirm this\n[confirm:${gate.id}]`));
 
     expect(captured.messages[0].text).toMatch(/did not match/);
-    expect(await getEntityByIdForTest(gate.id)).toBe("pending_approval");
+    expect(await getEntityByIdForTest(gate.id)).toBe("awaiting_approval");
   });
 
   async function getEntityByIdForTest(id: string): Promise<string | null | undefined> {

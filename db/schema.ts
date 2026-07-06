@@ -1,8 +1,14 @@
-// Drizzle schema mirroring migrations/0001_core.sql and migrations/0002_control_plane.sql.
+// Drizzle schema mirroring migrations/0001_core.sql and migrations/0002_control_plane.sql,
+// plus every later migration that touches one of these tables (0007, 0013, 0015, 0016 so
+// far - see the inline comments below each affected column/table). Tables introduced by
+// other migrations (vcs_refs, marketplace, memory, ...) are queried via raw SQL elsewhere
+// and are intentionally not declared here.
 // One module, imported by both the Worker (@libsql/client/web) and the Mac
 // (embedded replica) - see client.worker.ts / client.mac.ts in this package.
 // Source of truth for column shape is the SQL migrations; keep this in sync by hand,
 // there is no migration generation step in this repo (migrations/ is applied directly).
+// schema.test.ts is a mechanical parity gate: it applies every migrations/*.sql file to an
+// in-memory DB and asserts every column declared here actually exists on the real table.
 import { sql } from "drizzle-orm";
 import {
   sqliteTable,
@@ -107,6 +113,10 @@ export const events = sqliteTable(
     outcome: text("outcome"),
     evalScore: real("eval_score"),
     gated: integer("gated").default(0),
+    // migrations/0015_events_caused_by.sql - causal pointer memory/consolidation follows.
+    causedByEventId: text("caused_by_event_id"),
+    // migrations/0016_events_schema_version.sql - versioned replay; pre-existing rows default to 1.
+    schemaVersion: integer("schema_version").notNull().default(1),
   },
   (table) => [
     index("ix_events_ws_ts").on(table.workspaceId, table.ts),
@@ -185,6 +195,10 @@ export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
   email: text("email").notNull().unique(),
   name: text("name"),
+  // migrations/0007_auth_password.sql - nullable: the seeded personal user and
+  // any pre-#100 row has none, so login for those fails closed until a
+  // password is set via register/reset.
+  passwordHash: text("password_hash"),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
@@ -232,24 +246,9 @@ export const connections = sqliteTable(
   ],
 );
 
-export const plans = sqliteTable("plans", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  priceCents: integer("price_cents").notNull().default(0),
-  currency: text("currency").notNull().default("usd"),
-  limits: text("limits").notNull().default("{}"),
-  createdAt: integer("created_at").notNull(),
-  updatedAt: integer("updated_at").notNull(),
-});
-
-export const subscriptions = sqliteTable("subscriptions", {
-  id: text("id").primaryKey(),
-  workspaceId: text("workspace_id")
-    .notNull()
-    .references(() => workspaces.id),
-  planId: text("plan_id").notNull(),
-  status: text("status").notNull(),
-  currentPeriodEnd: integer("current_period_end").notNull(),
-  createdAt: integer("created_at").notNull(),
-  updatedAt: integer("updated_at").notNull(),
-});
+// `plans`/`subscriptions` (the billing/quota catalog from this file's
+// original 0002_control_plane.sql) were dropped by migrations/
+// 0013_remove_billing.sql (issue #104) - this is self-hosted,
+// bring-your-own-database-and-AI-model software with nothing to meter or
+// bill, and neither table was ever read by any route. Do not re-add them
+// here without a matching migration that recreates the tables.

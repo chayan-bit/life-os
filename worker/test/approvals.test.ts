@@ -83,12 +83,16 @@ describe("approveEntity", () => {
 });
 
 describe("approveEntity - typed confirm (issue #142)", () => {
+  // A T5 gate is a server/build/gate.js build gate, so its real status is
+  // "awaiting_approval" (finding 13) - seeding "pending_approval" here would
+  // still happen to work and mask that the Worker used to only recognize
+  // that one status, excluding every real T5 gate from this whole flow.
   async function seedTypedGate() {
     return createEntity(db, WS, {
       module: "pipelines",
       type: "pending_approval",
       title: "T5 crate",
-      status: "pending_approval",
+      status: "awaiting_approval",
       attrs: { requires_typed_confirm: true, node: "t5" },
     });
   }
@@ -101,7 +105,7 @@ describe("approveEntity - typed confirm (issue #142)", () => {
     expect(result.outcome).toBe("requires_typed_confirm");
     if (result.outcome === "requires_typed_confirm") expect(result.phrase).toBe("t5");
     const still = await getEntityById(db, WS, gate.id);
-    expect(still?.status).toBe("pending_approval");
+    expect(still?.status).toBe("awaiting_approval");
     const queuedJobs = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
     expect(queuedJobs).toHaveLength(0);
   });
@@ -127,14 +131,17 @@ describe("approveEntity - typed confirm (issue #142)", () => {
 });
 
 describe("denyEntity", () => {
-  it("transitions to denied, records a *.rejected event, and enqueues nothing", async () => {
+  it("transitions to rejected (matching services/lifeos-api), records a *.rejected event, and enqueues nothing", async () => {
     const draft = await seedDraft();
 
     const result = await denyEntity(db, WS, draft.id);
 
     expect(result.outcome).toBe("denied");
     const updated = await getEntityById(db, WS, draft.id);
-    expect(updated?.status).toBe("denied");
+    // Not "denied" - services/lifeos-api/src/routes/approval.rs's deny CAS-
+    // transitions to "rejected"; the Worker previously wrote a second,
+    // API-unrecognized terminal status for the same entity (finding 13).
+    expect(updated?.status).toBe("rejected");
 
     const recordedEvents = await db.select().from(events).where(eq(events.entityId, draft.id));
     expect(recordedEvents).toHaveLength(1);
@@ -142,5 +149,53 @@ describe("denyEntity", () => {
 
     const queuedJobs = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
     expect(queuedJobs).toHaveLength(0);
+  });
+});
+
+// finding 13: server/build/gate.js's real T3+ build gates carry status
+// "awaiting_approval", not "pending_approval" - the typed-confirm tests above
+// used "pending_approval" for their gate fixture, which happened to already
+// work and masked the fact that a REAL gate (this status) was silently
+// excluded from every pending-approval surface. These seed the real status.
+describe("awaiting_approval gates (server/build/gate.js's real status)", () => {
+  async function seedBuildGate(workspaceId = WS) {
+    return createEntity(db, workspaceId, {
+      module: "pipelines",
+      type: "pending_approval",
+      title: "T3 crate",
+      status: "awaiting_approval",
+    });
+  }
+
+  it("listPendingApprovals includes awaiting_approval gates alongside pending_approval drafts", async () => {
+    const gate = await seedBuildGate();
+    const draft = await seedDraft();
+
+    const rows = await listPendingApprovals(db, WS);
+
+    expect(rows.map((r) => r.id).sort()).toEqual([draft.id, gate.id].sort());
+  });
+
+  it("approveEntity approves an awaiting_approval gate, transitioning it and enqueuing execute_approval", async () => {
+    const gate = await seedBuildGate();
+
+    const result = await approveEntity(db, WS, gate.id);
+
+    expect(result.outcome).toBe("approved");
+    const updated = await getEntityById(db, WS, gate.id);
+    expect(updated?.status).toBe("approved");
+    const queuedJobs = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
+    expect(queuedJobs).toHaveLength(1);
+    expect(queuedJobs[0].kind).toBe("execute_approval");
+  });
+
+  it("denyEntity rejects an awaiting_approval gate", async () => {
+    const gate = await seedBuildGate();
+
+    const result = await denyEntity(db, WS, gate.id);
+
+    expect(result.outcome).toBe("denied");
+    const updated = await getEntityById(db, WS, gate.id);
+    expect(updated?.status).toBe("rejected");
   });
 });

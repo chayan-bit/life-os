@@ -1,5 +1,7 @@
-// Shared in-memory schema for tests - trimmed migrations/0001_core.sql DDL,
-// against @lifeos/db's own drizzle-orm instance (db/client.local.ts).
+// Shared in-memory schema for tests - trimmed migrations/0001_core.sql DDL
+// (plus events.caused_by_event_id/schema_version from 0015/0016 - db/
+// schema.ts declares them, so drizzle inserts include them), against
+// @lifeos/db's own drizzle-orm instance (db/client.local.ts).
 import { createLocalDb, type LocalDb } from "@lifeos/db/client/local";
 import { sql } from "@lifeos/db/query";
 
@@ -38,7 +40,9 @@ CREATE TABLE events (
   error TEXT,
   outcome TEXT,
   eval_score REAL,
-  gated INTEGER DEFAULT 0
+  gated INTEGER DEFAULT 0,
+  caused_by_event_id TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE jobs (
   id TEXT PRIMARY KEY,

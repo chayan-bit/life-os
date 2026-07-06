@@ -1,21 +1,31 @@
 // The gating state machine surfaced in Telegram - issue #66
-// (docs/SECURITY.md §2): pending_approval -> approved|denied, every
-// transition an event, approval only ever enqueues work for the Mac to
-// execute - the Worker itself never calls Nango's proxy, the browser
-// actuator, or trade-exec directly (it holds no provider tokens,
+// (docs/SECURITY.md §2): pending_approval|awaiting_approval -> approved|
+// rejected, every transition an event, approval only ever enqueues work for
+// the Mac to execute - the Worker itself never calls Nango's proxy, the
+// browser actuator, or trade-exec directly (it holds no provider tokens,
 // docs/ARCHITECTURE.md §3.1). Real dispatch of the enqueued
-// `execute_approval` job is services/lifeos-drain's job (not built yet -
-// its other job kinds are stubs too), so "on approve" here means "queued for
-// execution," not "executed."
+// `execute_approval` job is services/lifeos-drain's (issue #142): for a T3+
+// build gate it resumes the halted pipeline (`run_approval_resume_from_
+// payload`/`ScaffoldJsResumer`); a plain draft has nothing to resume and is
+// just acknowledged, since the outward Nango/browser-actuator/trade-exec call
+// itself still isn't wired up. Either way, "on approve" here means "queued
+// for execution," not "executed."
 import type { WorkerDb } from "@lifeos/db/client/worker";
 import { type Entity, getEntityById, listEntities, transitionEntityStatus } from "./entities.js";
 import { recordEvent } from "./events.js";
 import { enqueueJob } from "./jobs.js";
-
-export const PENDING_APPROVAL_STATUS = "pending_approval";
+import { APPROVED_STATUS, isPendingApproval, PENDING_STATUSES, REJECTED_STATUS } from "./status.js";
 
 export async function listPendingApprovals(db: WorkerDb, workspaceId: string, limit = 10): Promise<Entity[]> {
-  return listEntities(db, workspaceId, { status: PENDING_APPROVAL_STATUS, limit });
+  // `listEntities` only filters on a single status value, so a gate sitting
+  // in either pending status (status.ts) is fetched with one call per status
+  // and merged here rather than widening that shared helper for this one
+  // caller - newest-first across both, then re-capped to `limit`.
+  const rows = await Promise.all(PENDING_STATUSES.map((status) => listEntities(db, workspaceId, { status, limit })));
+  return rows
+    .flat()
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, limit);
 }
 
 export type ApprovalResult =
@@ -52,22 +62,32 @@ export function confirmPhrase(entity: Entity): string {
   return entity.title ?? entity.id;
 }
 
+// DB status a resolution outcome writes - kept distinct from the outcome tag
+// itself: "denied" is ApprovalResult's outcome name, but the stored status is
+// "rejected" (status.ts), matching services/lifeos-api's deny transition.
+const DB_STATUS_FOR_OUTCOME = { approved: APPROVED_STATUS, denied: REJECTED_STATUS } as const;
+
 async function resolveOrAlreadyResolved(
   db: WorkerDb,
   workspaceId: string,
   id: string,
-  toStatus: "approved" | "denied",
+  outcome: "approved" | "denied",
 ): Promise<ApprovalResult> {
   const existing = await getEntityById(db, workspaceId, id);
   if (!existing) return { outcome: "not_found" };
-  if (existing.status !== PENDING_APPROVAL_STATUS) return { outcome: "already_resolved", entity: existing };
+  const fromStatus = existing.status;
+  if (!isPendingApproval(fromStatus)) return { outcome: "already_resolved", entity: existing };
 
-  const updated = await transitionEntityStatus(db, workspaceId, id, PENDING_APPROVAL_STATUS, toStatus);
+  // `fromStatus` (not a hardcoded constant) so the CAS matches whichever
+  // pending status the entity actually carries (status.ts's
+  // pending_approval OR awaiting_approval) - the guard above already proved
+  // it's one of the two.
+  const updated = await transitionEntityStatus(db, workspaceId, id, fromStatus, DB_STATUS_FOR_OUTCOME[outcome]);
   // A concurrent tap could win the race between the check above and the
   // conditional UPDATE - treat that as already_resolved too, not a crash.
   if (!updated) return { outcome: "already_resolved", entity: existing };
 
-  return { outcome: toStatus, entity: updated } as ApprovalResult;
+  return { outcome, entity: updated } as ApprovalResult;
 }
 
 export async function approveEntity(
@@ -81,7 +101,7 @@ export async function approveEntity(
   // (no flag) skips this entirely.
   const existing = await getEntityById(db, workspaceId, id);
   if (!existing) return { outcome: "not_found" };
-  if (existing.status !== PENDING_APPROVAL_STATUS) return { outcome: "already_resolved", entity: existing };
+  if (!isPendingApproval(existing.status)) return { outcome: "already_resolved", entity: existing };
   if (requiresTypedConfirm(existing)) {
     const phrase = confirmPhrase(existing);
     if ((typed ?? "").trim() !== phrase) return { outcome: "requires_typed_confirm", entity: existing, phrase };

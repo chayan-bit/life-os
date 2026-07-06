@@ -27,9 +27,63 @@ function shortId(id: string): string {
   return id.slice(-SHORT_ID_LEN);
 }
 
-function endOfDayUtc(nowSecs: number): number {
-  const startOfDay = Math.floor(nowSecs / 86400) * 86400;
-  return startOfDay + 86400 - 1;
+// Default timezone for "today"-style windows - per the user (CLAUDE.md), not
+// UTC. Callers with an `env` to read from thread `env.LIFEOS_TZ` through
+// instead (index.ts's `scheduled` handler -> digest.ts -> here); bot.ts's
+// live `/today` command has no such plumbing yet, so it falls back to this
+// default, which is still correct for the common case.
+const DEFAULT_TZ = "Asia/Kolkata";
+const DAY_MS = 86_400_000;
+
+export interface DayWindow {
+  startSecs: number;
+  endSecs: number;
+  startIso: string;
+  endIso: string;
+}
+
+// This instant's UTC offset in minutes for `timeZone`, via the runtime's own
+// Intl/ICU data (correct for any IANA zone, DST-aware) rather than a
+// hand-maintained offset table - Asia/Kolkata's is a fixed +330 (IST,
+// +05:30, no DST), but this works for whatever `LIFEOS_TZ` names too.
+function timezoneOffsetMinutes(atMs: number, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(atMs));
+
+  const part = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? "0");
+  // Reading `timeZone`'s wall-clock fields for this instant, then
+  // reinterpreting them AS IF they were UTC, isolates exactly the offset -
+  // the difference from the instant's real UTC millis.
+  const asIfUtcMs = Date.UTC(part("year"), part("month") - 1, part("day"), part("hour"), part("minute"), part("second"));
+  return Math.round((asIfUtcMs - atMs) / 60_000);
+}
+
+// The "today" window (finding 41, correctness audit) - previously computed
+// on the UTC calendar day, wrong for most of the day for an IST (or any
+// non-UTC) user. E.g. at 9pm IST (same UTC calendar day), the old UTC
+// end-of-day cutoff (23:59:59 UTC) lands at 5:29am IST the NEXT day, so
+// `/today` silently counted a chunk of tomorrow's IST tasks as due today.
+export function dayWindow(nowSecs: number, tz: string = DEFAULT_TZ): DayWindow {
+  const nowMs = nowSecs * 1000;
+  const offsetMs = timezoneOffsetMinutes(nowMs, tz) * 60_000;
+  const shiftedMs = nowMs + offsetMs; // "as if" UTC millis were already `tz`
+  const startMs = Math.floor(shiftedMs / DAY_MS) * DAY_MS - offsetMs;
+  const endMs = startMs + DAY_MS - 1000; // inclusive last second of the day
+
+  return {
+    startSecs: Math.floor(startMs / 1000),
+    endSecs: Math.floor(endMs / 1000),
+    startIso: new Date(startMs).toISOString(),
+    endIso: new Date(endMs).toISOString(),
+  };
 }
 
 export async function captureTask(db: WorkerDb, workspaceId: string, text: string): Promise<string> {
@@ -82,8 +136,8 @@ export async function markDone(db: WorkerDb, workspaceId: string, suffix: string
   return `Done: ${result.entity.title}`;
 }
 
-export async function today(db: WorkerDb, workspaceId: string, nowSecs: number): Promise<string> {
-  const tasks = await listOpenTasksDueBy(db, workspaceId, endOfDayUtc(nowSecs));
+export async function today(db: WorkerDb, workspaceId: string, nowSecs: number, tz?: string): Promise<string> {
+  const tasks = await listOpenTasksDueBy(db, workspaceId, dayWindow(nowSecs, tz).endSecs);
   if (tasks.length === 0) return "Nothing due today.";
 
   return tasks.map((t) => `[${shortId(t.id)}] ${t.title}`).join("\n");

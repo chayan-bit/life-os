@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { LocalDb } from "@lifeos/db/client/local";
 import { captureDraft, captureTask, captureTopic } from "../src/commands.js";
 import { buildDigest } from "../src/digest.js";
+import { createEntity } from "../src/entities.js";
 import { createTestDb } from "./testDb.js";
 
 let db: LocalDb;
@@ -40,5 +41,21 @@ describe("buildDigest", () => {
     const digest = await buildDigest(db, WS, NOW);
 
     expect(digest).not.toContain("someone else's task");
+  });
+
+  // finding 13: a real server/build/gate.js build gate carries status
+  // "awaiting_approval", not "pending_approval" - it must show up in the
+  // digest's pending-approval section same as a plain draft.
+  it("includes awaiting_approval build gates in the pending approval section", async () => {
+    await createEntity(db, WS, {
+      module: "pipelines",
+      type: "pending_approval",
+      title: "T3 crate",
+      status: "awaiting_approval",
+    });
+
+    const digest = await buildDigest(db, WS, NOW);
+
+    expect(digest).toContain("T3 crate");
   });
 });

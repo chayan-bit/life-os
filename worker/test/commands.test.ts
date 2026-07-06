@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { LocalDb } from "@lifeos/db/client/local";
 import { events, jobs, moduleRequests } from "@lifeos/db";
 import { eq } from "@lifeos/db/query";
-import { captureDraft, captureTask, captureTopic, inbox, ingest, markDone, pnl, quiz, recall, requestModule, today } from "../src/commands.js";
-import { listEntities } from "../src/entities.js";
+import { captureDraft, captureTask, captureTopic, dayWindow, inbox, ingest, markDone, pnl, quiz, recall, requestModule, today } from "../src/commands.js";
+import { createEntity, listEntities } from "../src/entities.js";
 import { createTestDb } from "./testDb.js";
 
 let db: LocalDb;
@@ -77,6 +77,43 @@ describe("today", () => {
 
   it("says nothing due when there are no open tasks", async () => {
     expect(await today(db, WS, 1_000)).toBe("Nothing due today.");
+  });
+
+  // finding 41: 2026-07-05T20:00:00Z is 2026-07-06 01:30 IST - already
+  // tomorrow's calendar day in Asia/Kolkata while still today in UTC. A task
+  // due later that same IST day (2026-07-06T10:00:00Z, 3:30pm IST) must show
+  // up under the IST window and must NOT under the old plain-UTC one.
+  it("follows the IST calendar day, not the UTC one, by default", async () => {
+    const now = Date.parse("2026-07-05T20:00:00Z") / 1000;
+    const dueLaterTodayIst = Date.parse("2026-07-06T10:00:00Z") / 1000;
+    await createEntity(db, WS, { module: "tasks", type: "task", title: "ist afternoon task", status: "open", attrs: { due: dueLaterTodayIst } });
+
+    expect(await today(db, WS, now)).toContain("ist afternoon task");
+    expect(await today(db, WS, now, "UTC")).not.toContain("ist afternoon task");
+  });
+});
+
+describe("dayWindow", () => {
+  it("defaults to Asia/Kolkata (IST, +05:30) - the IST day can differ from the UTC day", () => {
+    // 2026-07-05T20:00:00Z = 2026-07-06T01:30:00 IST: already the 6th in
+    // IST, still the 5th in UTC - exactly the boundary finding 41 covers.
+    const now = Date.parse("2026-07-05T20:00:00Z") / 1000;
+
+    const window = dayWindow(now);
+
+    expect(window.startIso).toBe("2026-07-05T18:30:00.000Z"); // 2026-07-06T00:00:00 IST
+    expect(window.endIso).toBe("2026-07-06T18:29:59.000Z"); // 2026-07-06T23:59:59 IST
+    expect(window.startSecs).toBe(Date.parse("2026-07-05T18:30:00.000Z") / 1000);
+    expect(window.endSecs).toBe(Date.parse("2026-07-06T18:29:59.000Z") / 1000);
+  });
+
+  it("accepts an explicit tz, e.g. plain UTC", () => {
+    const now = Date.parse("2026-07-05T20:00:00Z") / 1000;
+
+    const window = dayWindow(now, "UTC");
+
+    expect(window.startIso).toBe("2026-07-05T00:00:00.000Z");
+    expect(window.endIso).toBe("2026-07-05T23:59:59.000Z");
   });
 });
 
