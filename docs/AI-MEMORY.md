@@ -104,14 +104,15 @@ When `LIFEOS_MEMVEC` is set, `lifeos-api` wires a subprocess-backed `MemvecSearc
 Memory-node vectors are partitioned from entity vectors by a `mem:<ws>` workspace label, so the memory lane only ever returns `mn_*` ids and `/api/search` only ever returns entity ids.
 Memory nodes are embedded best-effort at recall/ingest time (`embed_new_nodes`), tracked in the never-synced derived DB (`d.memory_embedded`); because node ids are content-deterministic, an embedding stays valid across a rebuild and never needs invalidating.
 
-Pipeline per query:
-1. **Query reformulation** (one cheap LLM call): rewrite the turn into "what would a relevant memory look like?" before scoring.
-2. **Self-RAG gate:** skip long-term retrieval entirely on turns that don't need it (latency + noise win).
-3. Gather candidates from FTS5 (BM25) + sqlite-vec (ANN) + entity match.
-4. Score with `A(m)`; take the top set.
-5. **Spreading activation (tiered, optional):** for multi-hop queries, expand 1-2 hops over `memory_edges` where `t_invalid IS NULL`, then re-score.
+Pipeline per query (`retrieval.rs::recall`):
+1. **Self-RAG gate:** skip long-term retrieval entirely on turns that don't need it (latency + noise win).
+2. Gather candidates from FTS5 (BM25) + sqlite-vec (ANN) + entity match.
+3. Score with `A(m)`; take the top set.
+4. **Spreading activation (tiered, optional):** for multi-hop queries, expand 1-2 hops over `memory_edges` where `t_invalid IS NULL`, then re-score.
    Graph expansion is *not* always-on - "Does Memory Need Graphs?" (2026) shows it only pays off for multi-hop at scale, so single-hop queries stay on the cheap FTS5+vector path.
-6. **Abstention signal:** if the top activation is below threshold, emit "no reliable memory" so the model says *I don't know* instead of confabulating (the LongMemEval failure mode).
+5. **Abstention signal:** if the top activation is below threshold, emit "no reliable memory" so the model says *I don't know* instead of confabulating (the LongMemEval failure mode).
+
+**Planned, not wired: query reformulation.** The original design called for one cheap LLM call rewriting the turn into "what would a relevant memory look like?" before scoring. `recall()` today scores the raw query directly - `retrieval.rs`'s own header comment notes reformulation is "the caller's (optional, cached) concern," and no call site invokes it. It stays a planned enhancement, not a step of the executing pipeline above.
 
 **GraphRAG global lens (issue #139, `communities.rs`):** spreading activation above is local, seeded from one query.
 A global view - "which parts of my world touch trading?" - instead clusters the whole `memory_edges` graph with deterministic label propagation, persists a `memory_communities` read model of cluster summaries, and rebuilds it every sleep cycle.
@@ -125,12 +126,19 @@ This is the SOTA-validated formula (Generative Agents + ACT-R + ENGRAM's typed h
 
 **Novel:** consolidation (Letta calls it sleep-time compute; Generative Agents call it reflection) runs as scheduled background jobs that **emit new provenance-linked events**, rather than overwriting memory.
 
-Jobs (Tokio async on the Mac; triggered on idle + an accumulated-importance threshold):
+Jobs (Tokio async on the Mac; triggered by a flat backlog-count threshold, see below):
 - `segment_episodes`: cut the raw event stream at **cognitive episode boundaries** (topic shift / task done), not per message - episode-aligned units retrieve better (ES-Mem).
 - `consolidate`: episodes -> episode summaries; summaries -> semantic facts; weekly -> reflections (multi-resolution).
-- `score_importance` + `score_surprise`: salience at write time; **Novel:** flag low-similarity outliers (surprising/contradicting memories) as high-importance, slow-decay, and trigger reconciliation.
+- `score_surprise`: **Novel:** flags low-similarity outliers (surprising/contradicting memories, `consolidate.rs::score_surprise`) - a genuine sleep-cycle job. Salience for a *normal* (non-surprising) memory is scored separately, at write time, not here - see the importance note below.
 - `decay_sweep`: nightly ranking recompute (no LLM); it also runs the cold-tier sweep (§7) on the same cadence, actually tiering a bounded batch of cold nodes out to storage when a backend is available, not merely counting them.
 - `supersede_detector`: turn UPDATE-type events into `t_invalid` on the old edge + a supersede pointer.
+- `retire_stale_rules` (procedural memory aging, §8): retires stale `memory_rules` rows on the same cadence.
+
+**Importance is a write-time heuristic, not a sleep job.** `project.rs::write_time_importance` scores every incoming event's salience at projection time (when the `memory_nodes` row is first written), not as a separate `score_importance` sleep-cycle pass - there is no such job. `score_surprise` above is the one salience-related job that actually runs during consolidation.
+
+**What "surprising" actually does today:** `score_surprise` pins a surprising memory's importance to a fixed `SURPRISE_IMPORTANCE = 0.8` and emits a `memory.surprise.flagged` event - it does not mark the memory "slow-decay" (there is one global `decay_per_hour` constant, `retrieval.rs:255`, applied uniformly to every memory regardless of surprise) and it does not trigger any reconciliation mechanism (no such mechanism exists in the codebase today). Both per-node decay rates and a reconciliation pass on surprising memories are planned refinements, not implemented behavior.
+
+**Trigger:** the sleep cycle fires on a flat unconsolidated-event count, not "idle + an accumulated-importance threshold." `lifeos-drain`'s poll loop calls `maybe_enqueue_memory_sleep`, which enqueues a `memory_sleep` job per workspace once `lifeos_memory::unconsolidated_importance()` - despite its name, a plain `COUNT(*)` of not-yet-consolidated events - reaches `LIFEOS_MEMORY_SLEEP_THRESHOLD` (default 25).
 
 The sleep cycle takes the workspace's primary storage backend as an optional argument.
 When it is present, the decay sweep tiers cold nodes out on cadence (bounded to `TIER_BATCH_MAX` per cycle, same thresholds as the manual `POST /api/memory/tier`); when it is `None`, the sweep records an honest `memory.tier.skipped` ledger note and only counts, so a deployment with no backend degrades cleanly rather than erroring.
@@ -177,6 +185,8 @@ Auditability is sacred, so nothing is hard-deleted.
 **Novel for Life OS:** beyond facts, store **how to behave** - "when the user asks about a trade, always include the current market regime", "summaries should lead with the TLDR".
 These are a separate procedural store that feeds the system prompt directly and is updated by consolidation, giving policy-learning-without-RL (LangMem's most distinctive idea).
 The interface is kept clean (inputs: candidate events; outputs: rule deltas) so the policy can later be replaced by a learned one (Memory-R1) with no architectural change.
+
+**Rule aging.** A rule that stops earning confidence should not sit in the system prompt forever. Each sleep cycle, `consolidate.rs::retire_stale_rules` retires any active `memory_rules` row that is both older than `RULE_TTL_DAYS` (45 days) and below `RULE_RETIRE_CONFIDENCE` (0.6), emitting one `memory.rule.retired` event per retired rule through the same event-append path `HeuristicPolicyLearner`'s own explicit retractions use - never a direct `UPDATE` of `memory_rules` outside the projector. This is what keeps stale advice from accreting indefinitely alongside the confidence-clamped learning described in §5.
 
 ---
 

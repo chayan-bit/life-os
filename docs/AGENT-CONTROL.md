@@ -57,8 +57,11 @@ agent ──► proposes ActionPlan = [ Action, Action, … ]
      events('action.applied', { reverse_patch })   ← append-only, reversible
 ```
 
-- **Action tools** are a closed set mapped to existing API routes: `entity.create`, `entity.update`, `edge.create`, `draft.create`, `view.configure`, `dashboard.arrange`, `navigate`, `pipeline.run`, `module.requestBuild`, `search`.
-  There is intentionally **no** `vcs.rewrite`, `security.configure`, `connection.create`, or `secret.read` tool - the protected domains have no tool to call.
+- **Action tools are a closed set, split across two registries that must agree:**
+  - **`server/agent/actionRegistry.js`** (backend, enforced by `/api/agent`) - `entity.create`, `entity.update`, `entity.list`, `entity.get`, `edge.create`, `edge.list`, `event.append`, `search.query`, `memory.recall`, `memory.network`, `web.scrape`, `pipeline.run`, `draft.create`, `config.draft`. This is the tool surface a real turn of the agent loop can actually call, gated per §3 of [AGENT-CORE.md](./AGENT-CORE.md).
+  - **`frontend/src/lib/agentActions.js`** (browser console, client-side only) - `entity.create`, `entity.update`, `edge.create`, `draft.create`, `view.configure`, `dashboard.arrange`, `navigate`, `pipeline.run`, `module.requestBuild`, `search`. This backs the Cmd-K/`AIConsole.jsx` compiler (§3 below) and includes three tools with no backend equivalent (`view.configure`, `dashboard.arrange`, `navigate` - localStorage-level, no API route) plus `module.requestBuild`, which the backend registry does not expose.
+  - The two registries are intentionally not identical (one drives server-side tool-calling, the other drives a browser-side compiled plan), but their *classification* of any name they share must agree - a parity test (in progress, another worker's addition) enforces that `classify()`/`classifyAction()` never diverge on overlapping tool names, so a tool can't be `allowed` in one surface and `gated`/`forbidden` in the other.
+  There is intentionally **no** `vcs.rewrite`, `security.configure`, `connection.create`, or `secret.read` tool in either registry - the protected domains have no tool to call.
 - **Classification** per action is `allowed` (reversible, internal → auto-apply), `gated` (outward/irreversible → human approve, reuses the [SECURITY.md](./SECURITY.md) §2 state machine), or `forbidden` (protected set → refuse).
 - **Every applied action** writes `events('action.applied')` carrying a **reverse-patch** so it can be undone (§4).
 
@@ -80,7 +83,7 @@ The same compiler powers `AIConsole.jsx`; the command bar is just a second entry
 
 Because broad actuation is only safe if it is trivially reversible, every agent mutation is reversible by construction.
 
-- Each `events('action.applied')` row stores `{ tool, args, entity_id, reverse_patch, run_id, actor:'agent' }`.
+- Each `events('action.applied')` row stores `{ tool, args, entity_id, actor:'agent' }` at the top level, with `attrs` carrying `{ tool, args, reverse_action, plan_id }` (`frontend/src/lib/agentActions.js::logApplied`) - `reverse_action` is the computed inverse tool call (or `null` when a tool genuinely has no inverse), and `plan_id` groups a multi-step `ActionPlan`'s applications for atomic undo.
 - The UI renders an **agent activity ledger** (an "the agent did X, Y, Z" timeline) with an **undo** control per action and per `ActionPlan`.
 - **Undo** applies the `reverse_patch` as a normal forward action (itself an event) - history is never rewritten, consistent with the append-only rule.
 - Batch plans undo atomically (reverse order); a partially-applied plan can be rolled back to its pre-plan state.
@@ -91,9 +94,15 @@ This makes "let the agent reorganize my whole workspace" a safe operation: anyth
 
 ## 5. Capability matrix (single source of truth)
 
-The frontend `lib/capabilities.js` is promoted into the **capability matrix**: the canonical map of every app surface to `{ allowed | gated | forbidden }` for the agent.
+The real structure is three registries, not one canonical map:
 
-- It is consumed by the action registry (§2), the command bar (§3), and rendered read-only in `Profile.jsx` so the user can *see* exactly what the agent can and cannot do.
+- **`frontend/src/lib/capabilities.js`** - the legacy free-text guardrail layer (`LAYERS`, `canAI()`), used to route `AIConsole.jsx`'s natural-language intent to a coarse app surface (theme, dashboard, atlas-domains, …) and to gate that surface as `aiCanRead`/`aiCanModify`/`aiCanDelete`/`gated`.
+- **`frontend/src/lib/agentActions.js`** - the typed action-tool registry (§2), entirely independent of `capabilities.js`: it does not import it, and its own `classifyAction()` is the only classifier the action registry uses.
+- **`frontend/src/lib/capabilityMatrix.js`** - a read-only view, not a source of truth: `getCapabilityMatrix()` merges `agentActions.js`'s `ACTION_TOOLS`/`PROTECTED_TOOLS` with `capabilities.js`'s `LAYERS` into one flat list purely for display, and is consumed only by the read-only Profile view.
+
+So there is no single canonical map "consumed by the action registry" - the action registry enforces its own closed set (§2) independently of the legacy layer registry; `capabilityMatrix.js` exists solely so `Profile.jsx` can show the user one combined picture of both.
+
+- Rendered read-only in `Profile.jsx` so the user can *see* exactly what the agent can and cannot do, across both registries.
 - The four protected domains appear as `forbidden` rows that **cannot be edited from the app** (only changed in code, behind review) - the matrix cannot be used to widen the agent's own reach.
 - Forbidden actions **refuse visibly** in the console rather than silently no-op, so the boundary is always legible.
 

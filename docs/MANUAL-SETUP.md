@@ -13,6 +13,26 @@ target until you decide to deploy.
 
 ## Pending
 
+### Semantic search dependency for `server/memvec.py` (Tool-RAG, LLM cache, entity/memory search)
+
+`server/memvec.py` needs two Python packages installed to do real embedding-backed search instead of degrading to lexical-only:
+
+```sh
+pip install sentence-transformers sqlite-vec
+```
+
+(or the nix-shell equivalent already used on this machine, e.g. `nix-shell -p python3Packages.sentence-transformers python3Packages.sqlite-vec --run '...'` - check what's actually on `$PATH` before assuming a permanent install is warranted; a one-off `nix-shell` run is enough to try it).
+
+**Graceful degradation:** every call site that shells out to `memvec.py` (search, Tool-RAG indexing/retrieval, the LLM semantic cache, memory-node embedding) is written to fail closed to a lexical-only or no-op path rather than erroring when these packages are missing - `memvec.py`'s own `die()` calls (`sentence-transformers not installed (pip install sentence-transformers)`, `sqlite-vec not installed (pip install sqlite-vec)`) are caught by the Rust/JS callers and treated as "semantic lane unavailable this run," not a hard failure. Installing both packages is what upgrades the system from FTS5-only recall to the full hybrid RRF-fused retrieval described in [DATA-MODEL.md](./DATA-MODEL.md) §6 and [AI-MEMORY.md](./AI-MEMORY.md) §4.
+
+### Building the Rust services and CLI
+
+`./setup.sh` already builds all three workspace binaries in one step: `cargo build --release -p lifeos-api -p lifeos-drain -p lifeos-cli` (from `services/`). To build just the CLI on its own (its crate is named `lifeos-cli`, but the binary it produces is named `lifeos`):
+
+```sh
+cd services && cargo build --release -p lifeos-cli
+```
+
 ### #47 - deploy self-hosted Nango + register the first OAuth apps
 
 The code (`infra/nango/docker-compose.yml`, `services/lifeos-api/src/nango.rs`,

@@ -76,7 +76,9 @@ CREATE TABLE events (
   -- harness run-log columns (events doubles as the run log):
   run_id      TEXT, tier TEXT, model TEXT,
   tokens_in   INTEGER, tokens_out INTEGER, cost REAL, latency_ms INTEGER,
-  error       TEXT, outcome TEXT, eval_score REAL, gated INTEGER DEFAULT 0
+  error       TEXT, outcome TEXT, eval_score REAL, gated INTEGER DEFAULT 0,
+  caused_by_event_id TEXT,   -- (0015) Novel causal pointer - "what led to this?", see docs/AI-MEMORY.md §2
+  schema_version INTEGER     -- (0016) versioned upcasters on replay, see docs/AI-MEMORY.md §2
 );
 CREATE INDEX ix_events_ws_ts ON events(workspace_id, ts);
 CREATE INDEX ix_events_type ON events(workspace_id, type);
@@ -87,6 +89,7 @@ CREATE INDEX ix_events_type ON events(workspace_id, type);
 
 ### 2.4 `annotations` - reader notes
 Generalizes the atlas's localStorage comment/link/question layer; per-entity notes/highlights/questions, workspace-scoped.
+The designated path off `localStorage` is a real `POST`/`GET`/`PATCH`/`DELETE /api/annotation` surface plus the corresponding frontend migration - in progress (another worker's addition), not yet landed. Until it ships, treat any "annotations are backend-backed" claim elsewhere as describing that designated end state, not current behavior.
 
 ### 2.5 `jobs` - heavy-work queue (cloud→Mac)
 ```sql
@@ -131,6 +134,19 @@ the matching `events('module.building'|'module.installed'|'module.failed')` row 
 transition actually applied. `GET /api/module-request/:id` exposes the current `status`/`error`
 to the requester. See [SELF-EXTENSION.md](./SELF-EXTENSION.md)'s #76 note for what's real today
 versus deferred to #78 (the live drain loop that actually calls these against a real build).
+
+### 2.7 Tables added after this doc's original write-up
+
+The generic-entity model still holds - these are read models and configuration for subsystems specified in their own docs, not a departure from "one generic schema":
+
+- `vcs_refs` (migration 0005) - branch/tag pointers for `lifeos-vcs`. See [VERSIONING.md](./VERSIONING.md).
+- `configs` (0006) - the release-loop / operating-manual config rows (`kind='config_active'`, `kind='agent_manual'`, …). See [HARNESS-LOOP.md](./HARNESS-LOOP.md).
+- `module_packages` (0009) - marketplace publish/install records. See [PLATFORM-SYSTEMS.md](./PLATFORM-SYSTEMS.md).
+- `push_subscriptions` (0010) - Web Push subscription storage for the PWA.
+- `blob_backends` (0014) - per-workspace storage-backend configuration (primary + mirrors). See [STORAGE-BACKENDS.md](./STORAGE-BACKENDS.md).
+- `memory_nodes`, `memory_edges`, `memory_summaries`, `memory_rules`, `llm_replay_cache`, `memory_cursors` (0017) - the cognitive-memory read models (semantic/procedural memory, the replay cache, per-workspace consolidation cursors). See [AI-MEMORY.md](./AI-MEMORY.md).
+- `memory_idx`, `memory_fts`, `memory_embedded` (0018) - the memory-lane derived-DB indices (lexical index, FTS5 virtual table, embedding tracking), physically separate from `lifeos.db` exactly like `entities_fts`/`entity_vec` (§5). See [AI-MEMORY.md](./AI-MEMORY.md).
+- `memory_communities` (0019) - GraphRAG community-summary read model, rebuilt every sleep cycle. See [AI-MEMORY.md](./AI-MEMORY.md) §4.
 
 ---
 
@@ -182,6 +198,8 @@ const db = createClient({
 ```
 Read-your-writes is guaranteed on the replica that issued the write, even before `sync()`.
 **Maturity flag:** offline writes / Turso Sync are public beta, not GA - treat as a watch item.
+
+**Rust-service reality.** The snippet above describes the eventual Turso-sync mode for a JS client; it is not what `lifeos-api` (Rust) actually does. The libSQL Rust client (0.6) has no `offline` flag at all - `services/lifeos-api/src/db.rs::connect` (lines ~96-98) instead defaults to `Builder::new_local(&config.db_path)`, a plain local SQLite file, which is offline-capable by construction because there is no remote to fall back to. When `turso_url`/`turso_token` are both configured, it switches to `Builder::new_remote_replica(...).read_your_writes(true).sync_interval(...)` - an embedded replica with periodic background sync, the closest Rust equivalent to the JS snippet's intent, but still without an `offline:true`-style write-local-first guarantee (that capability doesn't exist in this client version). Treat the JS snippet as the target shape for a future Turso Sync-based Rust client, not as what ships today.
 
 ### 4.2 Conflict resolution is last-push-wins, NOT last-writer-wins-on-`updated_at`
 Turso's default is **whichever replica pushes last wins**, regardless of `updated_at`, at **row granularity over the whole `attrs` JSON blob**.

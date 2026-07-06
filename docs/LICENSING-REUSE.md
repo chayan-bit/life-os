@@ -21,11 +21,10 @@ Legend: 🟢 EXISTS (reuse) · 🔵 FORK (OSS, extend) · 🟡 BUILD · 🦀 Rus
 | MiniLM-384 | Apache-2.0 | ✅ | — |
 | Telegram Bot API | free | ✅ | — |
 | BLAKE3 / FastCDC 🦀 | Apache-2.0/MIT | ✅ | — |
-| Jujutsu (jj) 🦀 | Apache-2.0 | ✅ | — |
+| Jujutsu (jj) 🦀 | Apache-2.0 | ✅ | Reference-only (`external/jj` submodule) - `lifeos-vcs` is modeled on jj's concepts but implemented from scratch, no `jj-lib` dependency (see docs/VERSIONING.md §2.4) |
 | whisper-rs / candle 🦀 | MIT/Apache | ✅ | — |
-| octocrab 🦀 | MIT/Apache | ✅ | — |
 | browser-use / browser-harness | MIT (verify at fork) | ✅ | — |
-| readability | Apache-2.0 | ✅ | — |
+| readability | Apache-2.0 | ✅ | Vendored at `external/readability` but unused today - extraction uses the `scraper` crate instead (see `reading.rs`'s own doc comment) |
 | **Nango** | **Elastic License 2.0** ⚠️ | ✅ self-host internal | Can't resell Nango-as-a-service (we don't). Fallback: fork (ELv2 allows), or OpenBao (MPL-2.0) vault + hand-rolled OAuth |
 
 **Only paid thing:** Claude API tokens (unavoidable - the intelligence).

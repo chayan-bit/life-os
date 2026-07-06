@@ -63,7 +63,8 @@ Modeled on the disciplined turn lifecycle, adapted to Life OS's substrate. Bound
 
 **Implemented (issue #123):** `server/agent/toolRag.js` (`indexTools`/`retrieveTools`), wired into `server/agent/loop.js` before the execute stage and into `server/agent/executor.js`'s SDK tool build; tests in `server/test/toolRag.test.js`.
 
-- **Registry.** The agent's tools are the existing thin surfaces - `bin/lifeos` CRUD, the Agent Control Plane action tools (`entity.create`, `edge.create`, `draft.create`, `view.configure`, `pipeline.run`, `module.requestBuild`, `search`, …), and heavy on-demand capabilities loaded via mcp-multiplexer (Figma, Higgsfield). **CRUD is never an MCP** ([CLAUDE.md](../CLAUDE.md)); the registry is a manifest of thin HTTP/CLI tools plus their JSON schemas.
+- **Registry.** The agent's tools are the existing thin surfaces - `bin/lifeos` CRUD plus the backend action registry (`server/agent/actionRegistry.js::BASE_REGISTRY`): `entity.create`, `entity.update`, `entity.list`, `entity.get`, `edge.create`, `edge.list`, `event.append`, `search.query`, `memory.recall`, `memory.network`, `web.scrape`, `pipeline.run`, `draft.create`, `config.draft`. **CRUD is never an MCP** ([CLAUDE.md](../CLAUDE.md)); the registry is a manifest of thin HTTP/CLI tools plus their JSON schemas.
+  Note the separate browser-side registry (`frontend/src/lib/agentActions.js`) additionally has `view.configure`, `dashboard.arrange`, and `navigate` - localStorage-level actions with no backend route, for the Cmd-K/console surface only. They are not part of this backend tool surface, and heavy on-demand capabilities via mcp-multiplexer (Figma, Higgsfield) are not wired into either registry today - a planned integration, not a live one (see [AGENT-CONTROL.md](./AGENT-CONTROL.md) §2 for the full reconciliation between the two registries).
 - **Tool-RAG.** Mounting every tool every turn is token waste and dulls tool choice. Instead, embed each tool's description once (reuse `memvec.py` / sqlite-vec in `lifeos-derived.db` - the same infra `entity_vec` already uses) and **retrieve the top-K relevant tools per turn** plus an always-on **core set** (search, entity read/write, the gate-respecting actuators). Falls back to the full catalog on any retrieval failure. This is the mechanism that lets the tool count grow to hundreds (every self-authored tool, every module's `agentTools`) without bloating the prompt.
 
 ---
@@ -104,9 +105,12 @@ words like "always"/"never"/"instead"/"next time"; skip on any doubt), makes
 one structured-output call (`{ rule, confidence, kind: 'lesson'|'skill' }`,
 `rule: null` when nothing durable applies), and - only when a rule comes
 back - appends exactly one `feedback.given` event with
-`attrs.feedback = "<kind>: <rule>"` and `attrs.confidence` (kept for a
-future learned `PolicyLearner`, even though `HeuristicPolicyLearner` doesn't
-read it today). It is wired into `loop.js`'s `finalize()` alongside
+`attrs.feedback = "<kind>: <rule>"` and `attrs.confidence`. `HeuristicPolicyLearner`
+(`services/lifeos-memory/src/procedural.rs`) now honors that explicit
+`attrs.confidence` - clamped to `[0.3, 0.95]` - instead of always falling back
+to its fixed `0.7`/`0.5` defaults, so a distilled lesson's LLM-judged
+confidence actually reaches the learned rule (the fixed defaults still apply
+only when a feedback event carries no confidence at all). It is wired into `loop.js`'s `finalize()` alongside
 `ingestTurnOutcome`, and is best-effort like every other write-back in that
 function - a distillation failure never affects an already-computed turn
 result. **"Recall before" needed no new code**: `memory_rules` already feeds
@@ -319,8 +323,8 @@ Identified from a full audit of the reference agent architecture; specced here a
 ## 14. Build surface & verification
 
 - **Backend:** `/api/agent` on `lifeos-api` (shells to the JS runtime); no new privileged routes - the loop rides existing `entity/edge/event/draft/pipeline` routes, boundary enforced by the capability matrix. **Implemented (issue #122):** `services/lifeos-api/src/routes/agent.rs` spawns `node agent/run.js <prompt> <workspaceId>` from `config.server_dir`, wraps it in a 300s timeout, and parses the last stdout JSON line - the same process contract `lifeos-drain`'s `ScaffoldJsBuilder` uses.
-- **Agent runtime:** `server/agent/` (JS) - the loop, planner, critic, tool registry, Tool-RAG retriever; reuses `scaffold.js`'s Agent SDK wiring and sandbox primitives. **Implemented (issue #122):** `server/agent/{loop,gate,worldSnapshot,planner,executor,critic,actionRegistry,http,run}.js` - the bounded gate -> snapshot -> plan -> execute -> verify loop over in-process Claude Agent SDK MCP tools, `MAX_STEPS=8`, one-refine cap, capability-matrix classification (`allowed`/`gated`/`forbidden`), and one append-only `events('agent.turn')` row per turn. Tool-RAG retrieval (§4) and memory injection (§5) are still stubs (the latter deferred to issue #124).
-- **Frontend:** `AIConsole.jsx` / Cmd-K bar / `actionPlanCompiler.js` migrate from bespoke prompt-and-parse to `/api/agent`; the action ledger already renders the results.
+- **Agent runtime:** `server/agent/` (JS) - the loop, planner, critic, tool registry, Tool-RAG retriever; reuses `scaffold.js`'s Agent SDK wiring and sandbox primitives. **Implemented (issue #122):** `server/agent/{loop,gate,worldSnapshot,planner,executor,critic,actionRegistry,http,run}.js` - the bounded gate -> snapshot -> plan -> execute -> verify loop over in-process Claude Agent SDK MCP tools, `MAX_STEPS=8`, one-refine cap, capability-matrix classification (`allowed`/`gated`/`forbidden`), and one append-only `events('agent.turn')` row per turn. Tool-RAG retrieval (§4) and memory injection (§5) landed in full as of issues #123/#124 - see those sections for what is live today.
+- **Frontend:** `AIConsole.jsx` / Cmd-K bar / `actionPlanCompiler.js` are the designated migration off bespoke prompt-and-parse onto `/api/agent` - in progress, not yet done: `actionPlanCompiler.js` still `POST`s `/api/llm` directly and no frontend code calls `/api/agent` today. The action ledger already renders the results once the migration lands.
 - **Must-pass checks:**
   - A multi-step request ("find my overdue tasks, tag them urgent, and draft a summary") plans, executes across tools, self-verifies, and lands every mutation in the Agent Control Plane ledger, each undoable.
   - A forbidden action (edit gating config, read a secret, place an order) refuses visibly and logs `action.denied` - and has no tool to call.

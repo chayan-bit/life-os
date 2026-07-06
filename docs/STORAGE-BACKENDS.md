@@ -34,16 +34,22 @@ Because identity is the hash, the user can **migrate or mirror** between backend
 
 A single Rust trait that every backend implements; `lifeos-vcs` depends only on the trait.
 
-```
-trait StorageBackend {
-    fn put(&self, hash: &Blake3, bytes: &[u8]) -> Result<()>;   // idempotent (CAS)
-    fn get(&self, hash: &Blake3) -> Result<Bytes>;              // verify BLAKE3 on read
-    fn has(&self, hash: &Blake3) -> Result<bool>;
-    fn delete(&self, hash: &Blake3) -> Result<()>;              // GC only; never agent-callable
-    fn location(&self, hash: &Blake3) -> Locator;               // backend-native path/id
+Implemented as `services/lifeos-vcs/src/backend.rs::StorageBackend` - all methods are `async`, the hash is a plain `&str` (not a `Blake3` type), and errors are the trait's own `BackendError`:
+
+```rust
+trait StorageBackend: Send + Sync {
+    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), BackendError>;   // idempotent (CAS)
+    async fn fetch_unverified(&self, hash: &str) -> Result<Vec<u8>, BackendError>; // REQUIRED - no integrity check
+    async fn get(&self, hash: &str) -> Result<Vec<u8>, BackendError> {           // PROVIDED - verifies BLAKE3 over fetch_unverified()
+        verify_bytes(hash, self.fetch_unverified(hash).await?)
+    }
+    async fn has(&self, hash: &str) -> Result<bool, BackendError>;
+    async fn delete(&self, hash: &str) -> Result<(), BackendError>;             // GC only; never agent-callable
+    fn location(&self, hash: &str) -> String;                                   // backend-native path/id
 }
 ```
 
+- **`get` is a provided method over a required `fetch_unverified`** - the split exists so a wrapper like `EncryptedBackend` can decrypt the fetched bytes back into plaintext *before* the plaintext-hash check runs; every backend still gets the same non-negotiable BLAKE3 verification for free via the default `get` impl.
 - **Integrity is non-negotiable:** every `get` re-hashes the fetched bytes with BLAKE3 and rejects a mismatch.
   An untrusted/remote backend cannot silently corrupt or swap content - content-addressing makes tampering detectable.
 - **FastCDC chunking is backend-agnostic:** a blob is still a Merkle manifest of chunk hashes; chunks are `put`/`get` individually, so a backend that supports range/partial reads gets dedup + incremental sync for free.
@@ -105,11 +111,19 @@ Life OS pulls content back from whatever backend holds it and renders it in the 
 
 ---
 
-## 7. Build surface & verification
+## 7. Build surface & verification - fully implemented
 
-- **`lifeos-vcs`:** the `StorageBackend` trait + `local-fs` and `object_store` impls (generalizes today's R2/S3 mirror); Drive/Dropbox/OneDrive/WebDAV impls; backend index for id<->hash mapping; the migration job.
-- **Integrations:** Drive/Dropbox/OneDrive backends ride the existing Nango layer ([INTEGRATIONS.md](./INTEGRATIONS.md)); R2/S3/WebDAV keys via `connections.secret_enc`.
-- **Frontend:** markdown fetch-and-render of any `blob_ref`; typed placeholder for non-markdown; storage-backend settings in the connections UI.
+This system is built, not future work. The pieces:
+
+- **Migration:** `migrations/0014_blob_backends.sql` - the per-workspace `blob_backends` config table (§4).
+- **`lifeos-vcs` (Rust):**
+  - `src/backend.rs` - the `StorageBackend` trait (§2), `LocalFsBackend` (the default `objects/<hh>/<hash>` layout), and `ExternalObjectStoreBackend` covering R2/S3/GCS/Azure via the `object_store` crate, with a BLAKE3 re-hash on every `get`.
+  - `src/backend_proxy.rs` - the Drive/Dropbox/OneDrive/WebDAV backends, riding the Nango proxy for the owned-OAuth providers.
+  - `src/backend_index.rs` - the id<->hash mapping for backends whose native locator isn't the hash itself (a Drive file id, for example).
+  - `src/migrate.rs` - the backend-migration job: `has`-before-`put` resumability (a resumed migration skips content already on the target), with the primary pointer flip happening only after a clean, complete run.
+  - `src/encrypted.rs` - `EncryptedBackend`, the optional client-side envelope (AES-256-GCM) wrapping any other backend: content is hashed over plaintext (identity stable) and encrypted before `put`, decrypted in `fetch_unverified` before the trait's provided `get` runs its BLAKE3 check over the plaintext.
+- **`lifeos-api`:** `src/storage.rs` is the `STORAGE_KINDS` factory that resolves a workspace's configured backend kind into the concrete `StorageBackend` impl; `routes/storage.rs` exposes the `storage_migrate` job trigger and enforces the gating from §4/§6 - backend `create` only ever writes a `pending_approval` config, and `migrate` requires an already-active target backend.
+- **Frontend:** `frontend/src/components/MarkdownRenderer.jsx` (`marked` GFM + KaTeX) is the real markdown-only renderer described in §5; non-markdown blobs fall back to the typed placeholder.
 - **Must-pass checks:**
   - Put a blob on backend X, switch primary to backend Y, read it back by the *same* `blob_ref` - bytes verify.
   - A corrupted/tampered remote blob fails the BLAKE3 check on `get`.

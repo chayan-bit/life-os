@@ -83,6 +83,12 @@ AES-256-GCM envelope key (`routes/workspace_db.rs`, `workspace_databases`,
 catalog stub (never read by any route) was dropped entirely rather than
 built out - see `docs/SECURITY.md` §5's note on issue #104.
 
+**Post-Phase-7 work shipped beyond this plan.** Two major systems landed after the phases above closed out, each with its own doc:
+- The agent core + self-extension ladder, T0-T5 (issues #121-#140) - see [AGENT-CORE.md](./AGENT-CORE.md) and [SELF-EXTENSION-V2.md](./SELF-EXTENSION-V2.md).
+- The event-sourced cognitive memory system (issues #111-#120) - see [AI-MEMORY.md](./AI-MEMORY.md).
+
+Both rode migrations through `0019` (memory + memory communities), on top of the schema this plan's phases already established.
+
 ---
 
 ## Verification (per phase)

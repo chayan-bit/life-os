@@ -8,7 +8,14 @@ Rendering lives in the React SPA under `frontend/` (generic renderers in `fronte
 
 ## 1. The manifest contract
 
-Each module ships `modules/<id>/module.js` calling `osRegisterModule({...})` - the generalization of the knowledge-atlas's `atlasAdd` merge-by-id contract.
+There are two manifest layers, and they deliberately do not carry identical data:
+
+- **`modules/<id>/module.js`** calling `osRegisterModule({...})` - the full manifest schema below, consumed only by the server build pipeline (self-extension's validators run it inside a `vm` sandbox). `osRegisterModule` is a sandboxed convention that pipeline provides, not a browser global - this file is never loaded by the SPA directly.
+- **`frontend/src/lib/moduleManifests.js`** - a smaller, display-only subset (`entityTypes`, `views`, mostly) that the React SPA actually renders. This is the manifest the generic renderer system reads at runtime.
+
+The two layers can and do diverge: `modules/projects/module.js` registers id `"projects"`, while the live SPA's equivalent is `frontend/src/lib/moduleManifests.js::CODING_MANIFEST` under id `"coding"`. This is an accepted, known state today (not a bug to silently hide) - the server-side manifest and the frontend manifest are authored and evolved somewhat independently until the two layers are unified.
+
+The generalization of the knowledge-atlas's `atlasAdd` merge-by-id contract:
 
 ```js
 osRegisterModule({
@@ -17,13 +24,13 @@ osRegisterModule({
   entityTypes: {
     <typeId>: {
       label, plural, icon,
-      attrs: { <field>: { type:'text|number|date|enum|ref|bool|secret|blob', enum?, ref?, required? } },
+      attrs: { <field>: { type:'text|number|boolean|date|select|enum|json|blob|file', enum?, required? } },
       display: { title, subtitle?, badge? },
       lifecycle: [/* statuses */],
     }
   },
 
-  views: [ { id, label, kind:'list|board|table|calendar|detail|graph|gallery|timeline|map',
+  views: [ { id, label, kind:'list|table|board|calendar|gallery|timeline|map|graph|metric',
              type, groupBy?, sortBy?, filter?, columns? } ],
 
   events:      [ /* emitted event types */ ],
@@ -41,9 +48,11 @@ osRegisterModule({
 
 A module manifest is consumed by the React SPA (`frontend/`); the self-extension builder writes new ones; the marketplace distributes them.
 
+`ref` (a typed reference to another entity) and `secret` (a value that should never render/leave the app) are conceptually useful attr types this manifest contract does not yet support - `server/validators/module.schema.json` has no such enum values today. Cross-entity references are modeled via `edges` instead; there is no secret-typed attr anywhere in the schema, so a module needing to store one must not put it in `attrs` at all (see [SECURITY.md](./SECURITY.md)).
+
 ### View kinds (rendered generically from `entityTypes.display` + `views`)
-`list` · `board` (Kanban) · `table` · `calendar` · `detail` · `graph` (Cytoscape) · `gallery` · `timeline` · `map`.
-A trade → journal table + equity calendar; a task → Kanban; a topic → atlas article + connection chips; an asset → gallery + version timeline; a trip → itinerary timeline + map.
+`list` · `table` · `board` (Kanban) · `calendar` · `gallery` · `timeline` · `map` · `graph` (Cytoscape) · `metric`.
+A trade → journal table + equity calendar; a task → Kanban; a topic → atlas article + connection chips; an asset → gallery + version timeline; a trip → itinerary timeline + map. (An entity's own detail view - the slide-over panel, `GenericDetail.jsx` - is not one of the manifest's `views` kinds; it's a generic per-entity affordance every module gets automatically.)
 
 ### Gating convention (applies to every `agentTool` and `botCommand`)
 `gated: true` ⇒ the tool produces a **draft only**; execution requires Telegram (or PWA) approval, then a Mac/Worker executor performs the outward call. See [SECURITY.md](./SECURITY.md).
@@ -58,7 +67,7 @@ The knowledge-atlas generalized to *any subject*.
 - **attrs:** topic → `{summary, mastery(0-1), last_review, next_due, difficulty}`; resource → `{url, kind, blob_ref?}`; gap → `{description, severity}`.
 - **Edges:** `topic ─connection→ topic` (cross-domain), `resource ─derived_from→ topic`, `gap ─blocks→ topic`, `topic ─thesis→ trade` (Trading link).
 - **Events:** `study.review`, `topic.added`, `gap.opened`, `quiz.answered`.
-- **Views:** atlas article (detail), graph (cross-domain), list (gaps inbox), calendar (spaced-repetition due).
+- **Views:** atlas (list, domains), topics (table), gaps (list, gaps inbox), due (calendar, spaced-repetition due), graph (cross-domain topic connections).
 - **Tools:** `learn.add_topic`, `learn.quiz` (examiner/teach-back), `learn.recall` (memvec).
 - **Bot:** `add topic`, `quiz me`, `what's due`.
 - **Migration:** atlas data files (`01_dsa.js … 13_gpu.js`) wrapped via an `atlasAdd → osRegisterModule` shim.

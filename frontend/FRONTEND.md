@@ -74,6 +74,24 @@ Each row is one work item: the route, where it lands in the UI, and what to repl
 
 **Live (issue #86/#87):** `TimeTravel.jsx` (`Storage.jsx` → Versions tab) is wired to the real `lifeos-vcs` HTTP surface - `GET/POST /api/vcs/{history,commit,checkout,diff}` for per-file version timelines + real per-type diffs, `GET/POST /api/vcs/{refs,branch,tag,snapshot}` for read/forward-only branch/tag creation and snapshot inspection. `lib/vcsApi.js` is the thin wrapper. The pre-existing localStorage app-settings checkpoint UI in the same component is a separate, unrelated concern (browser-only preferences, not file content).
 
+`POST /api/logout` (refresh-token revocation, issue #100) is also live: `App.jsx`'s `handleLogout` posts the stored refresh token before clearing local session state, best-effort (a local logout still proceeds if the API call fails, matching the app's general fail-open-to-offline posture).
+
+### 2.1 Routes landed since this doc's original write-up
+
+`frontend/src/App.jsx` now declares more routes than this table's original page-by-page list:
+
+| Route | Page | Notes |
+| --- | --- | --- |
+| `/m/:id` | `InstalledModulePage.jsx` | the generic manifest-driven module page (§3) - one route serves every installed module. |
+| `/graph` | `GraphView.jsx` | Cytoscape graph over `GET /api/edge`. |
+| `/dashboards` | `ModuleDashboards.jsx` | per-module metric dashboards. |
+| `/agent-ledger` | `AgentLedger.jsx` | the Agent Control Plane action ledger (docs/AGENT-CONTROL.md §4). |
+| `/marketplace` | `Marketplace.jsx` | module marketplace publish/browse/install (issue #101/#102). |
+| `/memory` | `MemoryInspector.jsx` | the cognitive-memory inspector (docs/AI-MEMORY.md §11). |
+| `/refine-demo` | `RefineDemo.jsx` | the one place Refine's `dataProvider` is actually proven live (see §3 below - it is not used by the generic renderers). |
+
+Back-compat redirects for the pre-merge information architecture: `/self-extension`, `/agent-harness`, `/harness-loop` → `/harness`; `/repository`, `/vcs-ingest` → `/storage`; unmatched paths and `/` → `/dashboard`.
+
 ---
 
 ## 3. Generic, manifest-driven views (the real product shape)
@@ -81,13 +99,14 @@ Each row is one work item: the route, where it lands in the UI, and what to repl
 The current per-module hardcoded boards must become **generic renderers driven by module manifests**, per `docs/MODULES.md` and `docs/PLATFORM-SYSTEMS.md`.
 This is what makes a new module render with zero bespoke UI.
 
-**Work:**
-- Adopt **Refine** with a custom `dataProvider` over the generic-entity API (`GET/POST /api/entity`, `PATCH /api/entity/:id`, `GET /api/edge`).
-- Build the generic view renderers, each reading `entityTypes.display` from the manifest: **list, board (Kanban), table, calendar, detail, gallery, timeline, map**.
-- Build the **graph view** with Cytoscape over `GET /api/edge`.
-- Add a React module registry (`lib/moduleRegistry.js`, implementing the old `osRegisterModule` contract): register manifests, listen for `module-mounted:<id>` to hot-add a module tab without reload (SSE from the self-extension builder).
+**Implemented:**
+- **Generic manifest-driven module pages exist** - `InstalledModulePage.jsx` (`frontend/src/core/ModuleManifestPage.jsx` underneath), routed at `/m/:id` (§2.1), renders any installed module's `views` from its manifest with zero bespoke screen code.
+- **The React module registry is real** - `frontend/src/lib/moduleRegistry.js` implements the old `osRegisterModule` contract (`registerModule`/`getModules`/`getModule`/`hydrateFromStorage`) and dispatches `lifeos:module-mounted` (plus a per-module `module-mounted:<id>` event) on registration; `Layout.jsx` listens for `lifeos:module-mounted` to hot-add a module's nav entry without a reload.
+- **The graph view is built** - `GraphView.jsx` at `/graph`, Cytoscape over `GET /api/edge`.
 
-Until the generic renderers exist, the existing per-module screens stay as fallbacks, but new modules must not require new screens.
+**Still work (honestly not done):**
+- **Refine's `dataProvider` is proven in exactly one place: `RefineDemo.jsx`** (`frontend/src/lib/refineDataProvider.js`, a real `useList` call over the generic-entity API). The generic renderers described above (`frontend/src/core/ModuleManifestPage.jsx` and friends) do **not** use Refine - they call `apiCall` directly. Adopting Refine as the data layer for the generic renderer system itself remains open work, not something this proof-of-concept already delivers.
+- Building out the full renderer set (`list, table, board, calendar, gallery, timeline, map`) to cover every manifest `views` kind consistently, beyond what's already exercised by shipped modules.
 
 ---
 
@@ -95,10 +114,12 @@ Until the generic renderers exist, the existing per-module screens stay as fallb
 
 `AIConsole.jsx` becomes the front door to **universal agent actuation**: the in-app agent can read and mutate everything the user can, through a typed action registry, **except** the protected set (VCS-rewrite, security/gating config, OAuth/connections, API keys/tokens), which are hard-denied.
 
-**Work:**
-- Promote `lib/capabilities.js` into the **capability/permission matrix** that is the single source of truth for `{allowed, gated, forbidden}` per app surface; render it read-only in `Profile.jsx`.
-- Have the agent emit a structured **action plan** (typed tool calls), render it as a **dry-run preview/diff**, and require confirm before applying (outward/irreversible stays human-gated as today).
-- Add an **action ledger + one-click undo**: every agent mutation writes an `event` with a reverse-patch; show an "agent did X" timeline with undo.
+**Implemented:**
+- The capability matrix exists as `frontend/src/lib/capabilityMatrix.js` (`getCapabilityMatrix()`), a read-only merge of `agentActions.js`'s action-tool registry and `capabilities.js`'s legacy guardrail layers - see [AGENT-CONTROL.md](../docs/AGENT-CONTROL.md) §5 for the real (not single-canonical-map) structure. Rendered read-only in `Profile.jsx`.
+- The action ledger is live at `/agent-ledger` (`AgentLedger.jsx`, §2.1), driven by `GET /api/event?type=action.applied` and `type=action.undone`.
+
+**Still work:**
+- Have the agent emit a structured **action plan** (typed tool calls), render it as a **dry-run preview/diff**, and require confirm before applying (outward/irreversible stays human-gated as today) - `actionPlanCompiler.js` compiles a plan today, but the dry-run preview/diff UI and one-click undo wiring in the console itself are not fully built out.
 - Forbidden surfaces must visibly refuse in the console (not silently no-op) so the boundary is legible.
 
 ---

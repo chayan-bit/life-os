@@ -34,7 +34,7 @@
 - A **snapshot** = a content-addressed Merkle manifest of `{entity_id → blob_ref}` across the whole workspace (or a filtered subset) at a point in time.
 - A **branch** = a named, moving pointer to a snapshot; a **tag** = a fixed pointer.
 - This gives **time-travel over your entire life**, not one repo: "show me everything as it was 3 weeks ago", "branch my design system, try a variant, merge or discard."
-- Snapshot/branch/merge logic is modeled on **Jujutsu (jj)** (Rust, git-compatible, superior large-file & conflict model) - fork its CAS/commit engine or port the model rather than reimplementing.
+- Snapshot/branch/merge logic is **modeled on Jujutsu (jj)**'s concepts (Rust, git-compatible, superior large-file & conflict model) but **implemented from scratch** in `lifeos-vcs` - a `BTreeMap`-backed `SnapshotManifest` (`src/snapshot.rs`) and the crate's own `vcs_refs` table (migration `0005_vcs_refs.sql`), not a fork of `jj-lib` and not a dependency on it. `external/jj` is checked out as a submodule for reference only (reading jj's model while implementing), and no `Cargo.toml` in this repo depends on `jj-lib`.
 
 ---
 
@@ -81,7 +81,7 @@ Responsibilities:
 4. **Snapshot/branch/tag/checkout** - Merkle manifests; restore any entity or the whole workspace to a past state.
 5. **GC** - drop unreferenced chunks (mark-and-sweep against live snapshots).
 
-Why Rust: tight hashing/IO loops, large-file throughput, memory safety on a security-relevant store, and native composition with libSQL (also Rust). Candidate crates: `blake3`, `fastcdc`, `jj-lib` (Jujutsu), `object_store` (R2/S3), `rusqlite`/libSQL client.
+Why Rust: tight hashing/IO loops, large-file throughput, memory safety on a security-relevant store, and native composition with libSQL (also Rust). Crates actually used: `blake3`, `fastcdc`, `object_store` (R2/S3), `libsql`. **Not** `jj-lib` - see §2.4: the snapshot/branch/tag model is modeled on Jujutsu's concepts but implemented from scratch, with no dependency on the `jj-lib` crate.
 
 CLI surface (thin, allow-listed): `lifeos file commit|diff|log|checkout|snapshot|branch|tag`.
 
