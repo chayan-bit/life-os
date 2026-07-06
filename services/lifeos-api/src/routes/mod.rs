@@ -25,6 +25,9 @@ mod module_request;
 mod notion;
 mod pipeline;
 mod planned;
+// `pub` so the since-cursor + presence-TTL queries are unit-testable directly
+// from the integration test crate (full SSE streaming is awkward to drive E2E).
+pub mod presence;
 mod proposal;
 mod push;
 mod reading;
@@ -392,6 +395,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/travel/parse-emails", post(travel::parse_emails))
         // --- SSE: module lifecycle events for hot-reload tabs (no polling) ---
         .route("/api/stream/modules", get(stream::modules))
+        // --- live activity feed + presence (issue #150): an SSE tail of the
+        //     append-only log plus ephemeral presence heartbeats (upserted into
+        //     their own table, deliberately kept OUT of `events`). All three are
+        //     reads/benign telemetry - never outward, never approval-gated. ---
+        .route("/api/events/stream", get(presence::events_stream))
+        .route("/api/presence", get(presence::list))
+        .route("/api/presence/ping", post(presence::ping))
         // --- local agent router (OpenDesign-style) ---
         .route("/api/agents", get(llm::agents))
         .route("/api/llm", post(llm::llm))

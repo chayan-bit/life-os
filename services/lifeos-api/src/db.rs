@@ -73,6 +73,10 @@ const MIGRATION_MEMORY_COMMUNITIES: &str =
 /// #146) - new `CREATE TABLE IF NOT EXISTS` tables, naturally idempotent.
 /// Seeded with nothing: absent membership rows = legacy single-user mode.
 const MIGRATION_MEMBERSHIP: &str = include_str!("../../../migrations/0020_membership.sql");
+/// `presence` (live activity feed + presence, issue #150) - a new `CREATE TABLE
+/// IF NOT EXISTS`, naturally idempotent. Ephemeral, UPSERTED heartbeat rows kept
+/// out of the append-only `events` log on purpose (see the migration header).
+const MIGRATION_PRESENCE: &str = include_str!("../../../migrations/0021_presence.sql");
 
 /// The canonical DB plus its live connection. `database` is retained by the caller
 /// so the embedded-replica's background replicator stays alive (dropping it would
@@ -212,6 +216,7 @@ pub async fn run_migrations(conn: &Connection) -> Result<(), libsql::Error> {
     conn.execute_batch(MIGRATION_MEMORY).await?;
     conn.execute_batch(MIGRATION_MEMORY_COMMUNITIES).await?;
     conn.execute_batch(MIGRATION_MEMBERSHIP).await?;
+    conn.execute_batch(MIGRATION_PRESENCE).await?;
     tracing::info!("migrations applied (core + control plane)");
     Ok(())
 }

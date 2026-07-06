@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import LoginPage from './pages/LoginPage';
 import { apiCall, WORKSPACE_ID_KEY, KEY_TOKEN_KEY, REFRESH_TOKEN_KEY } from './lib/api';
+import { clearIdentity } from './lib/identity';
 
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Database = lazy(() => import('./pages/Database'));
@@ -46,6 +47,9 @@ export default function App() {
     localStorage.removeItem(WORKSPACE_ID_KEY);
     localStorage.removeItem(KEY_TOKEN_KEY);
     localStorage.removeItem(REFRESH_TOKEN_KEY);
+    // #54: the user-identity keys (email/name) used to survive logout, leaking
+    // the previous user's email into the next session - clear them too.
+    clearIdentity();
     setIsLoggedIn(false);
   };
 

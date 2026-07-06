@@ -3,8 +3,11 @@ import { Link, useLocation } from 'react-router-dom';
 import BrandMark from './BrandMark';
 import AIConsole from './AIConsole';
 import CommandBar from './CommandBar';
+import ActivityFeed from './ActivityFeed';
 import { ensureBaseline } from '../lib/vcs';
 import { apiCall } from '../lib/api';
+import { avatarInitials } from '../lib/identity';
+import { usePresence } from '../lib/usePresence';
 import { hydrateFromStorage } from '../lib/moduleRegistry';
 import { useModuleStream } from '../lib/useModuleStream';
 import {
@@ -52,6 +55,11 @@ export default function Layout({ children, onLogout }) {
   );
   const [apiOnline, setApiOnline] = useState(null); // null = checking, true/false once known
   const [installedModules, setInstalledModules] = useState(() => hydrateFromStorage());
+  const [isFeedOpen, setIsFeedOpen] = useState(false);
+
+  // Live presence heartbeat + roster (issue #150): while this tab is visible it
+  // announces the current user every 30s and reads who else is online.
+  const { present } = usePresence();
 
   // Live module hot-reload: subscribes to /api/stream/modules (SSE, polling
   // fallback) and re-renders the nav the instant a new module installs.
@@ -328,7 +336,34 @@ export default function Layout({ children, onLogout }) {
               />
               <span>{apiOnline === null ? 'Checking API…' : apiOnline ? 'API online' : 'API offline'}</span>
             </div>
-            
+
+            {present.length > 0 && (
+              <div
+                className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 neo-border neo-shadow-sm bg-neo-mint"
+                title={`${present.length} online: ${present.map((u) => u.user_id).join(', ')}`}
+              >
+                <div className="flex items-center -space-x-1">
+                  {present.slice(0, 4).map((u) => (
+                    <span
+                      key={u.user_id}
+                      className="w-2.5 h-2.5 rounded-full bg-[var(--neo-text)] border border-neo-border"
+                    />
+                  ))}
+                </div>
+                <span className="neo-label-sm text-[10px] text-neo-text">{present.length}</span>
+              </div>
+            )}
+
+            <button
+              onClick={() => setIsFeedOpen((v) => !v)}
+              className="neo-btn p-2 bg-neo-surface-high hover:bg-neo-yellow flex items-center justify-center transition-colors"
+              title="Activity feed"
+              aria-label="Toggle activity feed"
+              aria-pressed={isFeedOpen}
+            >
+              <Activity size={18} />
+            </button>
+
             <button
               onClick={toggleTheme}
               className="neo-btn p-2 bg-neo-surface-high hover:bg-neo-yellow flex items-center justify-center transition-colors"
@@ -351,12 +386,7 @@ export default function Layout({ children, onLogout }) {
               title="Profile & account"
               className="w-10 h-10 neo-border neo-shadow bg-neo-yellow flex items-center justify-center font-bold text-neo-text hover:bg-neo-mint transition-colors"
             >
-              {(localStorage.getItem('life_os_user_name') || 'LO')
-                .split(' ')
-                .map((p) => p[0])
-                .join('')
-                .slice(0, 2)
-                .toUpperCase()}
+              {avatarInitials()}
             </Link>
           </div>
         </header>
@@ -371,6 +401,21 @@ export default function Layout({ children, onLogout }) {
           {children}
         </div>
       </main>
+
+      {/* Live activity feed slide-over (issue #150) - reachable from every page */}
+      {isFeedOpen && (
+        <div className="fixed inset-0 z-50 flex justify-end">
+          <button
+            type="button"
+            className="absolute inset-0 w-full h-full bg-[var(--neo-border)]/40"
+            aria-label="Close activity feed"
+            onClick={() => setIsFeedOpen(false)}
+          />
+          <aside className="relative w-[360px] max-w-[90vw] h-full neo-surface border-l-4 border-neo-border shadow-[-4px_0px_0px_0px_#1c1c0f] flex flex-col">
+            <ActivityFeed />
+          </aside>
+        </div>
+      )}
 
       {/* App-wide AI surface - reachable from every page */}
       <AIConsole />
