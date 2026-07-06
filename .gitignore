@@ -18,6 +18,12 @@ store/*.local.json
 memvec.db
 *.npy
 
+# Nango OAuth-vault Postgres datadir (bind-mounted by infra/nango/docker-compose.yml).
+# Raw pg heap files have no extension, so the *.db/*.sqlite rules miss them - and this
+# holds encrypted OAuth tokens. Never commit it.
+infra/nango/data/
+infra/gowa/data/
+
 # Dependencies
 node_modules/
 .venv/
@@ -37,6 +43,10 @@ build/
 *.log
 .idea/
 .vscode/
+
+# Stray agent-CLI scratch worktrees (Codex / OpenCode), not part of the project
+.codex/
+.opencode/
 
 # Rust build artifacts
 /services/target/

@@ -13,4 +13,15 @@ export default defineConfig({
   resolve: {
     dedupe: ['react', 'react-dom'],
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('cytoscape')) return 'cytoscape'
+          if (id.includes('leaflet')) return 'leaflet'
+          if (id.includes('recharts')) return 'recharts'
+        },
+      },
+    },
+  },
 })
