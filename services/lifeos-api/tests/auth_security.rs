@@ -8,10 +8,12 @@
 //! suites use.
 
 use axum::body::Body;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use lifeos_api::{build_state, config::Config, config::DEFAULT_WORKSPACE, ids::new_id, routes};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use tower::ServiceExt;
 
 struct TestApp {
@@ -64,6 +66,22 @@ async fn test_app() -> TestApp {
     let state = build_state(base_config(&db_path)).await.expect("build state");
     TestApp {
         router: routes::router(state),
+        db_path,
+    }
+}
+
+/// Like [`test_app`], but every request carries a mocked raw peer socket, so the
+/// authoritative `ConnectInfo` path in set-password is exercised under `oneshot`
+/// (the real `into_make_service_with_connect_info` peer is unavailable here).
+async fn test_app_with_peer(peer: SocketAddr) -> TestApp {
+    let db_path = std::env::temp_dir()
+        .join(format!("lifeos_authsec_{}.db", new_id("t")))
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_file(&db_path);
+    let state = build_state(base_config(&db_path)).await.expect("build state");
+    TestApp {
+        router: routes::router(state).layer(MockConnectInfo(peer)),
         db_path,
     }
 }
@@ -165,6 +183,72 @@ async fn set_password_is_rejected_from_a_non_loopback_origin() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "the loopback-set password must authenticate");
+}
+
+// --- Finding 2 (ConnectInfo): the raw peer socket is authoritative. ---
+
+#[tokio::test]
+async fn set_password_is_rejected_when_the_raw_peer_is_non_loopback() {
+    // The peer socket (203.0.113.5) is not loopback, so the request physically
+    // came from another host and must be refused - even though a spoofed
+    // X-Forwarded-For claims the client is 127.0.0.1. Headers cannot upgrade a
+    // remote peer to local.
+    let app = test_app_with_peer("203.0.113.5:44321".parse().unwrap()).await;
+    insert_passwordless_account(&app.db_path, "usr_peer_remote", "peer-remote@test.local").await;
+
+    let (st, _) = send(
+        &app.router,
+        "POST",
+        "/api/account/set-password",
+        Some(json!({"email": "peer-remote@test.local", "password": "attacker-chosen-pw"})),
+        &[("x-forwarded-for", "127.0.0.1")],
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a non-loopback raw peer must be refused despite a spoofed loopback forwarded header"
+    );
+
+    // The NULL slot survived - a genuine loopback-peer request can still set it.
+    let app_local = test_app_with_peer("127.0.0.1:44322".parse().unwrap()).await;
+    // (New app => fresh DB; re-insert the passwordless account there.)
+    insert_passwordless_account(&app_local.db_path, "usr_peer_remote", "peer-remote@test.local").await;
+    let (st, _) = send(
+        &app_local.router,
+        "POST",
+        "/api/account/set-password",
+        Some(json!({"email": "peer-remote@test.local", "password": "owner-chosen-pw"})),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a loopback raw peer must be allowed to bootstrap a passwordless account"
+    );
+}
+
+#[tokio::test]
+async fn set_password_from_a_loopback_peer_behind_a_proxy_with_remote_client_is_rejected() {
+    // Peer is loopback (a same-host reverse proxy), but the proxy recorded a
+    // remote origin client - so the bootstrap must still be refused.
+    let app = test_app_with_peer("127.0.0.1:44323".parse().unwrap()).await;
+    insert_passwordless_account(&app.db_path, "usr_peer_proxy", "peer-proxy@test.local").await;
+
+    let (st, _) = send(
+        &app.router,
+        "POST",
+        "/api/account/set-password",
+        Some(json!({"email": "peer-proxy@test.local", "password": "remote-via-proxy-pw"})),
+        &[("x-forwarded-for", "203.0.113.9")],
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a proxy-forwarded remote client must be refused even behind a loopback peer"
+    );
 }
 
 // --- Finding 2(b): the seeded owner is sealed with a non-NULL hash. ---

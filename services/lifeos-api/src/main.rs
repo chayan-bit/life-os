@@ -67,5 +67,14 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {}: {e}", config.bind_addr));
     tracing::info!("Life OS local API listening on http://{}", config.bind_addr);
-    axum::serve(listener, app).await.expect("server error");
+    // `into_make_service_with_connect_info` exposes the raw TCP peer socket to
+    // handlers via `ConnectInfo<SocketAddr>` - the authoritative, unspoofable
+    // origin signal the set-password loopback gate and the auth rate limiter
+    // both key on (security audit findings 2 and 20).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("server error");
 }

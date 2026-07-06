@@ -44,13 +44,18 @@ use crate::auth::{bearer_claims, resolve_role, resolve_workspace};
 use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
-    extract::{Request, State},
-    http::Method,
+    extract::{ConnectInfo, Request, State},
+    http::{Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, patch, post},
-    Router,
+    Json, Router,
 };
+use serde_json::json;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Paths that must skip the strict-mode role gate entirely: unauthenticated
 /// identity/auth endpoints (they cannot present a JWT yet), invite acceptance
@@ -124,16 +129,145 @@ async fn enforce_role(State(state): State<AppState>, req: Request, next: Next) -
     next.run(req).await
 }
 
+// --- Finding 20: per-IP rate limiting on the unauthenticated auth endpoints ---
+
+/// Default per-IP request budget per fixed window for the auth endpoints,
+/// overridable via `LIFEOS_AUTH_RATE_PER_MIN`.
+const DEFAULT_AUTH_RATE_PER_MIN: u32 = 10;
+
+/// The fixed window the per-IP budget is measured over.
+const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// A per-IP fixed-window rate limiter (finding 20). Deliberately a tiny in-crate
+/// limiter rather than a new dependency: the keying we need (a trusted forwarded
+/// header in local-first mode, else the raw peer socket - the same precedence
+/// `login.rs` uses) plus deterministic, injectable tests are simplest with full
+/// control over the state. `check` takes an explicit `now` so window rollover is
+/// unit-tested without sleeping.
+#[derive(Debug)]
+pub struct FixedWindowLimiter {
+    limit: u32,
+    window: Duration,
+    hits: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl FixedWindowLimiter {
+    fn new(limit: u32, window: Duration) -> Self {
+        Self {
+            limit,
+            window,
+            hits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records a hit for `ip` at `now` and returns whether it is within budget.
+    /// The first hit in a fresh (or expired) window is always allowed; the
+    /// `limit`-th hit is the last allowed; further hits are rejected until the
+    /// window rolls over.
+    fn check(&self, ip: IpAddr, now: Instant) -> bool {
+        let mut hits = self.hits.lock().expect("auth rate-limiter mutex poisoned");
+        match hits.get_mut(&ip) {
+            Some(entry) if now.duration_since(entry.1) < self.window => {
+                if entry.0 >= self.limit {
+                    return false;
+                }
+                entry.0 += 1;
+                true
+            }
+            _ => {
+                hits.insert(ip, (1, now));
+                true
+            }
+        }
+    }
+}
+
+/// State carried by the auth rate-limit middleware.
+#[derive(Clone)]
+struct RateLimitState {
+    limiter: Arc<FixedWindowLimiter>,
+    /// Mirrors `Config::trust_workspace_header` so IP resolution uses the same
+    /// precedence as `login.rs`: trust a forwarded client IP only in local-first
+    /// mode, otherwise key on the unspoofable raw peer socket.
+    trust_workspace_header: bool,
+}
+
+impl RateLimitState {
+    fn from_env(trust_workspace_header: bool) -> Self {
+        let limit = std::env::var("LIFEOS_AUTH_RATE_PER_MIN")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_AUTH_RATE_PER_MIN);
+        Self {
+            limiter: Arc::new(FixedWindowLimiter::new(limit, AUTH_RATE_WINDOW)),
+            trust_workspace_header,
+        }
+    }
+}
+
+/// The client IP the rate limiter keys on, matching `login.rs`'s precedence: in
+/// local-first mode a fronting proxy's forwarded client IP wins; otherwise (and
+/// as the authoritative source) the raw peer socket from `ConnectInfo`. `None`
+/// only in a non-ConnectInfo test harness with no forwarded header, in which case
+/// the request is not throttled (production always wires `ConnectInfo`).
+fn rate_limit_key(req: &Request, trust_workspace_header: bool) -> Option<IpAddr> {
+    if trust_workspace_header {
+        if let Some(ip) = login::forwarded_client_ip(req.headers()) {
+            return Some(ip);
+        }
+    }
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+}
+
+/// Per-IP throttle for the unauthenticated auth endpoints (finding 20): register,
+/// login, session refresh, and the set-password bootstrap. Returns HTTP 429 once
+/// an IP exceeds its window budget. Scoped to the auth sub-router only, never the
+/// whole API.
+async fn enforce_auth_rate_limit(
+    State(rl): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ip) = rate_limit_key(&req, rl.trust_workspace_header) {
+        if !rl.limiter.check(ip, Instant::now()) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "too many requests - please slow down and retry shortly" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// The unauthenticated auth endpoints, grouped into a sub-Router so the per-IP
+/// rate limiter (finding 20) applies to exactly these routes and nothing else.
+/// `/api/logout` is deliberately excluded - it needs a valid refresh token, so it
+/// is not an unauthenticated brute-force surface.
+fn auth_router(state: &AppState) -> Router<AppState> {
+    let rate_state = RateLimitState::from_env(state.config.trust_workspace_header);
+    Router::new()
+        .route("/api/register", post(register::register))
+        .route("/api/login", post(login::login))
+        .route("/api/session/refresh", post(login::refresh))
+        .route("/api/account/set-password", post(login::set_password))
+        .route_layer(axum::middleware::from_fn_with_state(
+            rate_state,
+            enforce_auth_rate_limit,
+        ))
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         // --- liveness + identity ---
         .route("/api/health", get(health::health))
-        .route("/api/register", post(register::register))
-        // --- real login/session (issue #100, docs/SECURITY.md §5) ---
-        .route("/api/login", post(login::login))
-        .route("/api/session/refresh", post(login::refresh))
+        // --- real login/session (issue #100, docs/SECURITY.md §5): register,
+        //     login, session/refresh, and set-password live in `auth_router`
+        //     below so the per-IP rate limiter (finding 20) wraps only them. ---
         .route("/api/logout", post(login::logout))
-        .route("/api/account/set-password", post(login::set_password))
         .route("/api/me", get(workspace::me))
         .route("/api/workspace", get(workspace::get_workspace).patch(workspace::update_workspace))
         // --- generic entity CRUD (the spine the whole system rests on) ---
@@ -307,8 +441,56 @@ pub fn router(state: AppState) -> Router {
         .route("/api/invite", post(membership::create_invite))
         .route("/api/invite/accept", post(membership::accept_invite))
         .route("/api/invite/:id", axum::routing::delete(membership::revoke_invite))
+        // Rate-limited unauthenticated auth endpoints (finding 20). Merged before
+        // the role layer so those routes are governed identically to the rest
+        // (they are all role-exempt, so `enforce_role` is a pass-through there).
+        .merge(auth_router(&state))
         // Per-role write enforcement (strict mode only); `route_layer` runs it
         // only for matched routes, so 404s stay 404s (issue #146).
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), enforce_role))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, last))
+    }
+
+    #[test]
+    fn allows_up_to_the_limit_then_rejects_within_the_window() {
+        let limiter = FixedWindowLimiter::new(3, Duration::from_secs(60));
+        let now = Instant::now();
+        // Three hits fit the budget; the fourth in the same window is rejected.
+        assert!(limiter.check(ip(1), now));
+        assert!(limiter.check(ip(1), now));
+        assert!(limiter.check(ip(1), now));
+        assert!(!limiter.check(ip(1), now));
+    }
+
+    #[test]
+    fn a_different_ip_has_an_independent_budget() {
+        let limiter = FixedWindowLimiter::new(2, Duration::from_secs(60));
+        let now = Instant::now();
+        assert!(limiter.check(ip(1), now));
+        assert!(limiter.check(ip(1), now));
+        assert!(!limiter.check(ip(1), now), "first IP is now over budget");
+        // A different IP is untouched by the first IP's traffic.
+        assert!(limiter.check(ip(2), now));
+        assert!(limiter.check(ip(2), now));
+    }
+
+    #[test]
+    fn the_window_rolls_over_after_it_elapses() {
+        let limiter = FixedWindowLimiter::new(1, Duration::from_secs(60));
+        let start = Instant::now();
+        assert!(limiter.check(ip(1), start));
+        assert!(!limiter.check(ip(1), start), "second hit in the same window is rejected");
+        // Once the window has fully elapsed the budget resets.
+        let later = start + Duration::from_secs(61);
+        assert!(limiter.check(ip(1), later), "a hit after the window elapses is allowed again");
+    }
 }

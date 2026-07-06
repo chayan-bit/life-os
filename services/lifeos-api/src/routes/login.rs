@@ -20,10 +20,10 @@ use crate::auth::{hash_password, hash_refresh_token, issue_token, new_refresh_to
 use crate::error::{ApiError, ApiResult};
 use crate::ids::{new_id, now_secs};
 use crate::state::AppState;
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::{ConnectInfo, State}, http::HeaderMap, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -151,19 +151,21 @@ pub struct SetPasswordRequest {
 /// else's account.
 pub async fn set_password(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<SetPasswordRequest>,
 ) -> ApiResult<Json<Value>> {
-    // TODO(finding-2): the robust, UNSPOOFABLE origin check is the raw peer
-    // socket via `axum::extract::ConnectInfo<std::net::SocketAddr>`. Wiring it
-    // requires `main.rs` to serve with
-    // `app.into_make_service_with_connect_info::<std::net::SocketAddr>()`
-    // (that file is owned by another component, so it is not changed here).
-    // Until that lands, `bootstrap_origin_is_local` is a best-effort gate over
-    // the (client-supplied, hence spoofable) forwarding headers, backed by the
-    // real teeth of this fix: the seeded owner is sealed with a non-NULL hash
-    // (db.rs::seed), so this NULL-guarded route can never take it over anyway.
-    if !bootstrap_origin_is_local(&headers, state.config.trust_workspace_header) {
+    // Finding 2: the authoritative, UNSPOOFABLE origin signal is the raw TCP
+    // peer socket, wired in `main.rs` via
+    // `into_make_service_with_connect_info::<SocketAddr>()`. A non-loopback peer
+    // means the request physically arrived from another host and is refused
+    // outright - client-supplied forwarding headers can never upgrade a remote
+    // peer to local. `peer` is `Option` only so the non-ConnectInfo test harness
+    // (tower `oneshot`) still exercises the header-only fallback; production
+    // always populates it. The seeded owner remains sealed with a non-NULL hash
+    // (db.rs::seed), so this NULL-guarded route can never take it over regardless.
+    let peer_ip = peer.map(|ConnectInfo(addr)| addr.ip());
+    if !bootstrap_origin_is_local(peer_ip, &headers, state.config.trust_workspace_header) {
         return Err(ApiError::Forbidden(
             "set-password is only available from localhost".into(),
         ));
@@ -203,19 +205,44 @@ pub async fn set_password(
     Ok(Json(json!({ "status": "password_set" })))
 }
 
-/// Whether a bootstrap set-password request may proceed from where it
-/// originated. This is a best-effort loopback gate until `ConnectInfo` is wired
-/// (see the TODO in `set_password`):
+/// Whether the local-only set-password bootstrap may proceed from where the
+/// request originated (finding 2). The AUTHORITATIVE signal is `peer`, the raw
+/// TCP peer socket (`ConnectInfo`), which a client cannot spoof:
 ///
-/// - Local-first default (`trust_workspace_header == true`): the API is bound to
-///   loopback, so a request that a fronting proxy did NOT tag with a client IP
-///   reached us directly and is local. If a proxy did forward one, it is allowed
-///   only when that address is itself loopback.
-/// - Shared/strict deployments (`trust_workspace_header == false`): client
-///   headers are not trusted and we lack the raw peer socket, so this local-only
-///   bootstrap is refused unless an operator explicitly opts in out-of-band with
-///   `LIFEOS_ALLOW_REMOTE_SET_PASSWORD`.
-fn bootstrap_origin_is_local(headers: &HeaderMap, trust_workspace_header: bool) -> bool {
+/// - A non-loopback peer physically came from another host: refused, unless a
+///   shared/strict operator explicitly opted in out-of-band with
+///   `LIFEOS_ALLOW_REMOTE_SET_PASSWORD`. No forwarding header can override this.
+/// - A loopback peer reached us directly OR via a same-host proxy. Here the
+///   forwarding headers are consulted as a SECONDARY signal via
+///   [`header_origin_is_local`]: in local-first mode a proxy-recorded client IP
+///   is honored (allowed only if itself loopback); strict mode ignores those
+///   spoofable headers and keeps the explicit opt-in default.
+/// - `peer == None` only in the non-ConnectInfo test harness (`oneshot`): fall
+///   back to the header-only best-effort gate.
+fn bootstrap_origin_is_local(
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+    trust_workspace_header: bool,
+) -> bool {
+    match peer {
+        // A remote peer is never local; only the strict opt-in can permit it.
+        Some(peer_ip) if !peer_ip.is_loopback() => remote_bootstrap_opt_in(),
+        // A loopback peer is local unless a trusted proxy forwarded a remote client.
+        Some(_) => header_origin_is_local(headers, trust_workspace_header),
+        // No raw peer available: header-only fallback.
+        None => header_origin_is_local(headers, trust_workspace_header),
+    }
+}
+
+/// The header-only origin gate: the SECONDARY (trusted-proxy) signal behind the
+/// authoritative peer check, and the fallback when no peer socket is available.
+///
+/// - Local-first (`trust_workspace_header == true`): a request a fronting proxy
+///   did NOT tag with a client IP reached the loopback-bound listener directly
+///   and is local; a forwarded client IP is allowed only when itself loopback.
+/// - Shared/strict (`trust_workspace_header == false`): client headers are not
+///   trusted, so the bootstrap is refused unless an operator explicitly opts in.
+fn header_origin_is_local(headers: &HeaderMap, trust_workspace_header: bool) -> bool {
     if trust_workspace_header {
         match forwarded_client_ip(headers) {
             Some(ip) => ip.is_loopback(),
@@ -232,9 +259,10 @@ fn bootstrap_origin_is_local(headers: &HeaderMap, trust_workspace_header: bool) 
 ///
 /// These headers are client-supplied and therefore spoofable - they are a
 /// defense-in-depth signal, never an authority. The authoritative origin check
-/// is the raw peer socket (`ConnectInfo<SocketAddr>`); see the TODO in
-/// `set_password` and finding 2.
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+/// is the raw peer socket (`ConnectInfo<SocketAddr>`), used by `set_password`
+/// (finding 2). Also reused by the auth rate limiter (routes/mod.rs) to key the
+/// client IP with the same precedence.
+pub(crate) fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     // `X-Forwarded-For: client, proxy1, proxy2` - the leftmost entry is the
     // original client.
     if let Some(first) = headers
@@ -356,5 +384,72 @@ async fn primary_workspace(state: &AppState, user_id: &str) -> ApiResult<String>
     match rows.next().await? {
         Some(row) => Ok(row.get(0)?),
         None => Err(ApiError::Internal(format!("user '{user_id}' has no workspace membership"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn loopback() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    }
+
+    fn remote() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+    }
+
+    fn with_xff(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", value.parse().unwrap());
+        headers
+    }
+
+    // --- Finding 2: the raw peer socket is the authoritative loopback gate. ---
+
+    #[test]
+    fn loopback_peer_with_no_forwarded_header_is_local() {
+        assert!(bootstrap_origin_is_local(Some(loopback()), &HeaderMap::new(), true));
+    }
+
+    #[test]
+    fn non_loopback_peer_is_rejected_even_with_no_forwarded_header() {
+        // The old header-only heuristic allowed this (no forwarded header =>
+        // "direct local"); the authoritative peer socket closes that hole.
+        assert!(!bootstrap_origin_is_local(Some(remote()), &HeaderMap::new(), true));
+    }
+
+    #[test]
+    fn non_loopback_peer_cannot_be_upgraded_by_a_spoofed_loopback_forwarded_header() {
+        assert!(!bootstrap_origin_is_local(Some(remote()), &with_xff("127.0.0.1"), true));
+    }
+
+    #[test]
+    fn loopback_peer_behind_proxy_with_remote_client_is_rejected() {
+        assert!(!bootstrap_origin_is_local(Some(loopback()), &with_xff("203.0.113.9"), true));
+    }
+
+    #[test]
+    fn loopback_peer_behind_proxy_with_loopback_client_is_allowed() {
+        assert!(bootstrap_origin_is_local(Some(loopback()), &with_xff("127.0.0.1"), true));
+    }
+
+    #[test]
+    fn no_peer_falls_back_to_the_header_only_gate() {
+        // Non-ConnectInfo harness: no forwarded header => treated as direct local.
+        assert!(bootstrap_origin_is_local(None, &HeaderMap::new(), true));
+        // A forwarded remote client is still rejected via the fallback.
+        assert!(!bootstrap_origin_is_local(None, &with_xff("203.0.113.9"), true));
+    }
+
+    #[test]
+    fn strict_mode_refuses_the_local_bootstrap_without_opt_in() {
+        // With LIFEOS_ALLOW_REMOTE_SET_PASSWORD unset, strict mode refuses every
+        // origin - loopback peer, remote peer, or none.
+        assert!(!bootstrap_origin_is_local(Some(loopback()), &HeaderMap::new(), false));
+        assert!(!bootstrap_origin_is_local(Some(remote()), &HeaderMap::new(), false));
+        assert!(!bootstrap_origin_is_local(None, &HeaderMap::new(), false));
     }
 }
