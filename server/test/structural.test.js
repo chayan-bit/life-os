@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { validateStructural } from "../validators/structural.js";
+import { RENDERER_KINDS } from "../../frontend/src/core/rendererKinds.js";
+
+const SCHEMA_PATH = path.resolve(import.meta.dirname, "..", "validators", "module.schema.json");
 
 const REAL_MODULES_DIR = path.resolve(import.meta.dirname, "..", "..", "modules");
 
@@ -181,6 +184,21 @@ describe("validateStructural - kind list derived from rendererKinds.js", () => {
     const result = await validateStructural(modulePath, { modulesDir });
     expect(result.valid).toBe(false);
     expect(result.errors.some((e) => e.includes('"hologram"'))).toBe(true);
+  });
+});
+
+// Guard (audit-verified drift): the schema file ships a static enum as a
+// readable baseline (getValidator() above patches it at runtime from
+// KNOWN_VIEW_KINDS before compiling), but the raw file itself must still
+// list the exact same kind set, or any other reader/consumer of
+// module.schema.json (docs, IDE tooling, a future validator that doesn't
+// go through structural.js's runtime patch) silently drifts out of sync.
+describe("module.schema.json - static view kind enum matches KNOWN_VIEW_KINDS", () => {
+  it("declares exactly RENDERER_KINDS + 'metric', the same derivation structural.js uses", async () => {
+    const schema = JSON.parse(await fs.readFile(SCHEMA_PATH, "utf8"));
+    const schemaKinds = new Set(schema.$defs.view.properties.kind.enum);
+    const knownViewKinds = new Set([...RENDERER_KINDS, "metric"]);
+    expect(schemaKinds).toEqual(knownViewKinds);
   });
 });
 

@@ -83,7 +83,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "label": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["list", "table", "board", "calendar", "gallery", "timeline", "map", "metric"] },
+        "kind": { "enum": ["list", "table", "board", "calendar", "gallery", "timeline", "map", "graph", "metric"] },
         "type": { "type": "string" },
         "metric": { "type": "string" },
         "sortBy": { "type": "string" },
