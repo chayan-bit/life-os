@@ -20,3 +20,4 @@ lifeos-agents = { path = "../lifeos-agents" }
 lifeos-pipelines = { path = "../lifeos-pipelines" }
 lifeos-memory = { path = "../lifeos-memory" }
 lifeos-actions = { path = "../lifeos-actions" }
+web-push = { version = "0.11", default-features = false }

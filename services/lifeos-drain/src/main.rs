@@ -182,6 +182,18 @@ async fn main() {
         }
     };
 
+    // Web push sender (issue #151): approval/build-gate/brief notifications
+    // to subscribed browsers. Without all three LIFEOS_VAPID_* vars, the
+    // fan-out tick still runs (cursors advance) but never actually pushes -
+    // same graceful-degradation posture as every other optional lane above.
+    let push_sender: Box<dyn lifeos_drain::push::PushSender> = match lifeos_drain::push::VapidConfig::from_env() {
+        Some(vapid) => Box::new(lifeos_drain::push::WebPushSender::new(vapid)),
+        None => {
+            println!("lifeos-drain: LIFEOS_VAPID_* not fully set, push notifications disabled");
+            Box::new(lifeos_drain::push::NoopPushSender)
+        }
+    };
+
     let vcs_blob_root = std::env::var("LIFEOS_VCS_BLOB_ROOT").unwrap_or_else(|_| "lifeos-blobs".to_string());
     let vcs_store = lifeos_vcs::ObjectStore::new(vcs_blob_root.clone());
     // The local CAS backend memory_sleep tiers cold nodes into. Drain has no
@@ -340,6 +352,12 @@ async fn main() {
             Ok(n) if n > 0 => println!("lifeos-drain: enqueued {n} daily_brief job(s)"),
             Ok(_) => {}
             Err(e) => eprintln!("lifeos-drain: daily brief trigger failed: {e}"),
+        }
+        // Push notification fan-out (issue #151): approvals/build gates/briefs.
+        match lifeos_drain::push::run_push_notification_tick(&conn, push_sender.as_ref(), now_secs()).await {
+            Ok(n) if n > 0 => println!("lifeos-drain: sent {n} push notification(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("lifeos-drain: push notification tick failed: {e}"),
         }
         sleep(poll).await;
     }

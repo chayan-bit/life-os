@@ -13,6 +13,9 @@
 //! `lifeos_api::audit::emit` rather than a cross-crate import.
 
 pub mod ai;
+/// Web push fan-out (issue #151) - see `push`'s module doc for the full
+/// design (event kinds notified on, cursor shape, VAPID sender).
+pub mod push;
 
 use async_trait::async_trait;
 use libsql::{params, Connection};

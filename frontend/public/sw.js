@@ -65,6 +65,29 @@ self.addEventListener('push', (event) => {
       // Mirrors the Telegram digest's alert-red gating (docs/PLATFORM-SYSTEMS.md) -
       // the payload carries the same urgency tag the digest uses.
       tag: data.tag || 'lifeos-digest',
+      // Deep-link the click handler below reads (issue #151). Defaults to the
+      // dashboard so a payload with no url still opens somewhere sensible.
+      data: { url: data.url || '/dashboard' },
+    })
+  );
+});
+
+// Web push click deep-link (issue #151): focuses an already-open PWA window
+// and navigates it to the notification's url, or opens a new one. Reuses an
+// existing client instead of always opening a new tab/window, matching how a
+// normal app notification (e.g. a Telegram deep link) behaves.
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const url = event.notification.data && event.notification.data.url ? event.notification.data.url : '/dashboard';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if ('focus' in client) {
+          const navigated = 'navigate' in client ? client.navigate(url).catch(() => client) : Promise.resolve(client);
+          return navigated.then((c) => c.focus());
+        }
+      }
+      return self.clients.openWindow(url);
     })
   );
 });

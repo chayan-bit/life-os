@@ -205,6 +205,7 @@ pub fn router(state: AppState) -> Router {
         // --- PWA Web Push subscriptions (issue #103) ---
         .route("/api/push/subscribe", post(push::subscribe))
         .route("/api/push/unsubscribe", post(push::unsubscribe))
+        .route("/api/push/vapid-public-key", get(push::vapid_public_key))
         // --- database-per-workspace provisioning (issue #104) ---
         .route("/api/workspace/provision-db", post(workspace_db::provision))
         .route("/api/workspace/database", get(workspace_db::get_database))

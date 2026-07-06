@@ -1,9 +1,9 @@
-//! Web Push subscriptions (issue #103, `docs/PLATFORM-SYSTEMS.md`). Storage
-//! only: the frontend service worker subscribes via the browser Push API and
-//! hands us the subscription; actually sending a push (VAPID-signed,
-//! mirroring the Telegram digest) needs a `web-push`-equivalent sender and
-//! VAPID keypair this base doesn't wire up yet - deferred, same honesty
-//! pattern as `routes/planned.rs`'s queued-but-undrained jobs.
+//! Web Push subscriptions (issue #103, `docs/PLATFORM-SYSTEMS.md`). This
+//! route group is storage only: the frontend service worker subscribes via
+//! the browser Push API and hands us the subscription. Actually sending a
+//! push (VAPID-signed, mirroring the Telegram digest) is `lifeos-drain`'s
+//! `push` module (issue #151) - a separate process/crate, so it isn't wired
+//! up here; this file just stores/serves what that sender needs.
 
 use crate::auth::resolve_workspace;
 use crate::db::workspace_exists;
@@ -70,4 +70,18 @@ pub async fn unsubscribe(
         )
         .await?;
     Ok(Json(json!({ "unsubscribed": true })))
+}
+
+/// `GET /api/push/vapid-public-key` - the `applicationServerKey` the frontend
+/// needs to call `pushManager.subscribe`. Read-only (docs/SECURITY.md §1: "reads
+/// are free") and workspace-agnostic - the VAPID keypair is one per deployment,
+/// not per tenant, mirroring `lifeos-drain`'s `LIFEOS_VAPID_PUBLIC_KEY` env var
+/// exactly so both processes are always configured with the same keypair.
+/// `enabled: false` (no `publicKey`) when the env var isn't set, so the
+/// frontend can skip calling `subscribe` with no key rather than fail obscurely.
+pub async fn vapid_public_key() -> Json<Value> {
+    match std::env::var("LIFEOS_VAPID_PUBLIC_KEY").ok().filter(|v| !v.is_empty()) {
+        Some(key) => Json(json!({ "enabled": true, "publicKey": key })),
+        None => Json(json!({ "enabled": false, "publicKey": null })),
+    }
 }
