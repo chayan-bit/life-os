@@ -39,7 +39,8 @@ import {
   Plane,
   Inbox,
   Activity,
-  Users
+  Users,
+  GitPullRequest
 } from 'lucide-react';
 
 export default function Layout({ children, onLogout }) {
@@ -132,6 +133,7 @@ export default function Layout({ children, onLogout }) {
         { name: 'Travel', href: '/m/travel', icon: Plane },
         { name: 'Modules', href: '/modules', icon: Cpu },
         { name: 'Database', href: '/database', icon: Database },
+        { name: 'Proposals', href: '/proposals', icon: GitPullRequest },
         { name: 'Graph', href: '/graph', icon: GitBranch },
         { name: 'Dashboards', href: '/dashboards', icon: LayoutDashboard },
       ],

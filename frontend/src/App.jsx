@@ -23,6 +23,7 @@ const MemoryInspector = lazy(() => import('./pages/MemoryInspector'));
 const Marketplace = lazy(() => import('./pages/Marketplace'));
 const ObserveDashboard = lazy(() => import('./pages/ObserveDashboard'));
 const Members = lazy(() => import('./pages/Members'));
+const Proposals = lazy(() => import('./pages/Proposals'));
 
 const PageFallback = () => (
   <div style={{ padding: '2rem', textAlign: 'center', color: '#888' }}>Loading...</div>
@@ -205,6 +206,14 @@ export default function App() {
           element={
             <Layout onLogout={handleLogout}>
               <Members />
+            </Layout>
+          }
+        />
+        <Route
+          path="/proposals"
+          element={
+            <Layout onLogout={handleLogout}>
+              <Proposals />
             </Layout>
           }
         />

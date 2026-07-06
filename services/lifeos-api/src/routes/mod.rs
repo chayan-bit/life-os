@@ -25,6 +25,7 @@ mod module_request;
 mod notion;
 mod pipeline;
 mod planned;
+mod proposal;
 mod push;
 mod reading;
 mod register;
@@ -289,6 +290,15 @@ pub fn router(state: AppState) -> Router {
         // --- database-per-workspace provisioning (issue #104) ---
         .route("/api/workspace/provision-db", post(workspace_db::provision))
         .route("/api/workspace/database", get(workspace_db::get_database))
+        // --- proposals: draft changeset -> review diff -> merge|reject, the
+        //     GitHub-analog on the entity graph (issue #148). Merge/reject are
+        //     editor+ (enforced in-handler; the strict middleware also blocks a
+        //     viewer). Review comments are annotations on the proposal entity. ---
+        .route("/api/proposal", post(proposal::create).get(proposal::list))
+        .route("/api/proposal/:id", get(proposal::get_one))
+        .route("/api/proposal/:id/diff", get(proposal::diff))
+        .route("/api/proposal/:id/merge", post(proposal::merge))
+        .route("/api/proposal/:id/reject", post(proposal::reject))
         // --- workspace membership, roles, invites (issue #146) ---
         .route("/api/members", get(membership::list_members))
         .route("/api/member/:user_id/role", post(membership::set_role))
