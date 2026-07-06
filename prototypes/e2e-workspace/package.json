@@ -1,0 +1,11 @@
+{
+  "name": "lifeos-e2e-workspace-spike",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated spike (issue #155): an E2E-encrypted workspace where the server never holds plaintext attrs and search runs locally. Zero runtime dependencies.",
+  "scripts": {
+    "bench": "node src/bench.js",
+    "test": "node --test"
+  }
+}
