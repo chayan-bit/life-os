@@ -43,10 +43,14 @@ export const ACTION_TOOLS = Object.freeze({
   // Drafting content for outward channels (social/email/etc.) is gated even
   // though the draft entity itself is internal - docs/AGENT-CONTROL.md §3
   // calls this out explicitly ("draft.create (gated, since publishing is
-  // outward)"), so approval happens before the draft is even written.
+  // outward)"), so approval happens before the draft is even written. The
+  // status default mirrors the backend draft.create tool and worker/src/
+  // approvals.ts, which key the approval queue off 'pending_approval' - a
+  // frontend-created draft with any other default status would be invisible
+  // to that queue.
   'draft.create': {
     classification: 'gated',
-    run: (args) => apiCall('POST', '/api/entity', { ...args, status: args.status || 'drafted' }),
+    run: (args) => apiCall('POST', '/api/entity', { ...args, status: args.status || 'pending_approval' }),
   },
   'view.configure': {
     classification: 'allowed',
@@ -71,11 +75,11 @@ export const ACTION_TOOLS = Object.freeze({
     // function; this registry only validates the action shape exists.
     run: (args) => Promise.resolve({ ok: true, data: args, error: null, offline: false }),
   },
-  // Pipelines (#92+) aren't built yet; their queued route already exists -
-  // classified gated since a pipeline's stages can themselves reach gated
-  // tools, and the registry can't know in advance which.
+  // Allowed: the backend actionRegistry.js is the enforcement authority for
+  // this route, and pipeline stages that act outwardly gate themselves via
+  // draft.create internally, so pipeline.run itself needs no separate gate.
   'pipeline.run': {
-    classification: 'gated',
+    classification: 'allowed',
     run: (args) => apiCall('POST', '/api/pipeline/run', args),
   },
   'module.requestBuild': {

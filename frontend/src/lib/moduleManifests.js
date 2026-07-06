@@ -53,6 +53,7 @@ export const LEARNING_MANIFEST = {
     ] },
     { id: 'gaps', label: 'Gaps inbox', kind: 'list', type: 'gap' },
     { id: 'due', label: "What's due", kind: 'calendar', type: 'topic', dateField: 'next_due' },
+    { id: 'graph', label: 'Knowledge Graph (cross-domain)', kind: 'graph', type: 'topic' },
   ],
 };
 
@@ -222,7 +223,11 @@ export const SOCIAL_MANIFEST = {
   },
   views: [
     { id: 'inbox', label: 'Inbox (mentions + DMs)', kind: 'list', type: 'mention' },
-    { id: 'posts', label: 'Posts', kind: 'board', type: 'post', groupBy: 'status', columns: ['drafted', 'published', 'rejected'] },
+    // 'pending_approval' matches the status draft.create now writes (server/
+    // agent/actionRegistry.js + frontend/src/lib/agentActions.js + worker/src/
+    // approvals.ts) - was 'drafted', which made agent-created posts invisible
+    // on this board.
+    { id: 'posts', label: 'Posts', kind: 'board', type: 'post', groupBy: 'status', columns: ['pending_approval', 'published', 'rejected'] },
     { id: 'accounts', label: 'Accounts (link via Integrations - Nango, Phase 3)', kind: 'list', type: 'social_account' },
   ],
 };
