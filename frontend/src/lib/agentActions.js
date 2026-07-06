@@ -98,6 +98,20 @@ export function classifyAction(tool) {
   return 'forbidden'; // unknown tool = no tool = forbidden by default (closed set)
 }
 
+// Per-role capability matrix (issue #146): which tool classifications each
+// workspace role may execute. Kept byte-identical to the backend export of the
+// same name in server/agent/actionRegistry.js - registryParity.test.js fails
+// the build the moment the two drift. `forbidden` is never listed: no role
+// runs a forbidden tool. viewer: none; agent: reversible/internal only;
+// editor: those plus gated drafting; owner: everything an editor can, with the
+// extra security-sensitive HTTP surfaces gated at the API layer, not here.
+export const ROLE_CAPS = Object.freeze({
+  owner: ['allowed', 'gated'],
+  editor: ['allowed', 'gated'],
+  agent: ['allowed'],
+  viewer: [],
+});
+
 async function logDenied(tool, args) {
   await apiCall('POST', '/api/event', {
     type: 'action.denied',

@@ -4,7 +4,7 @@ import {
   ShieldCheck, Database, Boxes, FolderGit2, ShieldAlert, Lock, Wand2, Repeat
 } from 'lucide-react';
 import { LAYERS } from '../lib/capabilities';
-import { getCapabilityMatrix } from '../lib/capabilityMatrix';
+import { getCapabilityMatrix, ROLES } from '../lib/capabilityMatrix';
 import { apiCall, WORKSPACE_ID_KEY } from '../lib/api';
 
 const read = (k, fallback = '') => localStorage.getItem(k) || fallback;
@@ -208,24 +208,43 @@ export default function Profile() {
         <p className="text-xs text-neo-text-muted">
           Exactly what the in-app agent can and cannot do, across both typed action tools and app layers.
           <strong> Forbidden</strong> means no tool/access exists at all - not a check that could be bypassed.
-          <strong> Gated</strong> means a human must approve before it runs. This view is read-only; it cannot be edited from the app.
+          <strong> Gated</strong> means a human must approve before it runs. The <strong>role</strong> column
+          shows which workspace roles may execute each capability (issue #146). This view is read-only; it
+          cannot be edited from the app.
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
           {getCapabilityMatrix().map((row) => (
-            <div key={`${row.kind}-${row.id}`} className="p-3 neo-border bg-neo-surface flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-sm font-bold text-neo-text truncate font-mono">{row.label}</div>
-                <div className="text-[10px] text-neo-text-muted">{row.kind}</div>
+            <div key={`${row.kind}-${row.id}`} className="p-3 neo-border bg-neo-surface flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-bold text-neo-text truncate font-mono">{row.label}</div>
+                  <div className="text-[10px] text-neo-text-muted">{row.kind}</div>
+                </div>
+                {row.classification === 'forbidden' && (
+                  <span className="neo-tag bg-neo-red text-white text-[9px] shrink-0"><Lock size={9} /> forbidden</span>
+                )}
+                {row.classification === 'gated' && (
+                  <span className="neo-tag bg-neo-yellow text-neo-text text-[9px] shrink-0">gated</span>
+                )}
+                {row.classification === 'allowed' && (
+                  <span className="neo-tag bg-neo-mint text-neo-text text-[9px] shrink-0">allowed</span>
+                )}
               </div>
-              {row.classification === 'forbidden' && (
-                <span className="neo-tag bg-neo-red text-white text-[9px] shrink-0"><Lock size={9} /> forbidden</span>
-              )}
-              {row.classification === 'gated' && (
-                <span className="neo-tag bg-neo-yellow text-neo-text text-[9px] shrink-0">gated</span>
-              )}
-              {row.classification === 'allowed' && (
-                <span className="neo-tag bg-neo-mint text-neo-text text-[9px] shrink-0">allowed</span>
-              )}
+              {/* Role column: which roles may execute this capability. */}
+              <div className="flex items-center gap-1 flex-wrap">
+                {ROLES.map((role) => {
+                  const can = row.roles?.includes(role);
+                  return (
+                    <span
+                      key={role}
+                      title={can ? `${role} can run this` : `${role} cannot run this`}
+                      className={`neo-tag text-[8px] font-mono ${can ? 'bg-neo-mint text-neo-text' : 'bg-neo-surface-high text-neo-text-muted opacity-60'}`}
+                    >
+                      {role}
+                    </span>
+                  );
+                })}
+              </div>
             </div>
           ))}
         </div>

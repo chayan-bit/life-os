@@ -8,8 +8,20 @@
 // from agentActions.js/capabilities.js and exposes a getter, never a setter.
 // There is deliberately no UI anywhere that writes to either source file -
 // the matrix cannot widen the agent's own reach from inside the app.
-import { ACTION_TOOLS, PROTECTED_TOOLS } from './agentActions';
+import { ACTION_TOOLS, PROTECTED_TOOLS, ROLE_CAPS } from './agentActions';
 import { LAYERS } from './capabilities';
+
+// Roles ordered most- to least-privileged, for the Profile matrix's role
+// column (issue #146). Read straight from ROLE_CAPS so the UI can never drift
+// from what the executor actually enforces.
+export const ROLES = ['owner', 'editor', 'agent', 'viewer'];
+
+// Which roles may EXECUTE a given classification. A `forbidden` row is off-
+// limits to every role (no tool exists to run), so it returns no roles.
+export function rolesForClassification(classification) {
+  if (classification === 'forbidden') return [];
+  return ROLES.filter((role) => (ROLE_CAPS[role] || []).includes(classification));
+}
 
 // A legacy layer's {aiCanRead, aiCanModify, gated, core} maps onto the
 // canonical three-state model: `gated: true` layers are fully blocked
@@ -25,21 +37,23 @@ function classifyLayer(layer) {
 }
 
 export function getCapabilityMatrix() {
-  const actionRows = Object.entries(ACTION_TOOLS).map(([tool, def]) => ({
+  const withRoles = (row) => ({ ...row, roles: rolesForClassification(row.classification) });
+
+  const actionRows = Object.entries(ACTION_TOOLS).map(([tool, def]) => withRoles({
     kind: 'action tool',
     id: tool,
     label: tool,
     classification: def.classification,
   }));
 
-  const protectedRows = PROTECTED_TOOLS.map((tool) => ({
+  const protectedRows = PROTECTED_TOOLS.map((tool) => withRoles({
     kind: 'action tool',
     id: tool,
     label: tool,
     classification: 'forbidden',
   }));
 
-  const layerRows = LAYERS.map((layer) => ({
+  const layerRows = LAYERS.map((layer) => withRoles({
     kind: 'app layer',
     id: layer.id,
     label: layer.label,

@@ -223,3 +223,17 @@ export function classify(toolName) {
   if (entry) return entry.classification;
   return "forbidden";
 }
+
+// Per-role capability matrix (issue #146): which tool classifications each
+// workspace role may EXECUTE. `forbidden` is never listed - no role runs a
+// forbidden tool. This mirrors the frontend export of the same name in
+// frontend/src/lib/agentActions.js exactly (registryParity.test.js asserts
+// they are byte-identical). The executor consults this only when a role is
+// present in ctx; absent a role, callers default to owner behavior, so
+// existing (single-user) callers are unaffected.
+export const ROLE_CAPS = Object.freeze({
+  owner: ["allowed", "gated"],
+  editor: ["allowed", "gated"],
+  agent: ["allowed"],
+  viewer: [],
+});

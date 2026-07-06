@@ -22,6 +22,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use axum::http::HeaderMap;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use libsql::Connection;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -174,6 +175,100 @@ pub fn resolve_workspace(
     Err(ApiError::Unauthorized(
         "missing or invalid authentication".into(),
     ))
+}
+
+/// A workspace member's role (issue #146). Ordered by increasing authority for
+/// the coarse HTTP write gate: `viewer` reads only, `agent`/`editor` write
+/// non-security routes, `owner` writes everything. The finer allowed-vs-gated
+/// split the agent loop enforces lives in `ROLE_CAPS` (server/agent/
+/// actionRegistry.js), not here - a route alone can't tell `entity.create`
+/// (allowed) from `draft.create` (gated), they share `POST /api/entity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Owner,
+    Editor,
+    Viewer,
+    Agent,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Owner => "owner",
+            Role::Editor => "editor",
+            Role::Viewer => "viewer",
+            Role::Agent => "agent",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "owner" => Some(Role::Owner),
+            "editor" => Some(Role::Editor),
+            "viewer" => Some(Role::Viewer),
+            "agent" => Some(Role::Agent),
+            _ => None,
+        }
+    }
+
+    /// Whether this role may perform a write. `security_sensitive` routes
+    /// (config promote/rollback, connections, storage, membership mutations)
+    /// are owner-only; ordinary writes are open to owner/editor/agent; a
+    /// viewer never writes.
+    pub fn can_write(self, security_sensitive: bool) -> bool {
+        match self {
+            Role::Owner => true,
+            Role::Editor | Role::Agent => !security_sensitive,
+            Role::Viewer => false,
+        }
+    }
+}
+
+/// Resolve the caller's role in `workspace_id` (issue #146, design decision #2).
+///
+/// - Workspace with **no** `workspace_members` rows at all -> `Owner`: legacy
+///   single-user mode, so personal deployments keep working untouched.
+/// - Rows exist and the user has one -> that stored role.
+/// - Rows exist but the user has none (or no identity was proven) -> `Forbidden`.
+///   This branch only ever fires in strict mode; in local-first mode the
+///   enforcement middleware short-circuits before calling this.
+pub async fn resolve_role(
+    conn: &Connection,
+    workspace_id: &str,
+    user_id: Option<&str>,
+) -> ApiResult<Role> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM workspace_members WHERE workspace_id = ?1",
+            libsql::params![workspace_id],
+        )
+        .await?;
+    let member_count: i64 = match rows.next().await? {
+        Some(row) => row.get(0)?,
+        None => 0,
+    };
+    if member_count == 0 {
+        return Ok(Role::Owner);
+    }
+
+    let uid = user_id
+        .ok_or_else(|| ApiError::Forbidden("workspace membership required".into()))?;
+    let mut rows = conn
+        .query(
+            "SELECT role FROM workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
+            libsql::params![workspace_id, uid],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => {
+            let role: String = row.get(0)?;
+            Role::parse(&role)
+                .ok_or_else(|| ApiError::Internal(format!("invalid stored role '{role}'")))
+        }
+        None => Err(ApiError::Forbidden(
+            "you are not a member of this workspace".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -345,5 +440,28 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(hash_refresh_token(&a), hash_refresh_token(&a));
         assert_ne!(hash_refresh_token(&a), hash_refresh_token(&b));
+    }
+
+    #[test]
+    fn role_string_round_trips_and_rejects_unknown() {
+        for r in [Role::Owner, Role::Editor, Role::Viewer, Role::Agent] {
+            assert_eq!(Role::parse(r.as_str()), Some(r));
+        }
+        assert_eq!(Role::parse("admin"), None);
+        assert_eq!(Role::parse(""), None);
+    }
+
+    #[test]
+    fn write_gate_is_owner_all_editor_agent_nonsecurity_viewer_none() {
+        // Ordinary writes: everyone but a viewer may perform them.
+        assert!(Role::Owner.can_write(false));
+        assert!(Role::Editor.can_write(false));
+        assert!(Role::Agent.can_write(false));
+        assert!(!Role::Viewer.can_write(false));
+        // Security-sensitive writes: owner only.
+        assert!(Role::Owner.can_write(true));
+        assert!(!Role::Editor.can_write(true));
+        assert!(!Role::Agent.can_write(true));
+        assert!(!Role::Viewer.can_write(true));
     }
 }

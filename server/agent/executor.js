@@ -5,7 +5,7 @@
 // enforces the per-turn step budget. No file tools, no Bash: the loop can only
 // touch the closed action registry.
 import { tool as sdkTool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
-import { REGISTRY, classify } from "./actionRegistry.js";
+import { REGISTRY, ROLE_CAPS, classify } from "./actionRegistry.js";
 import { isRouteAllowed } from "../lib/routeAllowlist.js";
 import { emptyUsage, foldUsage } from "./usage.js";
 import {
@@ -209,16 +209,27 @@ export async function runTool(ctx, toolName, args = {}) {
   }
 
   const decision = classify(toolName);
+  // Per-role capability gate (issue #146): consulted ONLY when ctx.role is set,
+  // so existing single-user callers (no role) are unchanged - they default to
+  // owner reach. A role that may not execute this classification demotes the
+  // decision to forbidden before any side effect runs (a route alone can't tell
+  // allowed from gated, so this classification gate is where roles bite).
+  const roleBlocked =
+    Boolean(ctx.role) &&
+    decision !== "forbidden" &&
+    !(ROLE_CAPS[ctx.role] ?? []).includes(decision);
   const start = Date.now();
   let ok = false;
   let result;
 
-  if (decision === "forbidden") {
+  if (decision === "forbidden" || roleBlocked) {
     await denyForbidden(ctx, toolName, args);
     result = {
       status: "forbidden",
       tool: toolName,
-      reason: `'${toolName}' has no tool - this domain is hard-denied (docs/AGENT-CONTROL.md §1).`,
+      reason: roleBlocked
+        ? `role '${ctx.role}' may not execute ${decision} tools (docs/AGENT-CONTROL.md §2).`
+        : `'${toolName}' has no tool - this domain is hard-denied (docs/AGENT-CONTROL.md §1).`,
     };
   } else if (decision === "gated") {
     ({ result, ok } = await runGated(ctx, toolName, args));
@@ -226,7 +237,12 @@ export async function runTool(ctx, toolName, args = {}) {
     ({ result, ok } = await runAllowed(ctx, toolName, REGISTRY[toolName], args));
   }
 
-  ctx.ledger.push({ tool: toolName, decision, ms: Date.now() - start, ok });
+  ctx.ledger.push({
+    tool: toolName,
+    decision: roleBlocked ? "forbidden" : decision,
+    ms: Date.now() - start,
+    ok,
+  });
   return result;
 }
 

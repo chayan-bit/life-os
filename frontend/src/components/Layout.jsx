@@ -38,7 +38,8 @@ import {
   BookOpen,
   Plane,
   Inbox,
-  Activity
+  Activity,
+  Users
 } from 'lucide-react';
 
 export default function Layout({ children, onLogout }) {
@@ -148,6 +149,7 @@ export default function Layout({ children, onLogout }) {
       group: 'System',
       items: [
         { name: 'Integrations', href: '/integrations', icon: Settings },
+        { name: 'Members', href: '/members', icon: Users },
         { name: 'Docs', href: '/docs', icon: FileText },
         { name: 'Approvals', href: '/approvals', icon: Inbox },
         { name: 'Agent Ledger', href: '/agent-ledger', icon: History },

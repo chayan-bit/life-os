@@ -69,6 +69,10 @@ const MIGRATION_DERIVED_MEMORY: &str = include_str!("../../../migrations/0018_de
 /// `CREATE TABLE IF NOT EXISTS`, naturally idempotent and rebuildable.
 const MIGRATION_MEMORY_COMMUNITIES: &str =
     include_str!("../../../migrations/0019_memory_communities.sql");
+/// `workspace_members` + `invites` (workspace membership/roles/invites, issue
+/// #146) - new `CREATE TABLE IF NOT EXISTS` tables, naturally idempotent.
+/// Seeded with nothing: absent membership rows = legacy single-user mode.
+const MIGRATION_MEMBERSHIP: &str = include_str!("../../../migrations/0020_membership.sql");
 
 /// The canonical DB plus its live connection. `database` is retained by the caller
 /// so the embedded-replica's background replicator stays alive (dropping it would
@@ -207,6 +211,7 @@ pub async fn run_migrations(conn: &Connection) -> Result<(), libsql::Error> {
     add_column_if_missing(conn, "events", "schema_version", MIGRATION_EVENTS_SCHEMA_VERSION).await?;
     conn.execute_batch(MIGRATION_MEMORY).await?;
     conn.execute_batch(MIGRATION_MEMORY_COMMUNITIES).await?;
+    conn.execute_batch(MIGRATION_MEMBERSHIP).await?;
     tracing::info!("migrations applied (core + control plane)");
     Ok(())
 }

@@ -18,6 +18,7 @@ mod kite;
 mod llm;
 mod login;
 mod marketplace;
+mod membership;
 mod memory;
 mod metrics;
 mod module_request;
@@ -38,11 +39,89 @@ mod whatsapp;
 mod workspace;
 mod workspace_db;
 
+use crate::auth::{bearer_claims, resolve_role, resolve_workspace};
+use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
+    extract::{Request, State},
+    http::Method,
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
     Router,
 };
+
+/// Paths that must skip the strict-mode role gate entirely: unauthenticated
+/// identity/auth endpoints (they cannot present a JWT yet), invite acceptance
+/// (the joining user is not a member yet - the token is the authority), and
+/// inbound webhooks (external callers, no user JWT). `/api/invite/accept` is
+/// matched exactly so `/api/invite` (owner-only create) stays gated.
+const ROLE_EXEMPT_PREFIXES: &[&str] = &[
+    "/api/login",
+    "/api/register",
+    "/api/logout",
+    "/api/session/refresh",
+    "/api/account/set-password",
+    "/api/invite/accept",
+    "/api/webhooks/",
+];
+
+fn is_write_method(method: &Method) -> bool {
+    matches!(*method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE)
+}
+
+fn is_role_exempt(path: &str) -> bool {
+    ROLE_EXEMPT_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Owner-only write surfaces: config promote/rollback, owned-credential
+/// connections, storage backends, and membership mutations (issue #146,
+/// design decision #3). An editor/agent hitting one of these gets 403; owner
+/// passes. `/api/invite/accept` is already exempt above, so it never reaches
+/// this despite the `/api/invite` prefix.
+fn is_security_sensitive(path: &str) -> bool {
+    path.starts_with("/api/connection")
+        || path.starts_with("/api/storage")
+        || path.starts_with("/api/member")
+        || path.starts_with("/api/invite")
+        || (path.starts_with("/api/configs")
+            && (path.ends_with("/promote") || path == "/api/configs/rollback"))
+}
+
+/// Per-role write enforcement (issue #146). ONE middleware for the whole API,
+/// not a per-route sweep. In local-first mode (`trust_workspace_header = true`)
+/// it is a pure pass-through - personal deployments are unaffected. In strict
+/// mode it gates writes only (reads are free for members): a viewer is denied
+/// every write, an editor/agent is denied security-sensitive writes, an owner
+/// passes. Identity itself is still resolved by `resolve_workspace`.
+async fn enforce_role(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if state.config.trust_workspace_header {
+        return next.run(req).await;
+    }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    if !is_write_method(&method) || is_role_exempt(&path) {
+        return next.run(req).await;
+    }
+    let headers = req.headers().clone();
+    let workspace = match resolve_workspace(&headers, &state.config, None) {
+        Ok(w) => w,
+        Err(e) => return e.into_response(),
+    };
+    let user_id = bearer_claims(&headers, &state.config.jwt_secret).map(|c| c.sub);
+    let role = match resolve_role(&state.conn, &workspace, user_id.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    if !role.can_write(is_security_sensitive(&path)) {
+        return ApiError::Forbidden(format!(
+            "role '{}' is not permitted to perform this write",
+            role.as_str()
+        ))
+        .into_response();
+    }
+    next.run(req).await
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -209,5 +288,16 @@ pub fn router(state: AppState) -> Router {
         // --- database-per-workspace provisioning (issue #104) ---
         .route("/api/workspace/provision-db", post(workspace_db::provision))
         .route("/api/workspace/database", get(workspace_db::get_database))
+        // --- workspace membership, roles, invites (issue #146) ---
+        .route("/api/members", get(membership::list_members))
+        .route("/api/member/:user_id/role", post(membership::set_role))
+        .route("/api/member/:user_id", axum::routing::delete(membership::remove_member))
+        .route("/api/invites", get(membership::list_invites))
+        .route("/api/invite", post(membership::create_invite))
+        .route("/api/invite/accept", post(membership::accept_invite))
+        .route("/api/invite/:id", axum::routing::delete(membership::revoke_invite))
+        // Per-role write enforcement (strict mode only); `route_layer` runs it
+        // only for matched routes, so 404s stay 404s (issue #146).
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), enforce_role))
         .with_state(state)
 }

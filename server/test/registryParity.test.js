@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { PROTECTED_TOOLS as BACKEND_PROTECTED, REGISTRY as BACKEND_REGISTRY } from "../agent/actionRegistry.js";
-import { PROTECTED_TOOLS as FRONTEND_PROTECTED, ACTION_TOOLS as FRONTEND_TOOLS } from "../../frontend/src/lib/agentActions.js";
+import {
+  PROTECTED_TOOLS as BACKEND_PROTECTED,
+  REGISTRY as BACKEND_REGISTRY,
+  ROLE_CAPS as BACKEND_ROLE_CAPS,
+} from "../agent/actionRegistry.js";
+import {
+  PROTECTED_TOOLS as FRONTEND_PROTECTED,
+  ACTION_TOOLS as FRONTEND_TOOLS,
+  ROLE_CAPS as FRONTEND_ROLE_CAPS,
+} from "../../frontend/src/lib/agentActions.js";
 
 // Guards the split maintained between the two independently-maintained agent
 // tool registries: server/agent/actionRegistry.js (backend, enforced) and
@@ -45,5 +53,23 @@ describe("agent registry parity - backend actionRegistry.js vs frontend agentAct
     for (const name of frontendSet) {
       expect(BACKEND_REGISTRY[name]).toBeUndefined();
     }
+  });
+
+  // Issue #146: the per-role capability matrix is exported from both registries
+  // and MUST stay symmetric - the executor (backend) and the Profile matrix
+  // (frontend) both read it, so any drift would let one layer grant a reach the
+  // other denies.
+  it("agrees on the ROLE_CAPS matrix byte-for-byte across both registries", () => {
+    expect(FRONTEND_ROLE_CAPS).toEqual(BACKEND_ROLE_CAPS);
+
+    // And it stays a closed, sane set: known roles only, no role can execute a
+    // 'forbidden' classification, viewer executes nothing.
+    const roles = Object.keys(BACKEND_ROLE_CAPS).sort();
+    expect(roles).toEqual(["agent", "editor", "owner", "viewer"]);
+    for (const [role, caps] of Object.entries(BACKEND_ROLE_CAPS)) {
+      expect(caps).not.toContain("forbidden");
+      for (const cap of caps) expect(["allowed", "gated"]).toContain(cap);
+    }
+    expect(BACKEND_ROLE_CAPS.viewer).toEqual([]);
   });
 });
