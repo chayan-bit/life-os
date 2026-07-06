@@ -159,11 +159,23 @@ pub struct MigrateRequest {
     workspace_id: Option<String>,
 }
 
-/// `POST /api/storage/migrate` - enqueues a `storage_migrate` job that
-/// re-puts every live object onto the target backend, then flips the
-/// primary pointer (issue #108). Identity is the hash, so no entity/edge/
-/// event/snapshot is rewritten. Returns 202 + job_id; progress lands in the
-/// job's payload; `has`-before-put makes a re-run resume where it stopped.
+/// `POST /api/storage/migrate` - re-puts every live object onto the target
+/// backend in-process, then flips the primary pointer (issue #108). Identity
+/// is the hash, so no entity/edge/event/snapshot is rewritten. Returns 202 +
+/// `migration_id`; progress lands in the target backend entity's
+/// `attrs.migration`; `has`-before-put makes a re-run resume where it stopped.
+///
+/// This intentionally does NOT enqueue a `jobs` row (finding: double-claim).
+/// The migration runs entirely inside this API process - it is the only
+/// place holding the Nango/secret_enc clients storage backends need - but
+/// `lifeos-drain`'s `claim_job` claims the highest-priority *queued* row
+/// with no kind filter, and its `dispatch()` stub-completes `storage_migrate`
+/// the instant it is claimed (`Dispatch::Stub`, `services/lifeos-drain/src/lib.rs`).
+/// A drain node polling concurrently would therefore mark the job 'done'
+/// while objects are still copying, and its own status write would race this
+/// function's. Since drain claims any kind, there is no claimable-but-ignored
+/// kind to pick either - so progress is tracked on the entity instead of in
+/// `jobs`, which nothing but this handler ever writes to for this backend id.
 pub async fn migrate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -177,26 +189,23 @@ pub async fn migrate(
         ));
     }
 
-    let payload = json!({ "target_backend_id": req.target_backend_id });
-    let job_id = super::job::enqueue(&state, &workspace_id, "storage_migrate", &payload, 0).await?;
+    let migration_id = new_id("mig");
+    mark_migration_running(&state, &req.target_backend_id, &migration_id).await?;
 
     let task_state = state.clone();
     let task_ws = workspace_id.clone();
-    let task_job = job_id.clone();
+    let task_migration = migration_id.clone();
     let task_target = req.target_backend_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_migration(&task_state, &task_ws, &task_job, &task_target).await {
-            tracing::error!("storage migration {task_job} failed: {e:?}");
-            let _ = task_state
-                .conn
-                .execute(
-                    "UPDATE jobs SET status='failed', error=?2 WHERE id=?1",
-                    libsql::params![task_job, format!("{e:?}")],
-                )
-                .await;
+        if let Err(e) = run_migration(&task_state, &task_ws, &task_migration, &task_target).await {
+            tracing::error!("storage migration {task_migration} failed: {e:?}");
+            let _ = mark_migration_failed(&task_state, &task_target, &task_migration, &format!("{e:?}")).await;
         }
     });
-    Ok((axum::http::StatusCode::ACCEPTED, Json(json!({ "status": "queued", "job_id": job_id }))))
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({ "status": "queued", "migration_id": migration_id, "target_backend_id": req.target_backend_id })),
+    ))
 }
 
 async fn fetch_backend_config(state: &AppState, workspace_id: &str, id: &str) -> ApiResult<Entity> {
@@ -218,14 +227,10 @@ async fn fetch_backend_config(state: &AppState, workspace_id: &str, id: &str) ->
 
 /// The migration itself: every live object hash (entity blob_refs +
 /// snapshots + their chunks) re-put onto the target with fallback reads
-/// across the local CAS and existing backends, progress persisted into the
-/// jobs row, and - only on a fully clean run - the primary pointer flip.
-async fn run_migration(state: &AppState, workspace_id: &str, job_id: &str, target_id: &str) -> ApiResult<()> {
-    state
-        .conn
-        .execute("UPDATE jobs SET status='running' WHERE id=?1", libsql::params![job_id])
-        .await?;
-
+/// across the local CAS and existing backends, progress persisted onto the
+/// target entity's `attrs.migration`, and - only on a fully clean run - the
+/// primary pointer flip.
+async fn run_migration(state: &AppState, workspace_id: &str, migration_id: &str, target_id: &str) -> ApiResult<()> {
     let target_entity = fetch_backend_config(state, workspace_id, target_id).await?;
     let target = crate::storage::backend_from_config(state, workspace_id, target_id, &target_entity.attrs).await?;
     let sources = crate::storage::read_backends(state, workspace_id).await?;
@@ -241,6 +246,7 @@ async fn run_migration(state: &AppState, workspace_id: &str, job_id: &str, targe
         .map_err(|e| ApiError::Internal(format!("migration failed: {e}")))?;
 
     let progress = json!({
+        "migration_id": migration_id,
         "target_backend_id": target_id,
         "migrated": report.migrated,
         "skipped": report.skipped,
@@ -248,17 +254,9 @@ async fn run_migration(state: &AppState, workspace_id: &str, job_id: &str, targe
         "total": hashes.len(),
     });
     if report.failed > 0 {
-        state
-            .conn
-            .execute(
-                "UPDATE jobs SET status='failed', payload=?2, error=?3 WHERE id=?1",
-                libsql::params![
-                    job_id,
-                    progress.to_string(),
-                    format!("{} object(s) could not be migrated", report.failed)
-                ],
-            )
-            .await?;
+        let error = format!("{} object(s) could not be migrated", report.failed);
+        mark_migration_finished(state, target_id, migration_id, "failed", &progress, Some(&error)).await?;
+        emit(&state.conn, workspace_id, "storage.migration.failed", Some(target_id), "api", &progress).await?;
         return Ok(()); // primary pointer NOT flipped on a partial copy
     }
 
@@ -279,14 +277,69 @@ async fn run_migration(state: &AppState, workspace_id: &str, job_id: &str, targe
             libsql::params![now, target_id],
         )
         .await?;
+    mark_migration_finished(state, target_id, migration_id, "done", &progress, None).await?;
+    emit(&state.conn, workspace_id, "storage.migrated", Some(target_id), "api", &progress).await?;
+    Ok(())
+}
+
+/// Stamps `attrs.migration = { id, status: 'running', started_at }` onto the
+/// target backend entity. Called synchronously before the migration task is
+/// spawned, so a client that lists backends immediately after the 202
+/// response already sees the in-flight state.
+async fn mark_migration_running(state: &AppState, target_id: &str, migration_id: &str) -> ApiResult<()> {
+    let now = now_secs();
+    let migration = json!({ "id": migration_id, "status": "running", "started_at": now });
     state
         .conn
         .execute(
-            "UPDATE jobs SET status='done', payload=?2 WHERE id=?1",
-            libsql::params![job_id, progress.to_string()],
+            "UPDATE entities SET attrs = json_set(attrs, '$.migration', json(?1)), updated_at = ?2 WHERE id = ?3",
+            libsql::params![migration.to_string(), now, target_id],
         )
         .await?;
-    emit(&state.conn, workspace_id, "storage.migrated", Some(target_id), "api", &progress).await?;
+    Ok(())
+}
+
+/// Stamps the terminal `attrs.migration` state (`done` or `failed`) with the
+/// object-copy report, merged from `run_migration`'s own success/failure
+/// path (not the panic/error fallback - see `mark_migration_failed`).
+async fn mark_migration_finished(
+    state: &AppState,
+    target_id: &str,
+    migration_id: &str,
+    status: &str,
+    progress: &Value,
+    error: Option<&str>,
+) -> ApiResult<()> {
+    let mut migration = progress.clone();
+    migration["id"] = json!(migration_id);
+    migration["status"] = json!(status);
+    migration["finished_at"] = json!(now_secs());
+    if let Some(e) = error {
+        migration["error"] = json!(e);
+    }
+    state
+        .conn
+        .execute(
+            "UPDATE entities SET attrs = json_set(attrs, '$.migration', json(?1)), updated_at = ?2 WHERE id = ?3",
+            libsql::params![migration.to_string(), now_secs(), target_id],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Terminal failure path for an error `run_migration` returned before it
+/// could compute a progress report (e.g. the backend factory or live-set
+/// scan itself failed) - `migrate()`'s spawned task calls this directly.
+async fn mark_migration_failed(state: &AppState, target_id: &str, migration_id: &str, error: &str) -> ApiResult<()> {
+    let now = now_secs();
+    let migration = json!({ "id": migration_id, "status": "failed", "finished_at": now, "error": error });
+    state
+        .conn
+        .execute(
+            "UPDATE entities SET attrs = json_set(attrs, '$.migration', json(?1)), updated_at = ?2 WHERE id = ?3",
+            libsql::params![migration.to_string(), now, target_id],
+        )
+        .await?;
     Ok(())
 }
 

@@ -97,6 +97,25 @@ async fn register(app: &Router, name: &str) -> String {
     body["workspace_id"].as_str().unwrap().to_string()
 }
 
+/// Migration progress lives on the target backend entity's `attrs.migration`
+/// (finding 11: the migration must not create a `jobs` row `lifeos-drain`
+/// could claim and stub-complete out from under the in-process run). Polls
+/// `/api/storage/backends` until that field reaches a terminal status.
+async fn poll_migration_status(app: &Router, ws: &str, backend_id: &str) -> String {
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, backends) = send(app, "GET", &format!("/api/storage/backends?workspace_id={ws}"), None).await;
+        if let Some(backend) = backends.as_array().into_iter().flatten().find(|b| b["id"] == backend_id) {
+            status = backend["attrs"]["migration"]["status"].as_str().unwrap_or("").to_string();
+            if status == "done" || status == "failed" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    status
+}
+
 #[tokio::test]
 async fn creating_a_backend_only_drafts_it_pending_approval() {
     let ta = test_app().await;
@@ -265,21 +284,17 @@ async fn migrate_moves_blobs_and_reads_fall_back_by_the_same_blob_ref() {
     )
     .await;
     assert_eq!(st, StatusCode::ACCEPTED, "{resp:?}");
-    let job_id = resp["job_id"].as_str().unwrap().to_string();
+    assert!(resp["migration_id"].as_str().is_some(), "{resp:?}");
 
-    // The migration runs async - poll the job until it finishes.
-    let mut status = String::new();
-    for _ in 0..100 {
-        let (_, jobs) = send(&ta.router, "GET", &format!("/api/jobs?workspace_id={ws}"), None).await;
-        if let Some(job) = jobs.as_array().into_iter().flatten().find(|j| j["id"] == job_id.as_str()) {
-            status = job["status"].as_str().unwrap_or("").to_string();
-            if status == "done" || status == "failed" {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    // The migration runs async - poll attrs.migration until it finishes.
+    let status = poll_migration_status(&ta.router, &ws, &backend_id).await;
     assert_eq!(status, "done");
+
+    // No drain-claimable jobs row exists for this migration - it ran
+    // entirely in-process, so `jobs` must have nothing of kind
+    // 'storage_migrate' for this workspace (finding 11: double-claim).
+    let (_, jobs) = send(&ta.router, "GET", &format!("/api/jobs?workspace_id={ws}&kind=storage_migrate"), None).await;
+    assert_eq!(jobs.as_array().map(|a| a.len()).unwrap_or(0), 0, "{jobs:?}");
 
     // Primary pointer flipped to the target.
     let (_, backends) = send(&ta.router, "GET", &format!("/api/storage/backends?workspace_id={ws}"), None).await;
@@ -350,18 +365,8 @@ async fn encrypted_backend_stores_ciphertext_and_fetch_decrypts() {
     )
     .await;
     assert_eq!(st, StatusCode::ACCEPTED, "{resp:?}");
-    let job_id = resp["job_id"].as_str().unwrap().to_string();
-    let mut status = String::new();
-    for _ in 0..100 {
-        let (_, jobs) = send(&ta.router, "GET", &format!("/api/jobs?workspace_id={ws}"), None).await;
-        if let Some(job) = jobs.as_array().into_iter().flatten().find(|j| j["id"] == job_id.as_str()) {
-            status = job["status"].as_str().unwrap_or("").to_string();
-            if status == "done" || status == "failed" {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    assert!(resp["migration_id"].as_str().is_some(), "{resp:?}");
+    let status = poll_migration_status(&ta.router, &ws, &backend_id).await;
     assert_eq!(status, "done");
 
     // The provider's directory never contains the plaintext marker.

@@ -47,64 +47,83 @@ pub async fn create(
         .execute(
             "INSERT INTO configs (id, workspace_id, kind, payload, status, shadow_summary, created_at, promoted_at) \
              VALUES (?1, ?2, ?3, ?4, 'draft', NULL, ?5, NULL)",
-            libsql::params![id.clone(), workspace_id, req.kind, payload_str, now],
+            libsql::params![id.clone(), workspace_id.clone(), req.kind, payload_str, now],
         )
         .await?;
 
-    row_json(&state, &id).await
+    row_json(&state, &workspace_id, &id).await
 }
 
 #[derive(Deserialize)]
 pub struct ShadowBody {
     shadow_summary: Value,
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 /// Attaches a shadow-replay summary (computed by the caller against
 /// `route.jsonl` - replay logic lives in one place, not duplicated into
 /// Rust) and moves the candidate to `status='shadow'`.
+///
+/// Scoped to the caller's resolved workspace (issue: cross-tenant IDOR) -
+/// a config belonging to another workspace is invisible (404), not just
+/// role-gated.
 pub async fn shadow(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<ShadowBody>,
 ) -> ApiResult<Json<Value>> {
-    require_status(&state, &id, "draft").await?;
+    let workspace_id = resolve_workspace(&headers, &state.config, req.workspace_id.as_deref())?;
+    require_status(&state, &workspace_id, &id, "draft").await?;
     let summary_str = serde_json::to_string(&req.shadow_summary).unwrap_or_else(|_| "{}".into());
-    state
+    let rows_changed = state
         .conn
         .execute(
-            "UPDATE configs SET status = 'shadow', shadow_summary = ?2 WHERE id = ?1",
-            libsql::params![id.clone(), summary_str],
+            "UPDATE configs SET status = 'shadow', shadow_summary = ?2 WHERE id = ?1 AND workspace_id = ?3",
+            libsql::params![id.clone(), summary_str, workspace_id.clone()],
         )
         .await?;
-    row_json(&state, &id).await
+    if rows_changed == 0 {
+        return Err(ApiError::NotFound(format!("config '{id}' not found")));
+    }
+    row_json(&state, &workspace_id, &id).await
 }
 
 /// Human-gated: flips the active pointer for this config's `kind` to this
 /// id, marks it `promoted`, and emits `events(type='config.promoted')`.
 /// Never called by an agent/hook/cron - only `harness config promote`
 /// (human-typed CLI) calls this route.
+///
+/// Scoped to the caller's resolved workspace (issue: cross-tenant IDOR) -
+/// a config belonging to another workspace is invisible (404), not just
+/// role-gated.
 pub async fn promote(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let cfg = load_config(&state, &id).await?;
-    let workspace_id = cfg["workspace_id"].as_str().unwrap_or_default().to_string();
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
+    let cfg = load_config(&state, &workspace_id, &id).await?;
     let kind = cfg["kind"].as_str().unwrap_or_default().to_string();
     let now = now_secs();
 
     let previous_ref = active_ref(&state, &workspace_id, &kind).await?;
 
-    state
+    let rows_changed = state
         .conn
         .execute(
-            "UPDATE configs SET status = 'promoted', promoted_at = ?2 WHERE id = ?1",
-            libsql::params![id.clone(), now],
+            "UPDATE configs SET status = 'promoted', promoted_at = ?2 WHERE id = ?1 AND workspace_id = ?3",
+            libsql::params![id.clone(), now, workspace_id.clone()],
         )
         .await?;
+    if rows_changed == 0 {
+        return Err(ApiError::NotFound(format!("config '{id}' not found")));
+    }
     upsert_active_ref(&state, &workspace_id, &kind, &id, now).await?;
     emit_event(&state, &workspace_id, "config.promoted", &id, &kind, previous_ref.as_deref()).await?;
 
-    row_json(&state, &id).await
+    row_json(&state, &workspace_id, &id).await
 }
 
 #[derive(Deserialize)]
@@ -145,7 +164,7 @@ pub async fn rollback(
     upsert_active_ref(&state, &workspace_id, &req.kind, &target_id, now).await?;
     emit_event(&state, &workspace_id, "config.rolledback", &target_id, &req.kind, current_ref.as_deref()).await?;
 
-    row_json(&state, &target_id).await
+    row_json(&state, &workspace_id, &target_id).await
 }
 
 #[derive(Deserialize)]
@@ -200,8 +219,8 @@ pub async fn list(
     Ok(Json(json!({ "configs": configs, "active": active })))
 }
 
-async fn require_status(state: &AppState, id: &str, expected: &str) -> ApiResult<()> {
-    let cfg = load_config(state, id).await?;
+async fn require_status(state: &AppState, workspace_id: &str, id: &str, expected: &str) -> ApiResult<()> {
+    let cfg = load_config(state, workspace_id, id).await?;
     if cfg["status"].as_str() != Some(expected) {
         return Err(ApiError::BadRequest(format!(
             "config '{id}' must be in status '{expected}' (is '{}')",
@@ -211,13 +230,16 @@ async fn require_status(state: &AppState, id: &str, expected: &str) -> ApiResult
     Ok(())
 }
 
-async fn load_config(state: &AppState, id: &str) -> ApiResult<Value> {
+/// Loads a config scoped to the caller's workspace. A config that exists but
+/// belongs to another workspace is indistinguishable from one that does not
+/// exist at all (404, not 403) - the same shape as `approval::read_entity_scoped`.
+async fn load_config(state: &AppState, workspace_id: &str, id: &str) -> ApiResult<Value> {
     let mut rows = state
         .conn
         .query(
             "SELECT id, workspace_id, kind, payload, status, shadow_summary, created_at, promoted_at \
-             FROM configs WHERE id = ?1",
-            libsql::params![id],
+             FROM configs WHERE id = ?1 AND workspace_id = ?2",
+            libsql::params![id, workspace_id],
         )
         .await?;
     match rows.next().await? {
@@ -226,8 +248,8 @@ async fn load_config(state: &AppState, id: &str) -> ApiResult<Value> {
     }
 }
 
-async fn row_json(state: &AppState, id: &str) -> ApiResult<Json<Value>> {
-    Ok(Json(load_config(state, id).await?))
+async fn row_json(state: &AppState, workspace_id: &str, id: &str) -> ApiResult<Json<Value>> {
+    Ok(Json(load_config(state, workspace_id, id).await?))
 }
 
 fn row_to_json(row: &libsql::Row) -> ApiResult<Value> {

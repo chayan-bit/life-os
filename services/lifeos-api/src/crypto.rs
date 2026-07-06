@@ -64,10 +64,31 @@ pub fn random_key() -> EncryptionKey {
     key
 }
 
+/// Decodes a base64-encoded raw key blob (as stored, encrypted, in
+/// `envelope_key_enc`) into an [`EncryptionKey`] after decrypting it under
+/// the server's master key.
+fn decrypt_envelope_key(enc: &str, master_key: &EncryptionKey) -> Result<EncryptionKey, ApiError> {
+    let raw = decrypt(enc, master_key)?;
+    let bytes = STANDARD
+        .decode(raw)
+        .map_err(|_| ApiError::Internal("envelope_key_enc did not decode to raw key bytes".into()))?;
+    bytes
+        .try_into()
+        .map_err(|_| ApiError::Internal("envelope key is not 32 bytes".into()))
+}
+
 /// Ensures `workspaces.envelope_key_enc` is set, generating + storing one
 /// under the server's master key if it isn't yet. Idempotent. Shared by
 /// database-per-workspace provisioning (issue #104) and client-side blob
 /// encryption (issue #110) so both derive the same per-workspace key.
+///
+/// The generate-then-store step is a compare-and-swap
+/// (`UPDATE ... WHERE envelope_key_enc IS NULL`) rather than an unconditional
+/// write: two concurrent callers can both observe NULL and mint different
+/// random keys, and an unconditional UPDATE would let the second writer's key
+/// silently clobber the first, permanently orphaning anything already
+/// encrypted under the first key. When the CAS loses (`rows_changed == 0`),
+/// this re-reads whichever key actually won and returns that instead.
 pub async fn ensure_envelope_key(
     conn: &libsql::Connection,
     master_key: &EncryptionKey,
@@ -84,23 +105,37 @@ pub async fn ensure_envelope_key(
         None => return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'"))),
     };
     if let Some(enc) = existing {
-        let raw = decrypt(&enc, master_key)?;
-        let bytes = STANDARD
-            .decode(raw)
-            .map_err(|_| ApiError::Internal("envelope_key_enc did not decode to raw key bytes".into()))?;
-        return bytes
-            .try_into()
-            .map_err(|_| ApiError::Internal("envelope key is not 32 bytes".into()));
+        return decrypt_envelope_key(&enc, master_key);
     }
 
     let key = random_key();
     let key_b64 = STANDARD.encode(key);
     let enc = encrypt(&key_b64, master_key)?;
-    conn.execute(
-        "UPDATE workspaces SET envelope_key_enc = ?1, updated_at = ?2 WHERE id = ?3",
-        libsql::params![enc, crate::ids::now_secs(), workspace_id],
-    )
-    .await?;
+    let rows_changed = conn
+        .execute(
+            "UPDATE workspaces SET envelope_key_enc = ?1, updated_at = ?2 WHERE id = ?3 AND envelope_key_enc IS NULL",
+            libsql::params![enc, crate::ids::now_secs(), workspace_id],
+        )
+        .await?;
+    if rows_changed == 0 {
+        // Lost the race: another caller already wrote a key between our
+        // SELECT and this UPDATE. Re-read and return the winner's key
+        // rather than the one we just generated locally.
+        let mut rows = conn
+            .query(
+                "SELECT envelope_key_enc FROM workspaces WHERE id = ?1",
+                libsql::params![workspace_id],
+            )
+            .await?;
+        let winner: Option<String> = match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => return Err(ApiError::BadRequest(format!("unknown workspace '{workspace_id}'"))),
+        };
+        let enc = winner.ok_or_else(|| {
+            ApiError::Internal("envelope_key_enc CAS lost but re-read found no key".into())
+        })?;
+        return decrypt_envelope_key(&enc, master_key);
+    }
     Ok(key)
 }
 
@@ -145,5 +180,116 @@ mod tests {
     fn rejects_wrong_length_key() {
         let encoded = STANDARD.encode([1u8; 16]);
         assert!(parse_key(&encoded).is_err());
+    }
+
+    async fn test_conn_with_workspace(workspace_id: &str) -> libsql::Connection {
+        let db = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE workspaces (id TEXT PRIMARY KEY, envelope_key_enc TEXT, updated_at INTEGER)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (id, envelope_key_enc, updated_at) VALUES (?1, NULL, 0)",
+            libsql::params![workspace_id],
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn ensure_envelope_key_generates_and_persists_when_absent() {
+        let conn = test_conn_with_workspace("ws-1").await;
+        let master_key = test_key();
+
+        let key = ensure_envelope_key(&conn, &master_key, "ws-1").await.unwrap();
+
+        let mut rows = conn
+            .query("SELECT envelope_key_enc FROM workspaces WHERE id = 'ws-1'", ())
+            .await
+            .unwrap();
+        let enc: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(decrypt_envelope_key(&enc, &master_key).unwrap(), key);
+    }
+
+    #[tokio::test]
+    async fn ensure_envelope_key_is_idempotent_on_repeat_calls() {
+        let conn = test_conn_with_workspace("ws-1").await;
+        let master_key = test_key();
+
+        let first = ensure_envelope_key(&conn, &master_key, "ws-1").await.unwrap();
+        let second = ensure_envelope_key(&conn, &master_key, "ws-1").await.unwrap();
+
+        assert_eq!(first, second, "repeat calls must return the same persisted key");
+    }
+
+    /// Regression test for the read-then-write race (finding 16): if a key
+    /// is already persisted by the time the CAS UPDATE runs (simulating a
+    /// concurrent winner), ensure_envelope_key must return the winner's key,
+    /// not silently overwrite it with a freshly generated one.
+    #[tokio::test]
+    async fn ensure_envelope_key_returns_winner_when_cas_loses_the_race() {
+        let conn = test_conn_with_workspace("ws-1").await;
+        let master_key = test_key();
+
+        // Simulate a concurrent caller that already won: pre-populate the
+        // row with an already-persisted envelope key.
+        let winner_key = random_key();
+        let winner_enc = encrypt(&STANDARD.encode(winner_key), &master_key).unwrap();
+        conn.execute(
+            "UPDATE workspaces SET envelope_key_enc = ?1 WHERE id = 'ws-1'",
+            libsql::params![winner_enc.clone()],
+        )
+        .await
+        .unwrap();
+
+        // A caller that (in a real race) already generated its own key
+        // before reaching the CAS UPDATE must still end up with the
+        // winner's key, because the SELECT above now finds it present.
+        let result = ensure_envelope_key(&conn, &master_key, "ws-1").await.unwrap();
+        assert_eq!(result, winner_key, "must return the already-persisted winner's key");
+
+        // The row must still hold the winner's ciphertext, untouched.
+        let mut rows = conn
+            .query("SELECT envelope_key_enc FROM workspaces WHERE id = 'ws-1'", ())
+            .await
+            .unwrap();
+        let enc: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(enc, winner_enc, "the pre-existing key must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn ensure_envelope_key_cas_branch_returns_pre_existing_key_not_local_generation() {
+        // Directly exercises the rows_changed == 0 branch: pre-populate the
+        // row with envelope_key_enc already NOT NULL, so the CAS UPDATE
+        // (`WHERE envelope_key_enc IS NULL`) is guaranteed to match zero
+        // rows regardless of timing, then assert the returned key is the
+        // pre-existing one rather than a freshly minted local key.
+        let conn = test_conn_with_workspace("ws-1").await;
+        let master_key = test_key();
+        let pre_existing_key = random_key();
+        let pre_existing_enc = encrypt(&STANDARD.encode(pre_existing_key), &master_key).unwrap();
+        conn.execute(
+            "UPDATE workspaces SET envelope_key_enc = ?1 WHERE id = 'ws-1'",
+            libsql::params![pre_existing_enc],
+        )
+        .await
+        .unwrap();
+
+        let result = ensure_envelope_key(&conn, &master_key, "ws-1").await.unwrap();
+
+        assert_eq!(result, pre_existing_key);
+    }
+
+    #[tokio::test]
+    async fn ensure_envelope_key_errors_on_unknown_workspace() {
+        let conn = test_conn_with_workspace("ws-1").await;
+        let master_key = test_key();
+
+        let err = ensure_envelope_key(&conn, &master_key, "does-not-exist").await;
+        assert!(err.is_err());
     }
 }
