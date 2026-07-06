@@ -4,19 +4,19 @@
 //! (`HeuristicJudge`, kept as the always-available fallback) to a real
 //! Haiku judge call, content-cached (BLAKE3 hash -> one `entities` row,
 //! "zero new tables") and sampled (deterministic hash-based sampling, not
-//! `rand`, so tests stay reproducible). Mirrors
-//! `lifeos-ingest/src/vision.rs::HaikuCaptioner`'s direct-`reqwest`,
-//! env-gated pattern - no Rust "Claude Agent SDK" exists in this
-//! workspace.
+//! `rand`, so tests stay reproducible). The Anthropic request itself goes
+//! through the crate's shared `anthropic::AnthropicClient` (audit finding
+//! 30) rather than a hand-rolled `reqwest` call.
 
+use crate::anthropic::AnthropicClient;
 use async_trait::async_trait;
 use libsql::{params, Connection};
 use serde_json::Value;
 
-const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-const JUDGE_MODEL: &str = "claude-haiku-4-5-20251001";
-const JUDGE_RUBRIC: &str = "You are a quality judge for an AI pipeline stage's output. \
+/// The judge rubric, `pub` so `lifeos-drain`'s agent-CLI judge reuses this
+/// single copy instead of duplicating a near-identical string (audit
+/// finding 31).
+pub const JUDGE_RUBRIC: &str = "You are a quality judge for an AI pipeline stage's output. \
 Score 1-5 on whether it is complete, non-empty, and usable as-is (5 = ship it, 1 = empty or unusable). \
 Respond with ONLY strict JSON: {\"score\": <1-5>, \"rationale\": \"<one sentence>\"}.";
 
@@ -48,7 +48,8 @@ impl Judge for HeuristicJudge {
     }
 }
 
-/// Real judging via the Anthropic Messages API (Haiku).
+/// Real judging via the Anthropic Messages API (Haiku), through the shared
+/// `AnthropicClient`.
 pub struct HaikuJudge {
     pub api_key: String,
 }
@@ -56,56 +57,36 @@ pub struct HaikuJudge {
 #[async_trait]
 impl Judge for HaikuJudge {
     async fn score(&self, content: &str) -> Result<(f64, String), String> {
-        let body = serde_json::json!({
-            "model": JUDGE_MODEL,
-            "max_tokens": 200,
-            "system": JUDGE_RUBRIC,
-            "messages": [{ "role": "user", "content": content }],
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("anthropic request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("anthropic api error {status}: {text}"));
-        }
-
-        let parsed: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("anthropic response parse failed: {e}"))?;
-        let text = parsed
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|block| block.get("text"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| "anthropic response had no judge text".to_string())?;
-
-        let judged: Value = serde_json::from_str(text.trim())
-            .map_err(|e| format!("judge response was not valid JSON: {e} (text: {text})"))?;
-        let raw_score = judged
-            .get("score")
-            .and_then(|s| s.as_f64())
-            .ok_or_else(|| "judge response missing numeric score".to_string())?;
-        let rationale = judged
-            .get("rationale")
-            .and_then(|r| r.as_str())
-            .unwrap_or("no rationale given")
-            .to_string();
-
-        Ok(((raw_score / 5.0).clamp(0.0, 1.0), rationale))
+        let client = AnthropicClient::new(self.api_key.clone());
+        let completion = client.complete(Some(JUDGE_RUBRIC), content, 200).await?;
+        parse_judge_json(&completion.text)
     }
+}
+
+/// Parse a judge model's reply (`{"score": 1-5, "rationale": "..."}`) into a
+/// normalized 0.0-1.0 score + rationale. Tolerant of a ```json code fence,
+/// which agent CLIs sometimes add and a raw API call never does - so it is
+/// the one parser both the API judge here and `lifeos-drain`'s agent-CLI
+/// judge share (audit finding 31). `pub` for that cross-crate reuse.
+pub fn parse_judge_json(text: &str) -> Result<(f64, String), String> {
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let judged: Value = serde_json::from_str(cleaned)
+        .map_err(|e| format!("judge response was not valid JSON: {e} (text: {text})"))?;
+    let raw_score = judged
+        .get("score")
+        .and_then(|s| s.as_f64())
+        .ok_or_else(|| "judge response missing numeric score".to_string())?;
+    let rationale = judged
+        .get("rationale")
+        .and_then(|r| r.as_str())
+        .unwrap_or("no rationale given")
+        .to_string();
+    Ok(((raw_score / 5.0).clamp(0.0, 1.0), rationale))
 }
 
 /// BLAKE3 content hash used both as the cache key and the sampling seed.
@@ -237,6 +218,21 @@ mod tests {
     fn content_hash_is_deterministic() {
         assert_eq!(content_hash("same text"), content_hash("same text"));
         assert_ne!(content_hash("a"), content_hash("b"));
+    }
+
+    #[test]
+    fn parse_judge_json_reads_plain_fenced_and_clamps() {
+        let (score, rationale) = parse_judge_json(r#"{"score": 4, "rationale": "solid"}"#).unwrap();
+        assert!((score - 0.8).abs() < 1e-9);
+        assert_eq!(rationale, "solid");
+
+        let fenced = "```json\n{\"score\": 5, \"rationale\": \"ship it\"}\n```";
+        assert!((parse_judge_json(fenced).unwrap().0 - 1.0).abs() < 1e-9);
+
+        // Out-of-range score is clamped into 0.0-1.0.
+        assert!((parse_judge_json(r#"{"score": 9, "rationale": "x"}"#).unwrap().0 - 1.0).abs() < 1e-9);
+
+        assert!(parse_judge_json("not json").is_err());
     }
 
     #[test]

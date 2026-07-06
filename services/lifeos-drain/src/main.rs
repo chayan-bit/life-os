@@ -42,7 +42,7 @@ use libsql::Builder;
 use lifeos_drain::ai::{AgentCliCaptioner, AgentCliJudge, AgentCliModel, AgentCliStageRunner};
 use lifeos_drain::{
     claim_job, claim_next_module_request, complete_job, dispatch, fail_job, notify_pipeline_gated,
-    reap_stuck, run_approval_resume_from_payload, run_daily_brief, run_module_build, run_voice_turn,
+    reap_stuck, run_daily_brief, run_execute_approval, run_module_build, run_voice_turn,
     AgentTurnRunner, BuildResumer, Dispatch, DrainConfig, IngestVoiceTranscriber, NodeAgentRunner,
     NoopNotifier, Notifier, ScaffoldJsBuilder, ScaffoldJsResumer, TelegramNotifier, VoiceTurnPayload,
 };
@@ -280,6 +280,10 @@ async fn main() {
     if telegram_admin_chat_id.is_none() {
         println!("lifeos-drain: TELEGRAM_ADMIN_CHAT_ID not set, gated pipeline rationales will only be logged");
     }
+    // Retention window for the prune tick (waste audit): terminal jobs and
+    // expired/revoked sessions older than this are reaped. `events` is never
+    // pruned (append-only domain log, a hard rule).
+    let job_retention_secs = env_int("LIFEOS_JOB_RETENTION_DAYS", 7).max(1) * 86_400;
 
     loop {
         match claim_job(&conn, &worker_id, now_secs(), cfg).await {
@@ -359,6 +363,15 @@ async fn main() {
             Ok(_) => {}
             Err(e) => eprintln!("lifeos-drain: push notification tick failed: {e}"),
         }
+        // Retention prune (waste audit): terminal jobs + expired/revoked
+        // sessions older than LIFEOS_JOB_RETENTION_DAYS. Never touches `events`.
+        match lifeos_drain::prune_old_jobs_and_sessions(&conn, job_retention_secs, now_secs()).await {
+            Ok((jobs, sessions)) if jobs > 0 || sessions > 0 => {
+                println!("lifeos-drain: pruned {jobs} old job(s), {sessions} expired session(s)")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("lifeos-drain: prune tick failed: {e}"),
+        }
         sleep(poll).await;
     }
 }
@@ -388,11 +401,21 @@ async fn run_job(
     println!("lifeos-drain: claimed {} (kind={})", job.id, job.kind);
     let result = match dispatch(&job.kind) {
         Dispatch::Stub(handler) => {
-            // `execute_approval` (issue #142) is acknowledged as a stub, but an
-            // approved BUILD gate must re-enter the pipeline here (the resume
-            // path lib.rs owns) rather than being a bare no-op.
+            // `execute_approval` (issue #142 + audit finding 10): an approved
+            // BUILD gate re-enters the pipeline; an approved outward-send
+            // draft with no executor yet FAILS loudly + notifies rather than
+            // silently completing. All handled in lib.rs's `run_execute_approval`.
             if job.kind == "execute_approval" {
-                run_execute_approval(conn, resumer, job, worker_id, build_pipeline).await
+                run_execute_approval(
+                    conn,
+                    resumer,
+                    notifier,
+                    telegram_admin_chat_id,
+                    job,
+                    worker_id,
+                    build_pipeline,
+                )
+                .await
             } else {
                 println!("lifeos-drain: {} -> {handler} (stub, no-op this phase)", job.id);
                 complete_job(conn, &job.id, worker_id).await
@@ -558,33 +581,5 @@ async fn run_job(
         ),
         Ok(_) => {}
         Err(e) => eprintln!("lifeos-drain: status update for {} failed: {e}", job.id),
-    }
-}
-
-/// Handles a claimed `execute_approval` job (issue #142): resume the build
-/// pipeline for an approved gate, or acknowledge a non-build approval. A build
-/// resume that fails is surfaced honestly (the job is failed); everything else
-/// completes. The resume is gated on `build_pipeline` (trusted-Mac only) inside
-/// `run_approval_resume_from_payload`.
-async fn run_execute_approval(
-    conn: &libsql::Connection,
-    resumer: &dyn BuildResumer,
-    job: &lifeos_drain::ClaimedJob,
-    worker_id: &str,
-    build_pipeline: bool,
-) -> libsql::Result<u64> {
-    match run_approval_resume_from_payload(resumer, &job.payload, &job.workspace_id, build_pipeline).await {
-        None => {
-            println!("lifeos-drain: {} execute_approval acknowledged (no build to resume)", job.id);
-            complete_job(conn, &job.id, worker_id).await
-        }
-        Some(Ok(run_id)) => {
-            println!("lifeos-drain: {} execute_approval resumed build -> {run_id}", job.id);
-            complete_job(conn, &job.id, worker_id).await
-        }
-        Some(Err(e)) => {
-            eprintln!("lifeos-drain: {} execute_approval resume failed: {e} - failing", job.id);
-            fail_job(conn, &job.id, worker_id).await
-        }
     }
 }

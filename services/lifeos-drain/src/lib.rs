@@ -675,6 +675,108 @@ pub async fn run_approval_resume_from_payload(
     run_approval_resume(resumer, &payload, workspace_id, build_pipeline).await
 }
 
+/// What to do with an approved entity that is NOT a build gate to resume
+/// (i.e. `run_approval_resume` returned `None`). Split out as a pure decision
+/// so the "never silently complete an outward send" rule (audit finding 10)
+/// is directly unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonBuildApproval {
+    /// Acknowledge (complete the job) - the approval has no outward effect
+    /// this drain owns. Two cases: a `storage_backend` switch (lifeos-api
+    /// runs the real migration via a separate `storage_migrate` path), and a
+    /// build gate (`pending_approval`) seen on an untrusted node whose
+    /// `LIFEOS_BUILD_PIPELINE` is off - the trusted Mac resumes that, so
+    /// acknowledging here is the unchanged, correct behavior.
+    Acknowledge,
+    /// An approved outward-send draft (email / calendar / whatsapp / slack /
+    /// drive / social / ...). The real outward executor is a separate,
+    /// not-yet-built issue, so the job must FAIL loudly and the approver be
+    /// told - never report `done` for a send that never happened.
+    OutwardUnimplemented,
+}
+
+/// Classify a non-build approval by its entity type. Denylist, not allowlist:
+/// only the types we know carry no outward send here are acknowledged; every
+/// other type (all the open-ended `{provider}_{action}` draft types) is
+/// treated as an unimplemented outward send and failed, so a newly-added
+/// provider can never silently regress to "reported done, nothing sent".
+pub fn classify_non_build_approval(entity_type: &str) -> NonBuildApproval {
+    match entity_type {
+        // lifeos-api owns the real storage migration (issue #108).
+        "storage_backend" => NonBuildApproval::Acknowledge,
+        // A build gate that only reached here because this node can't resume
+        // builds (untrusted). The trusted Mac resumes it.
+        "pending_approval" => NonBuildApproval::Acknowledge,
+        // A malformed/empty payload is not an outward send - acknowledge
+        // rather than fabricate a "not sent" alarm.
+        "" => NonBuildApproval::Acknowledge,
+        _ => NonBuildApproval::OutwardUnimplemented,
+    }
+}
+
+/// The approver-facing message for an approved-but-unexecuted outward send.
+pub fn outward_unimplemented_message(entity_type: &str) -> String {
+    format!("Approved {entity_type} but outward execution is not yet implemented - not sent.")
+}
+
+/// The approved entity's type from an `execute_approval` job payload; empty
+/// string for a malformed payload (never a build gate or a known outward
+/// send, so it is acknowledged).
+fn execute_approval_entity_type(payload_json: &str) -> String {
+    serde_json::from_str::<ExecuteApprovalPayload>(payload_json)
+        .unwrap_or_default()
+        .entity_type
+}
+
+/// Handles a claimed `execute_approval` job (issue #142 + audit finding 10):
+/// resume the build pipeline for an approved gate; acknowledge a
+/// storage-backend / untrusted-node / malformed approval; and for an approved
+/// outward-send draft with no executor yet, FAIL the job and notify the
+/// approver instead of silently reporting `done`. Kept here (DI over trait
+/// objects) so it is unit-testable without a `node` process or a live
+/// Telegram call. Returns the rows the status write touched (0 = lease lost).
+pub async fn run_execute_approval(
+    conn: &Connection,
+    resumer: &dyn BuildResumer,
+    notifier: &dyn Notifier,
+    admin_chat_id: Option<&str>,
+    job: &ClaimedJob,
+    worker_id: &str,
+    build_pipeline: bool,
+) -> libsql::Result<u64> {
+    match run_approval_resume_from_payload(resumer, &job.payload, &job.workspace_id, build_pipeline).await {
+        Some(Ok(run_id)) => {
+            println!("lifeos-drain: {} execute_approval resumed build -> {run_id}", job.id);
+            complete_job(conn, &job.id, worker_id).await
+        }
+        Some(Err(e)) => {
+            eprintln!("lifeos-drain: {} execute_approval resume failed: {e} - failing", job.id);
+            fail_job(conn, &job.id, worker_id).await
+        }
+        None => {
+            let entity_type = execute_approval_entity_type(&job.payload);
+            match classify_non_build_approval(&entity_type) {
+                NonBuildApproval::Acknowledge => {
+                    println!(
+                        "lifeos-drain: {} execute_approval acknowledged ('{entity_type}', no build to resume)",
+                        job.id
+                    );
+                    complete_job(conn, &job.id, worker_id).await
+                }
+                NonBuildApproval::OutwardUnimplemented => {
+                    let msg = outward_unimplemented_message(&entity_type);
+                    eprintln!("lifeos-drain: {} execute_approval {msg} - failing", job.id);
+                    match admin_chat_id {
+                        Some(chat) => notifier.notify(chat, &msg).await,
+                        None => println!("lifeos-drain: {} (no admin chat configured) {msg}", job.id),
+                    }
+                    fail_job(conn, &job.id, worker_id).await
+                }
+            }
+        }
+    }
+}
+
 /// Runs a claimed module request's build to completion: calls `builder`,
 /// applies the matching `module_requests` transition, and notifies the
 /// requester's chat (if any). This is the orchestration `main.rs`'s loop
@@ -998,6 +1100,54 @@ pub async fn run_daily_brief(
         None => println!("lifeos-drain: daily brief for {workspace_id} (no admin chat configured): {brief}"),
     }
     Ok(())
+}
+
+// --------------------------------------------------------- retention (waste audit)
+//
+// `jobs` (including up-to-20MB base64 voice payloads) and `sessions` (auth
+// refresh-token rows) are otherwise never pruned and grow without bound. A
+// drain tick reaps the terminal, expired rows.
+
+/// Max rows deleted per prune call, so one tick never blocks the poll loop on
+/// a large backlog - successive ticks drain the rest.
+const PRUNE_BATCH: i64 = 500;
+
+/// Retention prune (waste audit): delete terminal (`done`/`failed`) jobs and
+/// expired-or-revoked auth `sessions` older than `retention_secs`, in one
+/// bounded batch per call. `events` is the append-only domain log (a hard
+/// rule) and is NEVER touched here. Only terminal jobs are eligible, so a
+/// `queued` or `running` job - including one another worker holds the lease
+/// on - is never pruned, keeping this lease-safe. Returns
+/// `(jobs_pruned, sessions_pruned)`.
+pub async fn prune_old_jobs_and_sessions(
+    conn: &Connection,
+    retention_secs: i64,
+    now: i64,
+) -> libsql::Result<(u64, u64)> {
+    let cutoff = now - retention_secs;
+    // DELETE ... WHERE id IN (SELECT ... LIMIT ?) rather than DELETE ... LIMIT
+    // so it works regardless of libSQL's UPDATE/DELETE-LIMIT compile flag.
+    let jobs_pruned = conn
+        .execute(
+            "DELETE FROM jobs WHERE id IN ( \
+                SELECT id FROM jobs \
+                WHERE status IN ('done', 'failed') AND created_at < ?1 \
+                LIMIT ?2 \
+             )",
+            params![cutoff, PRUNE_BATCH],
+        )
+        .await?;
+    let sessions_pruned = conn
+        .execute(
+            "DELETE FROM sessions WHERE id IN ( \
+                SELECT id FROM sessions \
+                WHERE (expires_at < ?1 OR (revoked_at IS NOT NULL AND revoked_at < ?1)) \
+                LIMIT ?2 \
+             )",
+            params![cutoff, PRUNE_BATCH],
+        )
+        .await?;
+    Ok((jobs_pruned, sessions_pruned))
 }
 
 #[cfg(test)]
@@ -1673,5 +1823,228 @@ mod tests {
         assert!(notes[0].1.contains("2 tasks due"));
 
         let _ = std::fs::remove_file("test_run_daily_brief.db");
+    }
+
+    // ---------------------------------------- execute_approval (audit finding 10)
+
+    async fn queue_conn(path: &str) -> Connection {
+        let conn = fresh_conn(path).await; // module_requests + events
+        conn.execute(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL, \
+                payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'queued', \
+                priority INTEGER DEFAULT 0, run_after INTEGER, claimed_by TEXT, claimed_at INTEGER, \
+                attempts INTEGER DEFAULT 0, created_at INTEGER NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    async fn insert_running_approval(conn: &Connection, id: &str, payload: &str) {
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, kind, payload, status, claimed_by, claimed_at, attempts, created_at) \
+             VALUES (?1, 'ws1', 'execute_approval', ?2, 'running', 'worker_1', 100, 1, 100)",
+            params![id, payload],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn job_status(conn: &Connection, id: &str) -> String {
+        let mut rows = conn.query("SELECT status FROM jobs WHERE id=?1", params![id]).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    fn claimed(id: &str, payload: &str) -> ClaimedJob {
+        ClaimedJob {
+            id: id.to_string(),
+            kind: "execute_approval".to_string(),
+            payload: payload.to_string(),
+            workspace_id: "ws1".to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_non_build_approval_only_fails_outward_sends() {
+        assert_eq!(classify_non_build_approval("storage_backend"), NonBuildApproval::Acknowledge);
+        assert_eq!(classify_non_build_approval("pending_approval"), NonBuildApproval::Acknowledge);
+        assert_eq!(classify_non_build_approval(""), NonBuildApproval::Acknowledge);
+        assert_eq!(classify_non_build_approval("draft"), NonBuildApproval::OutwardUnimplemented);
+        assert_eq!(classify_non_build_approval("gmail_send"), NonBuildApproval::OutwardUnimplemented);
+        assert_eq!(classify_non_build_approval("whatsapp_send"), NonBuildApproval::OutwardUnimplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_approval_outward_draft_fails_and_notifies_not_completes() {
+        let conn = queue_conn("test_ea_draft.db").await;
+        let payload = r#"{"entity_id":"ent_d","entity_type":"draft"}"#;
+        insert_running_approval(&conn, "job_draft", payload).await;
+        let resumer = MockResumer { result: Ok("unused".into()), calls: Mutex::new(vec![]) };
+        let notifier = MockNotifier::default();
+
+        let n = run_execute_approval(
+            &conn,
+            &resumer,
+            &notifier,
+            Some("admin_chat"),
+            &claimed("job_draft", payload),
+            "worker_1",
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Failed, not completed - never report `done` for a send that never happened.
+        assert_eq!(n, 1, "the fail write touched the running job");
+        assert_eq!(job_status(&conn, "job_draft").await, "failed");
+        // A draft is not a build gate, so the resumer is never invoked.
+        assert_eq!(resumer.calls.lock().unwrap().len(), 0);
+        // The approver was told, verbatim.
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "admin_chat");
+        assert_eq!(
+            calls[0].1,
+            "Approved draft but outward execution is not yet implemented - not sent."
+        );
+
+        let _ = std::fs::remove_file("test_ea_draft.db");
+    }
+
+    #[tokio::test]
+    async fn execute_approval_storage_backend_is_acknowledged_without_alarm() {
+        let conn = queue_conn("test_ea_storage.db").await;
+        let payload = r#"{"entity_id":"ent_s","entity_type":"storage_backend"}"#;
+        insert_running_approval(&conn, "job_storage", payload).await;
+        let resumer = MockResumer { result: Ok("unused".into()), calls: Mutex::new(vec![]) };
+        let notifier = MockNotifier::default();
+
+        run_execute_approval(
+            &conn,
+            &resumer,
+            &notifier,
+            Some("admin_chat"),
+            &claimed("job_storage", payload),
+            "worker_1",
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(job_status(&conn, "job_storage").await, "done");
+        assert_eq!(notifier.calls.lock().unwrap().len(), 0, "no 'not sent' alarm for a storage switch");
+
+        let _ = std::fs::remove_file("test_ea_storage.db");
+    }
+
+    #[tokio::test]
+    async fn execute_approval_build_gate_resumes_and_completes() {
+        let conn = queue_conn("test_ea_gate.db").await;
+        let payload = r#"{"entity_id":"ent_g","entity_type":"pending_approval"}"#;
+        insert_running_approval(&conn, "job_gate", payload).await;
+        let resumer = MockResumer { result: Ok("build_9".into()), calls: Mutex::new(vec![]) };
+        let notifier = MockNotifier::default();
+
+        run_execute_approval(
+            &conn,
+            &resumer,
+            &notifier,
+            Some("admin_chat"),
+            &claimed("job_gate", payload),
+            "worker_1",
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(job_status(&conn, "job_gate").await, "done");
+        assert_eq!(resumer.calls.lock().unwrap().len(), 1, "the gate build resumed once");
+        assert_eq!(notifier.calls.lock().unwrap().len(), 0);
+
+        let _ = std::fs::remove_file("test_ea_gate.db");
+    }
+
+    // ------------------------------------------------ retention prune (finding 40)
+
+    async fn prune_conn(path: &str) -> Connection {
+        let conn = fresh_conn(path).await; // module_requests + events
+        conn.execute_batch(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL, \
+                payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'queued', \
+                priority INTEGER DEFAULT 0, run_after INTEGER, claimed_by TEXT, claimed_at INTEGER, \
+                attempts INTEGER DEFAULT 0, created_at INTEGER NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, workspace_id TEXT NOT NULL, \
+                refresh_token_hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, \
+                revoked_at INTEGER);",
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    async fn count_all(conn: &Connection, sql: &str) -> i64 {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    async fn row_exists(conn: &Connection, table: &str, id: &str) -> bool {
+        let mut rows =
+            conn.query(&format!("SELECT 1 FROM {table} WHERE id=?1"), params![id]).await.unwrap();
+        rows.next().await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn prune_reaps_old_terminal_jobs_and_expired_sessions_but_keeps_the_rest_and_events() {
+        let conn = prune_conn("test_prune.db").await;
+        let now: i64 = 1_000_000;
+        let retention = 7 * 86_400; // 604800; cutoff = 395200
+        let recent = now - 10;
+
+        // done/failed older than the window -> pruned; recent done + queued +
+        // running -> kept (only terminal, old rows are eligible).
+        conn.execute_batch(&format!(
+            "INSERT INTO jobs (id, workspace_id, kind, status, created_at) VALUES \
+               ('j_done_old','ws1','ingest','done',100), \
+               ('j_failed_old','ws1','ingest','failed',200), \
+               ('j_done_recent','ws1','ingest','done',{recent}), \
+               ('j_queued_old','ws1','ingest','queued',100), \
+               ('j_running_old','ws1','ingest','running',100);"
+        ))
+        .await
+        .unwrap();
+
+        // long-expired + long-revoked -> pruned; active + recently-expired -> kept.
+        conn.execute_batch(&format!(
+            "INSERT INTO sessions (id, user_id, workspace_id, refresh_token_hash, created_at, expires_at, revoked_at) VALUES \
+               ('s_expired_old','u','ws1','h',10,100,NULL), \
+               ('s_revoked_old','u','ws1','h',10,2000000,200), \
+               ('s_active','u','ws1','h',10,2000000,NULL), \
+               ('s_expired_recent','u','ws1','h',10,{recent},NULL);"
+        ))
+        .await
+        .unwrap();
+
+        // An events row (append-only domain log) must survive untouched.
+        emit_event(&conn, "ws1", "note.captured", "", "user", &serde_json::json!({}), 100).await.unwrap();
+
+        let (jobs, sessions) = prune_old_jobs_and_sessions(&conn, retention, now).await.unwrap();
+        assert_eq!(jobs, 2);
+        assert_eq!(sessions, 2);
+
+        assert_eq!(count_all(&conn, "SELECT COUNT(*) FROM jobs").await, 3);
+        for id in ["j_done_recent", "j_queued_old", "j_running_old"] {
+            assert!(row_exists(&conn, "jobs", id).await, "{id} should be kept");
+        }
+
+        assert_eq!(count_all(&conn, "SELECT COUNT(*) FROM sessions").await, 2);
+        for id in ["s_active", "s_expired_recent"] {
+            assert!(row_exists(&conn, "sessions", id).await, "{id} should be kept");
+        }
+
+        // events is never touched by the prune.
+        assert_eq!(event_count(&conn, "note.captured").await, 1);
+
+        let _ = std::fs::remove_file("test_prune.db");
     }
 }

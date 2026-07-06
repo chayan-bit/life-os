@@ -2,18 +2,13 @@
 //! `lifeos-ingest/src/vision.rs::Captioner`: a `NoopStageRunner` fails
 //! loudly (a pipeline stage is not optional - unlike OCR in the ingest
 //! crate, there is no safe "degrade to empty" for an agent stage) and a
-//! `HaikuStageRunner` calls the Anthropic Messages API directly over
-//! `reqwest`. No Rust "Claude Agent SDK" crate exists anywhere in this
-//! workspace (checked before writing this) - this is the established
-//! pattern, not a shortcut.
+//! `HaikuStageRunner` runs the stage through the crate's shared
+//! `anthropic::AnthropicClient` (audit finding 30).
 
+use crate::anthropic::AnthropicClient;
 use crate::StageSpec;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-
-const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-const STAGE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone)]
 pub struct StageResult {
@@ -42,12 +37,16 @@ impl PipelineStageRunner for NoopStageRunner {
     }
 }
 
-/// Real stage execution via the Anthropic Messages API (Haiku).
+/// Real stage execution via the Anthropic Messages API (Haiku), through the
+/// shared `AnthropicClient`.
 pub struct HaikuStageRunner {
     pub api_key: String,
 }
 
-fn build_prompt(stage: &StageSpec, input: &Value, prior: &[Value]) -> String {
+/// Builds a stage's prompt. `pub` so `lifeos-drain`'s agent-CLI stage runner
+/// reuses this single copy instead of duplicating it verbatim (audit
+/// finding 31).
+pub fn build_prompt(stage: &StageSpec, input: &Value, prior: &[Value]) -> String {
     let mut prompt = format!("You are the '{}' stage of an agent pipeline.\n", stage.agent);
     if let Some(skill) = stage.skill {
         prompt.push_str(&format!("Apply the '{skill}' skill.\n"));
@@ -67,45 +66,20 @@ fn build_prompt(stage: &StageSpec, input: &Value, prior: &[Value]) -> String {
 impl PipelineStageRunner for HaikuStageRunner {
     async fn run_stage(&self, stage: &StageSpec, input: &Value, prior: &[Value]) -> Result<StageResult, String> {
         let prompt = build_prompt(stage, input, prior);
-        let body = json!({
-            "model": STAGE_MODEL,
-            "max_tokens": 1024,
-            "messages": [{ "role": "user", "content": prompt }]
-        });
+        let client = AnthropicClient::new(self.api_key.clone());
+        let completion = client.complete(None, &prompt, 1024).await?;
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("anthropic request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("anthropic api error {status}: {text}"));
+        let text = completion.text.trim().to_string();
+        if text.is_empty() {
+            return Err("anthropic response had no stage output text".to_string());
         }
 
-        let parsed: Value = resp.json().await.map_err(|e| format!("anthropic response parse failed: {e}"))?;
-        let text = parsed
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|block| block.get("text"))
-            .and_then(|t| t.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "anthropic response had no stage output text".to_string())?;
-
-        let tokens_in = parsed.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-        let tokens_out =
-            parsed.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-
-        Ok(StageResult { output: json!({ "text": text }), tokens_in, tokens_out, model: STAGE_MODEL.to_string() })
+        Ok(StageResult {
+            output: json!({ "text": text }),
+            tokens_in: completion.tokens_in,
+            tokens_out: completion.tokens_out,
+            model: client.model().to_string(),
+        })
     }
 }
 

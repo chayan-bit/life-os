@@ -14,16 +14,16 @@ use async_trait::async_trait;
 use lifeos_agents::{DetectedAgent, RunOptions};
 use lifeos_ingest::Captioner;
 use lifeos_memory::{HeuristicModel, MemoryError, MemoryModel};
-use lifeos_pipelines::{Judge, PipelineStageRunner, StageResult, StageSpec};
+// Reuse the pipelines crate's stage-prompt builder, judge rubric, and score
+// parser rather than duplicating them here (audit finding 31).
+use lifeos_pipelines::{
+    build_prompt, parse_judge_json, Judge, PipelineStageRunner, StageResult, StageSpec, JUDGE_RUBRIC,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 const STAGE_TIMEOUT_SECS: u64 = 300;
 const MEMORY_MODEL_TIMEOUT_SECS: u64 = 60;
-const JUDGE_RUBRIC: &str = "You are an output quality judge. \
-Score the following stage output 1-5 on whether it is complete, non-empty, and usable as-is \
-(5 = ship it, 1 = empty or unusable). \
-Respond with ONLY strict JSON: {\"score\": <1-5>, \"rationale\": \"<one sentence>\"}.";
 const CAPTION_PROMPT: &str = "Read the image file at this path and describe it in one or two \
 concise sentences, focused on what it shows so it can be found later by a text search. \
 Respond with ONLY the description text.";
@@ -39,24 +39,6 @@ pub struct AgentCliStageRunner {
     pub agents: Arc<Vec<DetectedAgent>>,
 }
 
-fn build_stage_prompt(stage: &StageSpec, input: &Value, prior: &[Value]) -> String {
-    let mut prompt = format!("You are the '{}' stage of an agent pipeline.\n", stage.agent);
-    if let Some(skill) = stage.skill {
-        prompt.push_str(&format!("Apply the '{skill}' skill.\n"));
-    }
-    if let Some(tool) = stage.tool {
-        prompt.push_str(&format!(
-            "(Reference tool for this stage: {tool}; not actually invoked by this runner.)\n"
-        ));
-    }
-    prompt.push_str(&format!("Run input: {input}\n"));
-    if !prior.is_empty() {
-        prompt.push_str(&format!("Prior stage outputs: {}\n", Value::Array(prior.to_vec())));
-    }
-    prompt.push_str("Respond with the stage's output as plain text.");
-    prompt
-}
-
 #[async_trait]
 impl PipelineStageRunner for AgentCliStageRunner {
     async fn run_stage(
@@ -65,7 +47,7 @@ impl PipelineStageRunner for AgentCliStageRunner {
         input: &Value,
         prior: &[Value],
     ) -> Result<StageResult, String> {
-        let prompt = build_stage_prompt(stage, input, prior);
+        let prompt = build_prompt(stage, input, prior);
         let opts = run_options();
         let text = lifeos_agents::run(&self.agents, &opts, &prompt)
             .await
@@ -97,28 +79,6 @@ impl Judge for AgentCliJudge {
             .map_err(|e| format!("agent CLI judge failed: {e}"))?;
         parse_judge_json(&text)
     }
-}
-
-fn parse_judge_json(text: &str) -> Result<(f64, String), String> {
-    // Agents sometimes wrap JSON in a code fence - strip a fence if present.
-    let cleaned = text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let judged: Value = serde_json::from_str(cleaned)
-        .map_err(|e| format!("judge response was not valid JSON: {e} (text: {text})"))?;
-    let raw_score = judged
-        .get("score")
-        .and_then(|s| s.as_f64())
-        .ok_or_else(|| "judge response missing numeric score".to_string())?;
-    let rationale = judged
-        .get("rationale")
-        .and_then(|r| r.as_str())
-        .unwrap_or("no rationale given")
-        .to_string();
-    Ok(((raw_score / 5.0).clamp(0.0, 1.0), rationale))
 }
 
 /// Image captioning through a local agent CLI that can read files (Claude
@@ -219,21 +179,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn judge_json_parses_plain_and_fenced() {
-        let (score, rationale) =
-            parse_judge_json(r#"{"score": 4, "rationale": "solid"}"#).unwrap();
-        assert!((score - 0.8).abs() < 1e-9);
-        assert_eq!(rationale, "solid");
-
+    fn agent_cli_judge_reuses_the_shared_parser() {
+        // The rubric + parser now live in `lifeos-pipelines`; this just
+        // confirms the reused parser is wired in and handles a fenced reply.
         let fenced = "```json\n{\"score\": 5, \"rationale\": \"ship it\"}\n```";
-        let (score, _) = parse_judge_json(fenced).unwrap();
-        assert!((score - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn judge_score_is_clamped() {
-        let (score, _) = parse_judge_json(r#"{"score": 9, "rationale": "x"}"#).unwrap();
-        assert!((score - 1.0).abs() < 1e-9);
+        assert!((parse_judge_json(fenced).unwrap().0 - 1.0).abs() < 1e-9);
+        assert!(JUDGE_RUBRIC.contains("strict JSON"));
     }
 
     #[test]
@@ -246,7 +197,7 @@ mod tests {
             gate: None,
             gated: false,
         };
-        let prompt = build_stage_prompt(&stage, &json!({"topic": "x"}), &[json!({"text": "prev"})]);
+        let prompt = build_prompt(&stage, &json!({"topic": "x"}), &[json!({"text": "prev"})]);
         assert!(prompt.contains("'writer' stage"));
         assert!(prompt.contains("copywriting"));
         assert!(prompt.contains("\"topic\""));

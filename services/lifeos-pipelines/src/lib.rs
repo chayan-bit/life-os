@@ -38,10 +38,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use ulid::{Generator, Ulid};
 
+pub mod anthropic;
 pub mod eval_gate;
 pub mod runner;
-pub use eval_gate::{HaikuJudge, HeuristicJudge, Judge};
-pub use runner::{HaikuStageRunner, NoopStageRunner, PipelineStageRunner, StageResult};
+pub use eval_gate::{parse_judge_json, HaikuJudge, HeuristicJudge, Judge, JUDGE_RUBRIC};
+pub use runner::{build_prompt, HaikuStageRunner, NoopStageRunner, PipelineStageRunner, StageResult};
 
 static ID_GENERATOR: Mutex<Generator> = Mutex::new(Generator::new());
 
