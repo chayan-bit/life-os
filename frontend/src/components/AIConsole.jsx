@@ -1,37 +1,107 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Sparkles, X, ShieldAlert, GitCommit, Wand2, Lock, CornerDownLeft } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Sparkles, X, ShieldAlert, Wand2, Lock, CornerDownLeft, Wrench, Clock } from 'lucide-react';
 import MarkdownRenderer from './MarkdownRenderer';
 import { routeIntent, canAI } from '../lib/capabilities';
-import { apiCall } from '../lib/api';
-import { commit as vcsCommit } from '../lib/vcs';
-import { llmSelection } from '../lib/ai';
-import AgentPicker from './ui/AgentPicker';
-import { compileActionPlan } from '../lib/actionPlanCompiler';
-import ActionPlanPreview from './ActionPlanPreview';
+import { apiCall, WORKSPACE_ID_KEY } from '../lib/api';
+import { executeAction } from '../lib/agentActions';
 
 // The app-wide AI surface. Mounted once in Layout; openable from anywhere via:
 //   window.dispatchEvent(new CustomEvent('lifeos:ai', { detail: { prefill, layer } }))
-// It routes a natural-language change request to the layers it touches, enforces
-// the guardrail registry (gated layers + no-delete-core), proposes a change, and
-// lets the HUMAN commit it to VCS (AI can never commit).
+// The primary path routes the request to the backend plan -> execute -> verify
+// loop (POST /api/agent, docs/AGENT-CORE.md §14). That loop owns capability
+// gating, memory, Tool-RAG and tracing; applied mutations land in the Agent
+// Ledger (each undoable) and gated actions become pending_approval drafts.
+// Only browser-bound local actions (navigation) stay client-side, since the
+// server loop has no browser to drive.
 
 const EXAMPLES = [
-  'Make the theme warmer and increase contrast',
+  'Find my overdue tasks and tag them urgent',
   'Add a "Spanish" knowledge domain with a starter roadmap',
   'Recommend 3 projects for my Trading domain',
   'Delete the version history', // demonstrates a gated refusal
 ];
+
+// Browser-only navigation targets. The server agent loop cannot navigate the
+// user's browser, so these resolve through the client-side action registry.
+const LOCAL_NAV = [
+  { key: 'dashboard', label: 'Dashboard', href: '/dashboard' },
+  { key: 'knowledge', label: 'Knowledge', href: '/knowledge' },
+  { key: 'modules', label: 'Modules', href: '/modules' },
+  { key: 'database', label: 'Database', href: '/database' },
+  { key: 'graph', label: 'Graph', href: '/graph' },
+  { key: 'harness', label: 'Harness', href: '/harness' },
+  { key: 'storage', label: 'Storage', href: '/storage' },
+  { key: 'integrations', label: 'Integrations', href: '/integrations' },
+  { key: 'docs', label: 'Docs', href: '/docs' },
+  { key: 'profile', label: 'Profile', href: '/profile' },
+  { key: 'ledger', label: 'Agent Ledger', href: '/agent-ledger' },
+  { key: 'memory', label: 'Memory', href: '/memory' },
+];
+
+const NAV_INTENT = /^(?:go to|open|navigate to|take me to|show me)\s+(.+)/i;
+
+// Recognizes an explicit "go to X" request and resolves it to a route, so a
+// pure navigation never pays a network round trip to the server loop.
+function matchLocalNav(text) {
+  const m = NAV_INTENT.exec(text.trim());
+  if (!m) return null;
+  const target = m[1].toLowerCase().replace(/\b(page|the)\b/g, '').trim();
+  return LOCAL_NAV.find((n) => target.includes(n.key) || target.includes(n.label.toLowerCase())) || null;
+}
+
+const isDelete = (t) => /\b(delete|remove|drop|wipe|erase|destroy)\b/i.test(t);
+
+// A human-readable line for a turn that returned no final text of its own.
+function outcomeText(result) {
+  const o = result?.outcome;
+  if (o === 'awaiting_approval') return 'Prepared a draft that needs your approval before it goes out.';
+  if (o === 'kill_switch') return 'The agent is paused - the kill switch is on for this workspace.';
+  if (o === 'step_budget_exhausted') return 'The agent hit its step budget and stopped before finishing.';
+  if (result?.error) return `The agent stopped: ${result.error}.`;
+  return 'Done.';
+}
+
+// Compact, collapsible list of the tools the loop actually ran this turn.
+function StepList({ steps }) {
+  return (
+    <details className="mt-2">
+      <summary className="text-[10px] font-bold uppercase text-neo-text-muted cursor-pointer flex items-center gap-1">
+        <Wrench size={11} /> {steps.length} step{steps.length === 1 ? '' : 's'}
+      </summary>
+      <ul className="mt-1.5 flex flex-col gap-1">
+        {steps.map((s, i) => (
+          <li key={i} className="flex items-center gap-1.5 font-mono text-[10px] text-neo-text">
+            <span className={s.ok ? 'text-emerald-600' : 'text-neo-red'}>{s.ok ? '✓' : '✗'}</span>
+            {s.tool}
+            <span className="text-neo-text-muted">{s.decision}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+// Surfaces gated actions the loop turned into pending_approval drafts.
+function PendingNotice({ pending }) {
+  return (
+    <div className="mt-2 p-2 neo-border bg-neo-yellow/20 border-neo-yellow text-[11px] text-neo-text">
+      <div className="flex items-center gap-1 font-bold mb-1"><Clock size={12} /> Awaiting approval</div>
+      {pending.length} outward/irreversible action{pending.length === 1 ? '' : 's'} were drafted and need human approval before they run:
+      <ul className="mt-1 font-mono text-[10px]">
+        {pending.map((p, i) => <li key={i}>- {p.tool}</li>)}
+      </ul>
+    </div>
+  );
+}
 
 export default function AIConsole() {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState('');
   const [log, setLog] = useState([]);
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState(null); // proposed change awaiting human commit
-  const [actionPlan, setActionPlan] = useState(null); // compiled ActionPlan awaiting preview
-  const [planId, setPlanId] = useState(null); // groups this plan's applied actions for atomic undo
-  const [compiling, setCompiling] = useState(false);
   const endRef = useRef(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     const onOpen = (e) => {
@@ -42,68 +112,69 @@ export default function AIConsole() {
     return () => window.removeEventListener('lifeos:ai', onOpen);
   }, []);
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [log, busy, pending]);
-
-  const isDelete = (t) => /\b(delete|remove|drop|wipe|erase|destroy)\b/i.test(t);
+  useEffect(() => { endRef.current?.scrollIntoView?.({ behavior: 'smooth' }); }, [log, busy]);
 
   const run = async () => {
     const text = input.trim();
     if (!text || busy) return;
     setInput('');
-    setPending(null);
     setLog((l) => [...l, { role: 'user', text }]);
-    setBusy(true);
 
+    // 1. Local-only action: browser navigation goes through the client-side
+    // registry (executeAction) and never touches the server loop.
+    const nav = matchLocalNav(text);
+    if (nav) {
+      await executeAction({ tool: 'navigate', args: { to: nav.href } }, {});
+      setLog((l) => [...l, { role: 'system', text: `Navigating to **${nav.label}**.` }]);
+      navigate(nav.href);
+      setOpen(false);
+      return;
+    }
+
+    // 2. Fast client-side guardrail pre-filter (UX only - the /api/agent loop's
+    // gate is the enforcement authority). Short-circuits an obviously-forbidden
+    // ask before a 300s network round trip.
     const layers = routeIntent(text);
     const action = isDelete(text) ? 'delete' : 'modify';
-    const verdicts = layers.map((layer) => ({ layer, ...canAI(action, layer.id) }));
-    const blocked = verdicts.filter((v) => !v.allowed);
-
+    const blocked = layers
+      .map((layer) => ({ layer, ...canAI(action, layer.id) }))
+      .filter((v) => !v.allowed);
     if (blocked.length) {
-      // Guardrail stop - explain why, propose nothing.
       const reasons = blocked.map((b) => `- **${b.layer.label}** - ${b.reason}`).join('\n');
       setLog((l) => [...l, {
         role: 'ai',
         blocked: true,
         text: `I can't do that - it hits a guardrail:\n\n${reasons}\n\n_These are protected so the app can't be broken. You can make this change yourself._`,
       }]);
-      setBusy(false);
       return;
     }
 
-    // Allowed: ask the model lane for a plan; fall back to a deterministic one.
-    const scope = layers.map((l) => l.label).join(', ');
-    const { ok, data } = await apiCall('POST', '/api/llm', {
-      system: 'You are the in-app builder for Life OS. Describe the concrete change you would make, briefly.',
-      prompt: `User request: ${text}\nLayers in scope: ${scope}`,
-      ...llmSelection(),
+    // 3. Primary path: the backend plan -> execute -> verify loop.
+    setBusy(true);
+    const workspaceId = localStorage.getItem(WORKSPACE_ID_KEY) || undefined;
+    const { ok, data, error } = await apiCall('POST', '/api/agent', {
+      prompt: text,
+      ...(workspaceId ? { workspace_id: workspaceId } : {}),
     });
-    const plan = (ok && (data?.text || data)) ||
-      `**Proposed change** (local plan - \`/api/llm\` not connected):\n\n- Target: ${scope}\n- ${text}\n\nThis is reversible: once applied it's committed to VCS, so you can time-travel back anytime.`;
-
-    setLog((l) => [...l, { role: 'ai', text: plan }]);
-    setPending({ text, scope });
     setBusy(false);
-  };
 
-  const applyAndCommit = () => {
-    // The change itself is applied by the relevant surface in a full build; here
-    // the human seals it into version history (AI is gated from committing).
-    const c = vcsCommit(`AI-assisted: ${pending.text}`, 'user');
-    setLog((l) => [...l, { role: 'system', text: `Committed to VCS as \`${c.id}\` - "${c.message}". You can jump back to this point anytime.` }]);
-    setPending(null);
-  };
+    if (!ok) {
+      const timedOut = /timed out/i.test(error || '');
+      setLog((l) => [...l, {
+        role: 'ai',
+        error: true,
+        text: `The agent couldn't run: ${error || 'unknown error'}.${timedOut ? ' It ran past the time limit - try a smaller, more specific ask.' : ''}`,
+      }]);
+      return;
+    }
 
-  // Compiles the pending instruction into a structured ActionPlan (typed
-  // actions from the closed agentActions.js registry) instead of the
-  // freeform VCS-commit path - the Agent Control Plane's actuation surface
-  // (docs/AGENT-CONTROL.md §3), separate from the layer-guardrail path above.
-  const compileAsActionPlan = async () => {
-    setCompiling(true);
-    const { plan } = await compileActionPlan(pending.text, pending.scope);
-    setActionPlan(plan);
-    setPlanId(`plan_${crypto.randomUUID()}`);
-    setCompiling(false);
+    setLog((l) => [...l, {
+      role: 'ai',
+      text: data?.text || outcomeText(data),
+      steps: data?.ledger || [],
+      pending: data?.pendingApprovals || [],
+      outcome: data?.outcome,
+    }]);
   };
 
   return (
@@ -127,12 +198,7 @@ export default function AIConsole() {
           </div>
 
           <div className="px-4 py-2 border-b-2 border-neo-border bg-neo-surface-muted text-[11px] text-neo-text-muted flex items-center gap-1.5">
-            <Lock size={11} /> AI can reshape any non-gated layer. It can never touch VCS, secrets, guardrails or billing - or delete core.
-          </div>
-
-          <div className="px-4 py-2 border-b-2 border-neo-border bg-neo-surface flex items-center justify-between gap-2">
-            <span className="text-[10px] text-neo-text-muted font-bold uppercase shrink-0">Engine</span>
-            <AgentPicker />
+            <Lock size={11} /> The agent plans, executes and verifies. Applied changes land in the Agent Ledger (each undoable); outward actions wait for your approval.
           </div>
 
           <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
@@ -151,30 +217,17 @@ export default function AIConsole() {
                   m.role === 'user' ? 'bg-neo-blue text-white self-end max-w-[85%]'
                   : m.role === 'system' ? 'bg-neo-mint text-neo-text'
                   : m.blocked ? 'bg-neo-red/10 border-neo-red text-neo-text'
+                  : m.error ? 'bg-neo-red/10 border-neo-red text-neo-text'
                   : 'bg-neo-surface-muted text-neo-text'
                 }`}
               >
                 {m.blocked && <div className="flex items-center gap-1 font-bold text-neo-red mb-1"><ShieldAlert size={13} /> Guardrail</div>}
                 <MarkdownRenderer content={m.text} className={m.role === 'user' ? 'text-white' : ''} />
+                {m.role === 'ai' && !m.blocked && !m.error && m.steps?.length > 0 && <StepList steps={m.steps} />}
+                {m.role === 'ai' && m.pending?.length > 0 && <PendingNotice pending={m.pending} />}
               </div>
             ))}
-            {busy && <div className="p-2.5 text-xs neo-border bg-neo-surface-muted text-neo-text animate-pulse">Planning…</div>}
-            {pending && (
-              <div className="flex flex-col gap-2 self-start">
-                <button onClick={applyAndCommit} className="neo-btn bg-neo-mint text-neo-text py-2 px-3 text-xs flex items-center justify-center gap-2">
-                  <GitCommit size={14} /> Apply & commit to VCS
-                </button>
-                <button onClick={compileAsActionPlan} disabled={compiling} className="neo-btn bg-neo-surface-high text-neo-text py-2 px-3 text-xs flex items-center justify-center gap-2 disabled:opacity-50">
-                  <Wand2 size={14} /> {compiling ? 'Compiling…' : 'Compile as Action Plan (typed, reversible)'}
-                </button>
-              </div>
-            )}
-            {actionPlan && (
-              <div className="p-2.5 neo-border bg-neo-surface-muted">
-                <div className="neo-label-sm mb-2">Compiled Action Plan</div>
-                <ActionPlanPreview plan={actionPlan} planId={planId} onDone={() => { setActionPlan(null); setPlanId(null); }} />
-              </div>
-            )}
+            {busy && <div className="p-2.5 text-xs neo-border bg-neo-surface-muted text-neo-text animate-pulse">Working through it - planning, executing and verifying…</div>}
             <div ref={endRef} />
           </div>
 
