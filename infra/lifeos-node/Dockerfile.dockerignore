@@ -1,0 +1,17 @@
+# BuildKit reads this (named `<dockerfile>.dockerignore`) when building with
+# `-f infra/lifeos-node/Dockerfile`, keeping the build context small and, more
+# importantly, keeping the host's stale `node_modules` / Rust `target` out of
+# the image so the in-image `npm ci` / `cargo build` are authoritative.
+**/node_modules
+**/__pycache__
+services/target
+.git
+**/*.db
+**/*.db-*
+lifeos-blobs
+infra/nango/data
+infra/gowa
+frontend
+worker
+docs
+external

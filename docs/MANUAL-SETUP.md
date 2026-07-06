@@ -571,3 +571,90 @@ Distinct from `TURSO_TOKEN` (which authenticates to one already-provisioned
 database, §Phase 1). Without both set, `POST /api/workspace/provision-db`
 honestly 501s. No plan/quota gating anywhere in this path - see
 `docs/SECURITY.md` §5.
+
+### #141 - lifeos-node (remote agent container)
+
+The heavy lane (agent turns, memory consolidation, ingest) normally only runs
+while the Mac is awake.
+`lifeos-node` is a container that runs the exact same `lifeos-drain` loop on any
+box you like - a home server or a VPS - so Telegram reaches a live agent with the
+laptop off.
+Auth is keyless: it uses your Claude subscription via a token from
+`claude setup-token`, never an API key.
+Everything lives in `infra/lifeos-node/` (`Dockerfile`, `docker-compose.yml`,
+`.env.example`).
+
+**1. Mint a subscription token (keyless auth).**
+On any machine already logged into Claude (the `claude` CLI installed and
+authenticated):
+
+```sh
+claude setup-token
+```
+
+It prints a long-lived OAuth token tied to your subscription. Copy it - this is
+the only credential the node needs. There is deliberately no `ANTHROPIC_API_KEY`
+anywhere: inside the container `lifeos-agents::detect()` finds the bundled
+`claude` CLI on `PATH` and routes every AI lane through it, authenticated by
+`CLAUDE_CODE_OAUTH_TOKEN`.
+
+**2. Configure.**
+
+```sh
+cd infra/lifeos-node
+cp .env.example .env
+# then edit .env:
+#   CLAUDE_CODE_OAUTH_TOKEN=<the token from step 1>
+#   and ONE database mode:
+#     (a) multi-node / Mac-off:  TURSO_URL + TURSO_TOKEN  (your Turso primary)
+#     (b) single node:           leave TURSO_* empty, set LIFEOS_DB_DIR to a dir
+#                                holding lifeos.db (mounted at /data)
+```
+
+Mode (a) is the real "laptop off" mode: the drain connects **pure-remote** to the
+Turso primary, so every atomic `claim_job` runs server-side on the single
+primary and any number of nodes can drain concurrently without ever
+double-running a job (issue #141 acceptance). Mode (b) is for a single node
+against a mounted DB copy - SQLite file locking is not safe to share across
+hosts, so do not point two nodes at the same mounted file.
+
+**3. Bring it up.**
+
+```sh
+docker compose up -d --build
+docker compose logs -f lifeos-node   # watch it claim work
+```
+
+The image bundles the release `lifeos-drain` binary, Node 20 + the `server/`
+harness (`npm ci --omit=dev`), and the Claude Code CLI. (The `npm i -g` for the
+CLI inside the image is not a violation of the Mac's nix-only package policy -
+that policy governs the host; a container image is itself the pinned artifact.)
+
+**4. Verify with a Telegram round trip.**
+With the Mac drain stopped (to prove the node is doing the work), send the bot a
+message that enqueues a heavy job (e.g. an ingest or a query that triggers an
+agent turn). Watch `docker compose logs -f` show the node claim and run it, and
+confirm the reply lands in Telegram. Each claim also writes a `job.claimed`
+event stamped with `LIFEOS_NODE_ID`, so you can audit which node ran which job:
+
+```sh
+# against the same DB the node uses
+SELECT entity_id, json_extract(attrs,'$.node_id'), json_extract(attrs,'$.job_kind')
+FROM events WHERE type='job.claimed' ORDER BY ts DESC LIMIT 10;
+```
+
+**Trusted vs untrusted posture (important).**
+The container hardcodes `LIFEOS_BUILD_PIPELINE=0` in `docker-compose.yml`. That
+is the **untrusted-node posture**: the node never runs self-extension codegen -
+it does not poll `module_requests` and never scaffolds or commits code, honoring
+CLAUDE.md's hard rule that *codegen runs only on the trusted Mac*. If you enqueue
+a module build, an untrusted node simply leaves it for the Mac. Flipping the flag
+to `1` (edit the compose file) marks the node **trusted** and lets it build
+modules - only do this for a box you own and trust as much as the Mac.
+
+**Outward actions stay human-gated regardless.**
+Trusted or not, this changes nothing about the outward-action safety model:
+social posts/DMs, email sends, calendar writes, drive shares, browser actions,
+and any trade action still go draft -> Telegram approve -> execute, enforced by
+the gate/executor, and trading remains read-only for every agent/bot. A remote
+node can *draft* and *read*; it can never act outwardly on its own.

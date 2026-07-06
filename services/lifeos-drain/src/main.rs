@@ -56,6 +56,8 @@ use lifeos_pipelines::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
+mod node;
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,6 +79,35 @@ fn env_float(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Open the DB the drain consumes, in one of two modes:
+///
+/// - **Turso primary (remote, issue #141):** when `TURSO_URL` + `TURSO_TOKEN`
+///   are both set - the `lifeos-node` container's mode. A *pure remote*
+///   connection (not an embedded replica) runs every statement server-side on
+///   the single primary, so `claim_job`'s atomic `UPDATE ... RETURNING` stays
+///   the one place a job is claimed even with N nodes racing: there is no local
+///   replica to fall behind and double-claim under last-push-wins sync.
+///   `LIFEOS_DB_PATH` is ignored in this mode.
+/// - **Local file (default):** a plain local libSQL file at `LIFEOS_DB_PATH` -
+///   the personal-Mac default, where `lifeos-api` owns the embedded replica and
+///   the drain shares the same on-disk file (unchanged behavior). The Mac
+///   drain never sets `TURSO_URL`/`TURSO_TOKEN`, so this branch is preserved
+///   byte-for-byte for it.
+async fn open_database(db_path: &str) -> Result<libsql::Database, libsql::Error> {
+    let turso_url = std::env::var("TURSO_URL").ok().filter(|s| !s.is_empty());
+    let turso_token = std::env::var("TURSO_TOKEN").ok().filter(|s| !s.is_empty());
+    match (turso_url, turso_token) {
+        (Some(url), Some(token)) => {
+            println!("lifeos-drain: connecting to Turso primary (remote mode; LIFEOS_DB_PATH ignored)");
+            Builder::new_remote(url, token).build().await
+        }
+        _ => {
+            println!("lifeos-drain: opening local DB {db_path}");
+            Builder::new_local(db_path).build().await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let db_path = std::env::var("LIFEOS_DB_PATH").unwrap_or_else(|_| "lifeos.db".to_string());
@@ -87,10 +118,10 @@ async fn main() {
         max_attempts: env_int("LIFEOS_DRAIN_MAX_ATTEMPTS", 3),
     };
 
-    let db = match Builder::new_local(&db_path).build().await {
+    let db = match open_database(&db_path).await {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("lifeos-drain: failed to open {db_path}: {e}");
+            eprintln!("lifeos-drain: failed to open database: {e}");
             std::process::exit(1);
         }
     };
@@ -98,16 +129,27 @@ async fn main() {
     // Wait rather than error on a write lock so two drainers cooperate.
     let _ = conn.execute("PRAGMA busy_timeout = 5000", ()).await;
 
-    let worker_id = format!("mac-drain-{}", now_secs());
-    println!("lifeos-drain: worker {worker_id} on {db_path} (poll {poll:?}, {cfg:?})");
+    // Node identity for claim observability (issue #141). On the Mac this is
+    // just the hostname; on a `lifeos-node` container it is `LIFEOS_NODE_ID` (or
+    // the container id via `HOSTNAME`). `worker_id` stays the per-process lease
+    // owner (must be unique per running drainer); `node_id` is the stable,
+    // human-meaningful fleet identity stamped into `job.claimed` events.
+    let node_id = node::node_id();
+    let worker_id = format!("{node_id}-{}", now_secs());
+    println!("lifeos-drain: node '{node_id}' worker {worker_id} (poll {poll:?}, {cfg:?})");
 
     let server_dir = std::env::var("LIFEOS_SERVER_DIR").unwrap_or_else(|_| "server".to_string());
-    // LIFEOS_BUILD_PIPELINE (default on): route claimed module requests through
-    // the full multi-tier build pipeline (#132, `build/run.js`); set to `0` for
-    // the plain single-manifest `scaffold.js` escape hatch (#78).
+    // LIFEOS_BUILD_PIPELINE doubles as the trusted-node gate (issue #141):
+    // - default on (unset / `1`): TRUSTED. This drainer polls `module_requests`
+    //   and runs the full multi-tier self-extension build pipeline (#132,
+    //   `build/run.js`) - the Mac's posture.
+    // - `0`: UNTRUSTED node. Codegen is disabled entirely: the drainer does NOT
+    //   poll `module_requests` and never scaffolds/commits code (CLAUDE.md:
+    //   "codegen runs only on the trusted Mac"). A remote `lifeos-node` runs
+    //   this way by default; flipping the flag to `1` marks the node trusted.
     let build_pipeline = std::env::var("LIFEOS_BUILD_PIPELINE").map(|v| v != "0").unwrap_or(true);
     if !build_pipeline {
-        println!("lifeos-drain: LIFEOS_BUILD_PIPELINE=0, module builds use plain scaffold.js");
+        println!("lifeos-drain: LIFEOS_BUILD_PIPELINE=0 (untrusted-node posture): codegen disabled, not polling module_requests");
     }
     let builder = ScaffoldJsBuilder { server_dir, build_pipeline };
     let notifier: Box<dyn Notifier> = match std::env::var("TELEGRAM_BOT_TOKEN") {
@@ -208,6 +250,13 @@ async fn main() {
     loop {
         match claim_job(&conn, &worker_id, now_secs(), cfg).await {
             Ok(Some(job)) => {
+                // Observability stamp (issue #141) - which node claimed this
+                // job. Non-fatal: a failed stamp must never abort the job.
+                if let Err(e) =
+                    node::emit_claim_event(&conn, &job.workspace_id, &job.id, &job.kind, &node_id, now_secs()).await
+                {
+                    eprintln!("lifeos-drain: claim-event stamp for {} failed: {e}", job.id);
+                }
                 run_job(
                     &conn,
                     &job,
@@ -230,13 +279,17 @@ async fn main() {
             Ok(None) => {}
             Err(e) => eprintln!("lifeos-drain: claim failed: {e}"),
         }
-        match claim_next_module_request(&conn, now_secs()).await {
-            Ok(Some(req)) => {
-                println!("lifeos-drain: building module request {} ({})", req.id, req.prompt);
-                run_module_build(&conn, &builder, notifier.as_ref(), req, now_secs()).await;
+        // Untrusted nodes (LIFEOS_BUILD_PIPELINE=0) never claim self-extension
+        // build requests - codegen stays on the trusted Mac (issue #141).
+        if build_pipeline {
+            match claim_next_module_request(&conn, now_secs()).await {
+                Ok(Some(req)) => {
+                    println!("lifeos-drain: building module request {} ({})", req.id, req.prompt);
+                    run_module_build(&conn, &builder, notifier.as_ref(), req, now_secs()).await;
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("lifeos-drain: module_request claim failed: {e}"),
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("lifeos-drain: module_request claim failed: {e}"),
         }
         match reap_stuck(&conn, now_secs(), cfg).await {
             Ok(n) if n > 0 => println!("lifeos-drain: reaped {n} stuck job(s)"),

@@ -1,0 +1,73 @@
+## lifeos-node: the remote agent container (issue #141, docs/MANUAL-SETUP.md).
+##
+## Runs the heavy lane (agent turns, memory, ingest) anywhere - home server or
+## VPS - so Telegram reaches a live agent with the Mac off. Keyless subscription
+## auth: mint a token with `claude setup-token`, put it in `.env`, `up -d`.
+##
+## Usage:
+##   cp .env.example .env    # fill CLAUDE_CODE_OAUTH_TOKEN + a DB mode
+##   docker compose up -d --build
+##
+## Build context is the repo root (two levels up) so the image can pull in both
+## `services/` (for the Rust build) and `server/` (the Node harness).
+
+services:
+  lifeos-node:
+    build:
+      context: ../..
+      dockerfile: infra/lifeos-node/Dockerfile
+    image: lifeos-node:latest
+    restart: unless-stopped
+    environment:
+      # --- Keyless AI auth (REQUIRED). Subscription OAuth token from
+      # `claude setup-token` on any machine already logged into Claude. This is
+      # the ONLY auth the container needs - never an ANTHROPIC_API_KEY.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN in .env (run `claude setup-token`)}
+
+      # --- DB mode. Pick ONE:
+      # (a) Turso primary (multi-node): set TURSO_URL + TURSO_TOKEN in .env. The
+      #     drain connects pure-remote, so N nodes racing claim_job stay safe on
+      #     the single primary. LIFEOS_DB_PATH is ignored in this mode.
+      # (b) Mounted file (single node): leave TURSO_* empty and use the volume
+      #     below; the drain reads/writes /data/lifeos.db directly.
+      TURSO_URL: ${TURSO_URL:-}
+      TURSO_TOKEN: ${TURSO_TOKEN:-}
+      LIFEOS_DB_PATH: /data/lifeos.db
+
+      # --- Node identity, stamped into every `job.claimed` event so you can see
+      # which node ran which job. Defaults to the container HOSTNAME if unset.
+      LIFEOS_NODE_ID: ${LIFEOS_NODE_ID:-lifeos-node-1}
+
+      # --- UNTRUSTED-NODE POSTURE (do NOT flip casually). 0 = this node never
+      # runs self-extension codegen: it does not poll module_requests and never
+      # scaffolds/commits code. CLAUDE.md's hard rule is "codegen runs only on
+      # the trusted Mac"; a remote box you don't fully trust must stay at 0.
+      # Setting this to 1 marks the node TRUSTED and lets it build modules - only
+      # do that for a box you own and trust as much as the Mac.
+      LIFEOS_BUILD_PIPELINE: "0"
+
+      # --- Route memory consolidation through the local Claude CLI (keyless),
+      # same as the Mac. Anything else keeps the deterministic heuristic.
+      LIFEOS_MEMORY_MODEL: agent
+
+      # --- Optional: announce module-build results / pipeline gate rationales
+      # back to Telegram (same token as the Worker's BOT_TOKEN). Harmless to omit.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-}
+
+      # --- Loop tunables (defaults match the Mac drain).
+      LIFEOS_DRAIN_POLL_SECS: ${LIFEOS_DRAIN_POLL_SECS:-3}
+      LIFEOS_DRAIN_STUCK_TTL_SECS: ${LIFEOS_DRAIN_STUCK_TTL_SECS:-300}
+      LIFEOS_DRAIN_MAX_ATTEMPTS: ${LIFEOS_DRAIN_MAX_ATTEMPTS:-3}
+
+    volumes:
+      # Only meaningful in mounted-file DB mode (b). Point it at a host copy of
+      # lifeos.db. Harmless in Turso mode (the path is simply unused).
+      - ${LIFEOS_DB_DIR:-./data}:/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -x lifeos-drain > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
