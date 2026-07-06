@@ -281,6 +281,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/marketplace/packages", get(marketplace::list))
         .route("/api/marketplace/verify", post(marketplace::verify))
         .route("/api/marketplace/install", post(marketplace::install))
+        .route("/api/marketplace/package/:module_id/versions", get(marketplace::versions))
         // --- PWA Web Push subscriptions (issue #103) ---
         .route("/api/push/subscribe", post(push::subscribe))
         .route("/api/push/unsubscribe", post(push::unsubscribe))

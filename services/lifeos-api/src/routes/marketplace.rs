@@ -17,13 +17,18 @@ use crate::ids::{new_id, now_secs};
 use crate::marketplace_sign;
 use crate::state::AppState;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Wall-clock ceiling on the Node package-validator subprocess. Structural
+/// validation is fast (no browser/LLM); this is only a runaway backstop.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn signing_key_or_501(state: &AppState) -> ApiResult<&SigningKey> {
     state.config.marketplace_signing_key.as_ref().ok_or_else(|| {
@@ -176,11 +181,27 @@ pub struct InstallRequest {
     package_id: String,
 }
 
-/// `POST /api/marketplace/install` - re-verifies the stored signature
-/// against the stored manifest before recording an install event. A
-/// tampered `manifest_json` (or a package whose signature was forged)
-/// fails closed with 400, never silently "installs".
-pub async fn install(State(state): State<AppState>, Json(req): Json<InstallRequest>) -> ApiResult<Json<Value>> {
+/// `POST /api/marketplace/install` - the trusted install gate. In order, and
+/// failing closed at each step (issue #147 acceptance - validation on install
+/// is non-negotiable):
+///   1. re-verify the stored signature over the stored manifest - a tampered
+///      `manifest_json` or forged signature 400s, never "installs";
+///   2. re-run the Tier-0 validator chain on the manifest
+///      (`server/validators/validatePackage.js`) - a structurally-invalid
+///      manifest 400s even with a perfectly valid signature (a signature
+///      proves provenance, not that the manifest is installable);
+///   3. only then persist the `module_manifest` entity (so the module renders
+///      live, issue #121) and record the install event.
+///
+/// The package is looked up globally by `package_id` (you install packages
+/// others published), but the install RECORD - the `module_manifest` entity and
+/// the `marketplace.installed` event - lands in the CALLER's workspace, never
+/// the publisher's, so an install is tenant-correct.
+pub async fn install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<InstallRequest>,
+) -> ApiResult<Json<Value>> {
     let mut rows = state
         .conn
         .query(
@@ -195,6 +216,7 @@ pub async fn install(State(state): State<AppState>, Json(req): Json<InstallReque
         .ok_or_else(|| ApiError::NotFound(format!("package '{}' not found", req.package_id)))?;
     let package = package_row_to_json(&row)?;
 
+    // Step 1 - signature: provenance + tamper-evidence.
     let manifest_bytes = serde_json::to_vec(&package["manifest"]).unwrap_or_default();
     let signature = package["signature"].as_str().unwrap_or_default();
     let pubkey = package["publisher_pubkey"].as_str().unwrap_or_default();
@@ -204,7 +226,13 @@ pub async fn install(State(state): State<AppState>, Json(req): Json<InstallReque
         ));
     }
 
-    let workspace_id = package["workspace_id"].as_str().unwrap_or_default().to_string();
+    // Step 2 - validator re-run: the manifest must still pass the T0 gates.
+    validate_manifest_via_node(&state, &package["manifest"]).await?;
+
+    // Step 3 - activate into the CALLER's workspace (not the publisher's).
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
+    let module_id = package["module_id"].as_str().unwrap_or_default();
+    upsert_manifest_entity(&state, &workspace_id, module_id, &package["manifest"]).await?;
     crate::audit::emit(
         &state.conn,
         &workspace_id,
@@ -216,6 +244,153 @@ pub async fn install(State(state): State<AppState>, Json(req): Json<InstallReque
     .await?;
 
     Ok(Json(json!({ "installed": true, "manifest": package["manifest"] })))
+}
+
+/// Parsed shape of `validatePackage.js`'s last stdout line.
+#[derive(Debug, serde::Deserialize)]
+struct ValidationResult {
+    #[serde(default)]
+    valid: bool,
+    #[serde(default)]
+    errors: Vec<String>,
+}
+
+/// Parses the LAST non-empty stdout line as the validator's JSON result. Pure +
+/// `#[cfg(test)]`-covered so the line contract is verified without spawning
+/// Node (same discipline as `agent.rs::parse_agent_output`).
+fn parse_validation_output(stdout: &str, stderr: &str) -> Result<ValidationResult, String> {
+    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+    let Some(last_line) = last_line else {
+        return Err(format!("package validator produced no output (stderr: {stderr})"));
+    };
+    serde_json::from_str(last_line)
+        .map_err(|e| format!("package validator output was not valid JSON: {e} (line: {last_line})"))
+}
+
+/// Re-runs the Tier-0 validator chain on a package manifest by shelling the
+/// thin Node entry (`server/validators/validatePackage.js`) - the same
+/// process + last-line-JSON contract `lifeos-drain` uses for build entries.
+/// The manifest is staged to a temp file (never passed as an argv, which
+/// would break on size/quoting). Fails CLOSED: a spawn failure, timeout,
+/// unparseable output, or a `valid:false` result all reject the install.
+async fn validate_manifest_via_node(state: &AppState, manifest: &Value) -> ApiResult<()> {
+    let bytes = serde_json::to_vec(manifest)
+        .map_err(|_| ApiError::BadRequest("manifest is not serializable".into()))?;
+    let tmp = std::env::temp_dir().join(format!("{}.json", new_id("pkgval")));
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("could not stage manifest for validation: {e}")))?;
+
+    let run = tokio::process::Command::new("node")
+        .arg("validators/validatePackage.js")
+        .arg(&tmp)
+        .current_dir(&state.config.server_dir)
+        .output();
+    let output = match tokio::time::timeout(VALIDATE_TIMEOUT, run).await {
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(ApiError::Upstream("package validation timed out".into()));
+        }
+        Ok(Err(e)) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(ApiError::Upstream(format!("failed to spawn package validator: {e}")));
+        }
+        Ok(Ok(o)) => o,
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let result = parse_validation_output(&stdout, &stderr).map_err(ApiError::Upstream)?;
+    if result.valid {
+        Ok(())
+    } else {
+        let detail = if result.errors.is_empty() {
+            "invalid manifest".to_string()
+        } else {
+            result.errors.join("; ")
+        };
+        Err(ApiError::BadRequest(format!("package failed validation: {detail}")))
+    }
+}
+
+/// Persists (upserts) the installed manifest as the generic `module='system'` /
+/// `type='module_manifest'` entity the live app reads (issue #121,
+/// `server/lib/manifestEntity.js`) so a hot-installed module renders through
+/// the real multi-view `ModuleManifestPage`. Keyed by `title =
+/// module_manifest_<id>` (the write side's logical id), matching the Node
+/// upsert exactly, so re-installing a newer version replaces in place.
+async fn upsert_manifest_entity(
+    state: &AppState,
+    workspace_id: &str,
+    module_id: &str,
+    manifest: &Value,
+) -> ApiResult<()> {
+    let title = format!("module_manifest_{module_id}");
+    let attrs_str = serde_json::to_string(manifest).unwrap_or_else(|_| "{}".into());
+    let now = now_secs();
+
+    let mut rows = state
+        .conn
+        .query(
+            "SELECT id FROM entities WHERE workspace_id = ?1 AND module = 'system' \
+             AND type = 'module_manifest' AND title = ?2 LIMIT 1",
+            libsql::params![workspace_id, title.clone()],
+        )
+        .await?;
+    let entity_id = if let Some(row) = rows.next().await? {
+        let id: String = row.get(0)?;
+        state
+            .conn
+            .execute(
+                "UPDATE entities SET attrs = ?1, updated_at = ?2 WHERE id = ?3 AND workspace_id = ?4",
+                libsql::params![attrs_str, now, id.clone(), workspace_id],
+            )
+            .await?;
+        id
+    } else {
+        let id = new_id("ent");
+        state
+            .conn
+            .execute(
+                "INSERT INTO entities \
+                 (id, workspace_id, module, type, parent_id, title, status, tier, attrs, source, blob_ref, created_at, updated_at) \
+                 VALUES (?1, ?2, 'system', 'module_manifest', NULL, ?3, NULL, NULL, ?4, 'marketplace', NULL, ?5, ?5)",
+                libsql::params![id.clone(), workspace_id, title, attrs_str, now],
+            )
+            .await?;
+        id
+    };
+    // Keep the lexical search index live (best-effort; boot rebuild reconciles).
+    if let Err(e) = crate::db::index_entity(&state.conn, &entity_id).await {
+        tracing::warn!("derived index upsert failed for {entity_id}: {e}");
+    }
+    Ok(())
+}
+
+/// `GET /api/marketplace/package/:module_id/versions` - every published version
+/// of a module in this workspace, newest first. The detail view renders this as
+/// the version history; installing an older row's `package_id` is the rollback
+/// path (it flows through the same signature + validator gate as any install).
+pub async fn versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let workspace_id = resolve_workspace(&headers, &state.config, None)?;
+    let mut rows = state
+        .conn
+        .query(
+            "SELECT id, workspace_id, module_id, version, manifest_json, signature, publisher_pubkey, created_at \
+             FROM module_packages WHERE workspace_id = ?1 AND module_id = ?2 ORDER BY created_at DESC",
+            libsql::params![workspace_id, module_id],
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(package_row_to_json(&row)?);
+    }
+    Ok(Json(json!({ "versions": out })))
 }
 
 fn package_row_to_json(row: &libsql::Row) -> ApiResult<Value> {
@@ -238,4 +413,38 @@ fn package_row_to_json(row: &libsql::Row) -> ApiResult<Value> {
         "publisher_pubkey": publisher_pubkey,
         "created_at": created_at,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_valid_result_from_the_last_stdout_line() {
+        let stdout = "npm noise\n\n{\"valid\":true,\"errors\":[],\"tier\":\"T0\"}\n";
+        let result = parse_validation_output(stdout, "").unwrap();
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn parses_an_invalid_result_with_its_errors() {
+        let stdout = "{\"valid\":false,\"errors\":[\"(root) must have required property 'name'\"],\"tier\":\"T0\"}\n";
+        let result = parse_validation_output(stdout, "").unwrap();
+        assert!(!result.valid);
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn errors_when_the_validator_produced_no_output() {
+        let err = parse_validation_output("  \n\n", "boom on stderr").unwrap_err();
+        assert!(err.contains("no output"));
+        assert!(err.contains("boom on stderr"));
+    }
+
+    #[test]
+    fn errors_when_the_last_line_is_not_json() {
+        let err = parse_validation_output("not json at all\n", "").unwrap_err();
+        assert!(err.contains("not valid JSON"));
+    }
 }

@@ -413,8 +413,16 @@ export const API_ROUTES = [
     method: 'POST',
     path: '/api/marketplace/install',
     status: 'live',
-    summary: 'Re-verifies a stored package\'s signature and records a marketplace.installed event. The actual git-commit-as-install step is the Node scaffold layer\'s job.',
+    summary: 'Re-verifies a stored package\'s signature, re-runs the Tier-0 validator chain on its manifest, then persists the module_manifest entity + records marketplace.installed (issue #147). A tampered or structurally-invalid bundle is rejected.',
     sample: { package_id: '<package_id>' },
+  },
+  {
+    service: 'lifeos-api',
+    method: 'GET',
+    path: '/api/marketplace/package/:module_id/versions',
+    status: 'live',
+    summary: 'Version history for a module (all published versions, newest first). Installing an older version\'s package_id is the rollback path (issue #147).',
+    sample: null,
   },
   {
     service: 'lifeos-api',
