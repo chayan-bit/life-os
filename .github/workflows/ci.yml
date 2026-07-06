@@ -1,0 +1,141 @@
+name: CI
+
+# Finding 19 (test/CI audit): the required lane (js, rust) is kept fast and
+# deterministic - no real browser, no network model calls, no optional heavy
+# deps. Anything that needs those (Playwright's chromium, memvec.py's
+# sentence-transformers/sqlite-vec) lives in its own continue-on-error job so
+# it reports status without ever blocking a merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  js:
+    name: js (db, server, worker, frontend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            db/package-lock.json
+            server/package-lock.json
+            worker/package-lock.json
+            frontend/package-lock.json
+
+      # worker imports the built @lifeos/db package via a `file:../db`
+      # dependency; db/dist is gitignored, so it must be built before
+      # worker's install/test can resolve "@lifeos/db*" at all.
+      - name: Build @lifeos/db
+        run: cd db && npm ci && npm run build
+
+      # renderSmoke.test.js drives a real Playwright/chromium browser
+      # (docs/MANUAL-SETUP.md #75's one-time `npx playwright install`) - kept
+      # out of the required path (finding 19); see the e2e-playwright job.
+      - name: server - install + test
+        run: cd server && npm ci && npm test -- --exclude test/renderSmoke.test.js
+
+      - name: worker - install + test + typecheck
+        run: cd worker && npm ci && npm test && npm run typecheck
+
+      - name: frontend - install + test
+        run: cd frontend && npm ci && npm test
+
+  rust:
+    name: rust (services workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            services/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('services/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo test --workspace
+        working-directory: services
+        run: cargo test --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: services
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Finding 18 (test/CI audit): memvec.py's cache-put/cache-get tests
+  # (test/llmCache.test.js's "memvec.py cache-put/cache-get (python
+  # integration)" describe block, including the cross-workspace isolation
+  # assertion) silently skip everywhere sentence-transformers/sqlite-vec
+  # aren't installed - which, before this job existed, was everywhere. This
+  # job installs them for real and sets LIFEOS_REQUIRE_PY_DEPS=1, which turns
+  # a still-missing dep into a hard failure instead of a silent skip
+  # (server/test/llmCache.test.js).
+  py-integration:
+    name: py-integration (optional - memvec.py semantic cache)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: server/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install memvec.py's optional deps (sentence-transformers, sqlite-vec)
+        run: pip install sentence-transformers sqlite-vec
+
+      - name: server - install
+        run: cd server && npm ci
+
+      - name: Run the memvec.py cache-put/cache-get integration tests for real
+        run: cd server && LIFEOS_REQUIRE_PY_DEPS=1 npx vitest run test/llmCache.test.js
+
+  # Finding 19: the render-smoke validator (server/validators/render.js) drives
+  # a real headless Chromium via Playwright. Isolated here, with its own
+  # one-time browser download, so a flaky/slow browser install never blocks
+  # the required lane.
+  e2e-playwright:
+    name: e2e-playwright (optional - render-smoke validator)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: server/package-lock.json
+
+      - name: server - install
+        run: cd server && npm ci
+
+      - name: Install Playwright's chromium browser
+        run: cd server && npx playwright install --with-deps chromium
+
+      - name: server - run the full suite, including the real-browser render-smoke validator
+        run: cd server && npm test

@@ -346,6 +346,21 @@ function pythonDepsAvailable() {
 
 const HAS_PY_DEPS = pythonDepsAvailable();
 
+// Finding 18 (test/CI audit): these are the only tests that ever exercise
+// memvec.py's real cache-put/cache-get path, including the cross-workspace
+// isolation assertion - a silent skip forever (no CI job ever installs
+// sentence-transformers/sqlite-vec) means they have never actually run. The
+// dedicated "py-integration" CI job (ci.yml) sets LIFEOS_REQUIRE_PY_DEPS=1
+// after installing those deps, so a missing dep there is a real regression,
+// not an environment quirk - fail hard instead of skipping. Every other
+// runner (no env var set) keeps the original silent-skip behavior.
+if (process.env.LIFEOS_REQUIRE_PY_DEPS === "1" && !HAS_PY_DEPS) {
+  throw new Error(
+    "LIFEOS_REQUIRE_PY_DEPS=1 but python3 is missing sentence-transformers and/or sqlite-vec - " +
+      "the py-integration CI job installs these, so this must not silently skip.",
+  );
+}
+
 describe.skipIf(!HAS_PY_DEPS)("memvec.py cache-put/cache-get (python integration)", () => {
   const memvecPath = path.join(process.cwd(), "memvec.py");
 
