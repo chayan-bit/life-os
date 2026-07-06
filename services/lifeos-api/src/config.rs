@@ -9,6 +9,19 @@ use std::net::SocketAddr;
 /// carries no explicit workspace (the current frontend does this on some calls).
 pub const DEFAULT_WORKSPACE: &str = "default-personal-workspace";
 
+/// The well-known insecure dev secret that used to be the silent JWT fallback.
+/// Still recognised so strict/shared mode can hard-reject it explicitly
+/// (security audit findings 6/7).
+const DEV_INSECURE_JWT_SECRET: &str = "lifeos-dev-insecure-secret-change-me";
+
+/// Minimum acceptable `LIFEOS_JWT_SECRET` length in strict/shared mode, where
+/// the JWT is the tenancy boundary.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Default CORS allow-list: the Vite dev-server origins. Overridden by
+/// `LIFEOS_CORS_ORIGINS` (comma-separated). See [`cors_origins`].
+const DEFAULT_CORS_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// libSQL/SQLite file path for the canonical DB (embedded replica on the Mac).
@@ -117,13 +130,6 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080)));
 
-        let jwt_secret = std::env::var("LIFEOS_JWT_SECRET").unwrap_or_else(|_| {
-            tracing::warn!(
-                "LIFEOS_JWT_SECRET not set - using an insecure dev secret. Set it before any non-local use."
-            );
-            "lifeos-dev-insecure-secret-change-me".to_string()
-        });
-
         let trust_workspace_header = std::env::var("LIFEOS_TRUST_WORKSPACE_HEADER")
             .ok()
             .map(|s| s != "0" && !s.eq_ignore_ascii_case("false"))
@@ -133,6 +139,29 @@ impl Config {
                 "workspace header trusted - local-first mode; set LIFEOS_TRUST_WORKSPACE_HEADER=0 for shared deployments"
             );
         }
+
+        // Findings 6/7 (security audit): in strict/shared mode the JWT is the
+        // tenancy boundary, so an absent, well-known, or too-short secret is a
+        // hard startup failure. In local-first mode an unset secret mints a
+        // random ephemeral one - there is never a hardcoded default.
+        let jwt_secret = match resolve_jwt_secret(
+            std::env::var("LIFEOS_JWT_SECRET").ok(),
+            trust_workspace_header,
+        ) {
+            Ok(Some(secret)) => secret,
+            Ok(None) => {
+                let secret = random_secret();
+                tracing::warn!(
+                    "LIFEOS_JWT_SECRET not set - generated a random ephemeral secret; sessions will not survive a restart. Set LIFEOS_JWT_SECRET to persist them."
+                );
+                secret
+            }
+            Err(msg) => {
+                tracing::error!("{msg}");
+                eprintln!("FATAL: {msg}");
+                std::process::exit(1);
+            }
+        };
 
         let agent_cwd = std::env::var("LIFEOS_AGENT_CWD").ok();
 
@@ -207,5 +236,162 @@ impl Config {
             turso_platform_api_token,
             turso_org_slug,
         }
+    }
+}
+
+/// Decide the effective JWT secret (security audit findings 6/7). Pure so it is
+/// unit-tested without touching the environment.
+///
+/// - `env_secret`: the raw `LIFEOS_JWT_SECRET` value if set (empty is treated as
+///   unset).
+/// - `trust_workspace_header`: local-first (`true`) vs strict/shared (`false`).
+///
+/// Returns `Ok(Some(secret))` to use it as-is, `Ok(None)` meaning "mint a random
+/// ephemeral secret" (local-first with none set), or `Err(msg)` to hard-fail at
+/// startup. In strict mode an absent, well-known, or too-short secret is fatal:
+/// a known secret there is total tenancy compromise.
+fn resolve_jwt_secret(
+    env_secret: Option<String>,
+    trust_workspace_header: bool,
+) -> Result<Option<String>, String> {
+    match env_secret.filter(|s| !s.is_empty()) {
+        Some(secret) => {
+            if !trust_workspace_header {
+                if secret == DEV_INSECURE_JWT_SECRET {
+                    return Err(
+                        "LIFEOS_JWT_SECRET is the well-known dev constant but LIFEOS_TRUST_WORKSPACE_HEADER=0 (strict/shared mode): set a unique high-entropy secret - the JWT is the tenancy boundary".into(),
+                    );
+                }
+                if secret.len() < MIN_JWT_SECRET_LEN {
+                    return Err(format!(
+                        "LIFEOS_JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} characters in strict/shared mode (LIFEOS_TRUST_WORKSPACE_HEADER=0): the JWT is the tenancy boundary"
+                    ));
+                }
+            }
+            Ok(Some(secret))
+        }
+        None => {
+            if trust_workspace_header {
+                Ok(None)
+            } else {
+                Err(
+                    "LIFEOS_JWT_SECRET must be set in strict/shared mode (LIFEOS_TRUST_WORKSPACE_HEADER=0): the JWT is the tenancy boundary and a missing secret means no auth".into(),
+                )
+            }
+        }
+    }
+}
+
+/// A cryptographically random 256-bit secret, hex-encoded - the local-first
+/// default when `LIFEOS_JWT_SECRET` is unset (finding 6), so the docs' "random
+/// if unset" claim is now literally true.
+fn random_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// The CORS allow-list for the local API (finding 3), read from
+/// `LIFEOS_CORS_ORIGINS` (comma-separated), defaulting to the Vite dev-server
+/// origins. Deliberately a standalone reader rather than a `Config` field:
+/// keeping it here upholds config.rs as the sole `std::env` boundary without
+/// adding a field that would ripple through every `Config { .. }` constructor.
+pub fn cors_origins() -> Vec<String> {
+    parse_cors_origins(std::env::var("LIFEOS_CORS_ORIGINS").ok().as_deref())
+}
+
+/// Pure parser behind [`cors_origins`] - split on commas, trim, drop empties,
+/// and fall back to the dev defaults when unset or blank.
+fn parse_cors_origins(raw: Option<&str>) -> Vec<String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => DEFAULT_CORS_ORIGINS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_defaults_to_dev_origins_when_unset() {
+        assert_eq!(
+            parse_cors_origins(None),
+            vec![
+                "http://localhost:5173".to_string(),
+                "http://127.0.0.1:5173".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cors_parses_comma_list_and_trims_whitespace() {
+        assert_eq!(
+            parse_cors_origins(Some(" https://app.example.com , https://admin.example.com ")),
+            vec![
+                "https://app.example.com".to_string(),
+                "https://admin.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cors_blank_string_falls_back_to_defaults() {
+        assert_eq!(parse_cors_origins(Some("   ")), parse_cors_origins(None));
+    }
+
+    #[test]
+    fn jwt_local_first_unset_mints_random() {
+        assert!(matches!(resolve_jwt_secret(None, true), Ok(None)));
+        assert!(matches!(resolve_jwt_secret(Some(String::new()), true), Ok(None)));
+    }
+
+    #[test]
+    fn jwt_local_first_accepts_any_set_secret() {
+        // Local-first is permissive: even the dev constant is fine for personal use.
+        assert_eq!(
+            resolve_jwt_secret(Some(DEV_INSECURE_JWT_SECRET.to_string()), true).unwrap(),
+            Some(DEV_INSECURE_JWT_SECRET.to_string())
+        );
+    }
+
+    #[test]
+    fn jwt_strict_unset_hard_fails() {
+        assert!(resolve_jwt_secret(None, false).is_err());
+        assert!(resolve_jwt_secret(Some(String::new()), false).is_err());
+    }
+
+    #[test]
+    fn jwt_strict_dev_constant_hard_fails() {
+        assert!(resolve_jwt_secret(Some(DEV_INSECURE_JWT_SECRET.to_string()), false).is_err());
+    }
+
+    #[test]
+    fn jwt_strict_short_secret_hard_fails_at_boundary() {
+        assert!(resolve_jwt_secret(Some("a".repeat(MIN_JWT_SECRET_LEN - 1)), false).is_err());
+        assert!(resolve_jwt_secret(Some("a".repeat(MIN_JWT_SECRET_LEN)), false).is_ok());
+    }
+
+    #[test]
+    fn jwt_strict_strong_secret_passes_through() {
+        let strong = "b".repeat(48);
+        assert_eq!(
+            resolve_jwt_secret(Some(strong.clone()), false).unwrap(),
+            Some(strong)
+        );
+    }
+
+    #[test]
+    fn random_secret_is_high_entropy_and_unique() {
+        let a = random_secret();
+        let b = random_secret();
+        assert_ne!(a, b);
+        assert!(a.len() >= MIN_JWT_SECRET_LEN);
     }
 }

@@ -2,8 +2,9 @@
 //! that is the only process holding the canonical DB credential. Everything
 //! (CLI, bot proxy, SPA) talks to the data plane through here, workspace-scoped.
 
-use lifeos_api::{agents, build_state, config::Config, routes};
-use tower_http::cors::{Any, CorsLayer};
+use axum::http::{header, HeaderName, HeaderValue, Method};
+use lifeos_api::{agents, build_state, config, routes};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 #[tokio::main]
@@ -15,7 +16,7 @@ async fn main() {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = config::Config::from_env();
     tracing::info!(db = %config.db_path, "opening canonical DB");
     let state = build_state(config.clone())
         .await
@@ -31,16 +32,32 @@ async fn main() {
         ),
     }
 
-    // Localhost-only API; permissive CORS so the Vite dev server can call it.
-    // `allow_private_network` answers Chrome's Private Network Access preflight
-    // (`Access-Control-Request-Private-Network`) - without it, browsers that
-    // enforce PNA silently hang every non-simple (POST/PATCH/DELETE) request
-    // from the dev server origin to this API.
+    // Localhost-only API. CORS is restricted to an explicit allow-list
+    // (`LIFEOS_CORS_ORIGINS`, default the Vite dev-server origins) rather than a
+    // wildcard (security audit finding 3). Only the verbs and headers the SPA
+    // actually uses are allowed. `allow_private_network` is intentionally NOT
+    // set: the dev SPA is itself a loopback origin (localhost:5173 -> the
+    // loopback API), so Chrome's Private Network Access preflight never fires.
+    // Credentials are bearer-token based, not cookies, so `allow_credentials`
+    // stays off - the client sends the token in an `Authorization` header.
+    let allowed_origins: Vec<HeaderValue> = config::cors_origins()
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::warn!("ignoring invalid LIFEOS_CORS_ORIGINS entry: {origin}");
+                None
+            }
+        })
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .allow_private_network(true);
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("x-workspace-id"),
+        ]);
 
     let app = routes::router(state)
         .layer(cors)
