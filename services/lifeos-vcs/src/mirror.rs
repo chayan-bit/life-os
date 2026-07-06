@@ -7,8 +7,8 @@
 //! service in this workspace constructs or calls them yet - this is a real
 //! planned feature (R2 mirror/pull-on-demand for the CAS), not dead code to
 //! delete. `from_r2_env` is gated behind the `R2_BUCKET`, `R2_ENDPOINT`,
-//! `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` env vars (unset anywhere today
-//! - see docs/MANUAL-SETUP.md), so don't assume production blobs are
+//! `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` env vars (unset anywhere today,
+//! see docs/MANUAL-SETUP.md), so don't assume production blobs are
 //! actually mirrored to R2 by reading this file alone.
 //!
 //! Historically this module talked to R2/S3 directly; it is now a thin
