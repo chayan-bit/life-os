@@ -1,0 +1,15 @@
+{
+  "name": "lifeos-collab-spike",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Spike #152: cr-sqlite vs Yjs co-editing convergence prototype. Isolated, NOT wired into the Life OS app.",
+  "type": "commonjs",
+  "scripts": {
+    "attrs": "node crr_attrs.js",
+    "body": "node yjs_body.js",
+    "test": "node crr_attrs.js && node yjs_body.js"
+  },
+  "dependencies": {
+    "yjs": "^13.6.31"
+  }
+}
