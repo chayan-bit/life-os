@@ -310,6 +310,82 @@ describe("createBot - gated approve/deny (issue #66)", () => {
   });
 });
 
+describe("createBot - typed-confirm gate (issue #142)", () => {
+  async function seedTypedGate(workspaceId = WS) {
+    const { createEntity } = await import("../src/entities.js");
+    return createEntity(db, workspaceId, {
+      module: "pipelines",
+      type: "pending_approval",
+      title: "T5 crate",
+      status: "pending_approval",
+      attrs: { requires_typed_confirm: true, node: "t5" },
+    });
+  }
+
+  function replyUpdate(text: string, quoted: string) {
+    return {
+      update_id: 7,
+      message: {
+        message_id: 8,
+        date: 0,
+        chat: { id: 1, type: "private" as const, first_name: "tester" },
+        from: { id: 1, is_bot: false, first_name: "tester" },
+        text,
+        reply_to_message: {
+          message_id: 6,
+          date: 0,
+          chat: { id: 1, type: "private" as const, first_name: "tester" },
+          text: quoted,
+          reply_to_message: undefined,
+        },
+      },
+    };
+  }
+
+  it("a button tap on a typed-confirm gate refuses and opens a force-reply prompt", async () => {
+    const gate = await seedTypedGate();
+    const bot = createBot(deps, FAKE_BOT_INFO);
+    const captured = captureAll(bot);
+
+    await bot.init();
+    await bot.handleUpdate(callbackQueryUpdate(`approve:${gate.id}`));
+
+    expect(captured.answeredCallbacks[0]).toMatch(/Requires typed confirmation - reply with: t5/);
+    expect(captured.messages[0].text).toContain(`[confirm:${gate.id}]`);
+    const stillPending = await getEntityByIdForTest(gate.id);
+    expect(stillPending).toBe("pending_approval");
+  });
+
+  it("replying with the exact phrase approves the gate", async () => {
+    const gate = await seedTypedGate();
+    const bot = createBot(deps, FAKE_BOT_INFO);
+    const captured = captureAll(bot);
+
+    await bot.init();
+    await bot.handleUpdate(replyUpdate("t5", `confirm this\n[confirm:${gate.id}]`));
+
+    expect(captured.messages[0].text).toBe("Approved - queued for execution.");
+    expect(await getEntityByIdForTest(gate.id)).toBe("approved");
+  });
+
+  it("replying with the wrong phrase does not approve", async () => {
+    const gate = await seedTypedGate();
+    const bot = createBot(deps, FAKE_BOT_INFO);
+    const captured = captureAll(bot);
+
+    await bot.init();
+    await bot.handleUpdate(replyUpdate("wrong", `confirm this\n[confirm:${gate.id}]`));
+
+    expect(captured.messages[0].text).toMatch(/did not match/);
+    expect(await getEntityByIdForTest(gate.id)).toBe("pending_approval");
+  });
+
+  async function getEntityByIdForTest(id: string): Promise<string | null | undefined> {
+    const { getEntityById } = await import("../src/entities.js");
+    return (await getEntityById(db, WS, id))?.status;
+  }
+});
+
 describe("createBot - recall (issue #69)", () => {
   it("/recall finds a previously captured topic", async () => {
     const bot = createBot(deps, FAKE_BOT_INFO);

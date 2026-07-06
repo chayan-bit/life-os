@@ -2,6 +2,7 @@
 
 mod agent;
 mod annotation;
+mod approval;
 mod browser;
 mod calendar;
 mod configs;
@@ -60,6 +61,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/entity/:id", get(entity::get_one).patch(entity::update))
         // --- repair a forced sync conflict by replaying events (docs/DATA-MODEL.md §4.2) ---
         .route("/api/entity/:id/reconcile", post(entity::reconcile))
+        // --- approval inbox (issue #142): the human-JWT surface for the gating
+        //     state machine. List pending, then approve (CAS + execute_approval
+        //     job; T5 gates need typed confirm) or deny (CAS, no job). ---
+        .route("/api/approvals", get(approval::list))
+        .route("/api/approval/:id/approve", post(approval::approve))
+        .route("/api/approval/:id/deny", post(approval::deny))
         // --- reader/annotation layer: workspace-scoped notes/highlights/
         //     questions on entities (docs/DATA-MODEL.md §2.4). Plain mutable
         //     CRUD - not append-only - each write still logs an event. ---

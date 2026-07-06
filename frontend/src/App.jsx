@@ -18,6 +18,7 @@ const GraphView = lazy(() => import('./pages/GraphView'));
 const InstalledModulePage = lazy(() => import('./pages/InstalledModulePage'));
 const ModuleDashboards = lazy(() => import('./pages/ModuleDashboards'));
 const AgentLedger = lazy(() => import('./pages/AgentLedger'));
+const ApprovalInbox = lazy(() => import('./pages/ApprovalInbox'));
 const MemoryInspector = lazy(() => import('./pages/MemoryInspector'));
 const Marketplace = lazy(() => import('./pages/Marketplace'));
 
@@ -162,6 +163,14 @@ export default function App() {
           element={
             <Layout onLogout={handleLogout}>
               <AgentLedger />
+            </Layout>
+          }
+        />
+        <Route
+          path="/approvals"
+          element={
+            <Layout onLogout={handleLogout}>
+              <ApprovalInbox />
             </Layout>
           }
         />

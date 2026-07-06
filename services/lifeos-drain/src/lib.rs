@@ -215,6 +215,12 @@ pub fn dispatch(kind: &str) -> Dispatch {
         // was down when it fired) is acknowledged like reconcile, and the
         // API's has-before-put resume makes re-running it from the API safe.
         "storage_migrate" => Dispatch::Stub("lifeos-api storage migration"),
+        // `execute_approval` (issue #142): an approved gate. Acknowledged here
+        // like storage_migrate - the real work (a draft's outward effect, or a
+        // build gate's pipeline resume via `run_approval_resume` /
+        // `ScaffoldJsResumer`) is driven by the resume path below, not this
+        // `jobs`-dispatch arm, so a bare drain of the row never fails it.
+        "execute_approval" => Dispatch::Stub("lifeos-drain approval resume"),
         "memory_sleep" => Dispatch::MemorySleep,
         _ => Dispatch::Unknown,
     }
@@ -553,6 +559,90 @@ pub async fn notify_pipeline_gated(notifier: &dyn Notifier, chat_id: &str, stage
     notifier.notify(chat_id, &text).await;
 }
 
+// ------------------------------------------------ resume-on-approval (#142)
+//
+// A T3+ build node halts at a `pipelines/pending_approval` gate (server/build/
+// gate.js) with its worktree discarded. When a human approves that gate, an
+// `execute_approval` job is enqueued (worker/src/approvals.ts or the API's
+// /api/approval/:id/approve). Resuming it means re-entering the pipeline from
+// the halted node - a BUILD - so it must ONLY run on the trusted Mac with the
+// full pipeline enabled, exactly like a fresh module build (ARCHITECTURE.md's
+// "codegen runs only on the trusted Mac"). The wiring from `run_job` to this
+// path is main.rs's (owned separately); these functions are the tested,
+// DI-shaped core it calls, mirroring `run_module_build`/`ScaffoldJsBuilder`.
+
+/// Payload of an `execute_approval` job: the approved entity + its type.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExecuteApprovalPayload {
+    pub entity_id: String,
+    #[serde(default)]
+    pub entity_type: String,
+}
+
+/// True iff an approved entity should re-enter the build pipeline. Only
+/// `pipelines/pending_approval` gate entities (type `pending_approval`) carry a
+/// build to resume - a draft (`draft`) or storage backend (`storage_backend`)
+/// approval has no build. And an untrusted `lifeos-node` container
+/// (LIFEOS_BUILD_PIPELINE off) must NEVER resume a build, so the flag gates it.
+pub fn should_resume_build(entity_type: &str, build_pipeline: bool) -> bool {
+    build_pipeline && entity_type == "pending_approval"
+}
+
+/// Re-enters the build pipeline for an approved gate. Injected so the resume
+/// orchestration is unit-testable without spawning a real `node` process - the
+/// same DI seam `ModuleBuilder` uses for fresh builds.
+#[async_trait]
+pub trait BuildResumer: Send + Sync {
+    /// `Ok(runId)` when the resumed pipeline completed its remaining nodes;
+    /// `Err(message)` on any failure (honest, surfaced verbatim).
+    async fn resume(&self, approval_entity_id: &str, workspace_id: &str) -> Result<String, String>;
+}
+
+/// Shells `node build/run.js --resume <approvalEntityId> <workspaceId>` - the
+/// SAME process + last-line-JSON contract `ScaffoldJsBuilder` uses, just the
+/// resume entry. `parse_build_result` reads either build shape.
+pub struct ScaffoldJsResumer {
+    pub server_dir: String,
+}
+
+#[async_trait]
+impl BuildResumer for ScaffoldJsResumer {
+    async fn resume(&self, approval_entity_id: &str, workspace_id: &str) -> Result<String, String> {
+        let output = tokio::process::Command::new("node")
+            .arg("build/run.js")
+            .arg("--resume")
+            .arg(approval_entity_id)
+            .arg(workspace_id)
+            .current_dir(&self.server_dir)
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn node build/run.js --resume: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+        let Some(last_line) = last_line else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("build/run.js --resume produced no output (stderr: {stderr})"));
+        };
+        parse_build_result(last_line)
+    }
+}
+
+/// Resumes a build iff the approved entity is a build gate AND the pipeline is
+/// enabled. Returns `None` when there is nothing to resume (a draft/storage
+/// approval, or the flag is off), `Some(result)` when a resume was attempted.
+pub async fn run_approval_resume(
+    resumer: &dyn BuildResumer,
+    payload: &ExecuteApprovalPayload,
+    workspace_id: &str,
+    build_pipeline: bool,
+) -> Option<Result<String, String>> {
+    if !should_resume_build(&payload.entity_type, build_pipeline) {
+        return None;
+    }
+    Some(resumer.resume(&payload.entity_id, workspace_id).await)
+}
+
 /// Runs a claimed module request's build to completion: calls `builder`,
 /// applies the matching `module_requests` transition, and notifies the
 /// requester's chat (if any). This is the orchestration `main.rs`'s loop
@@ -882,8 +972,58 @@ mod tests {
         assert_eq!(dispatch("pipeline"), Dispatch::Pipeline);
         assert_eq!(dispatch("action"), Dispatch::Stub("lifeos-actions run"));
         assert_eq!(dispatch("storage_migrate"), Dispatch::Stub("lifeos-api storage migration"));
+        assert_eq!(dispatch("execute_approval"), Dispatch::Stub("lifeos-drain approval resume"));
         assert_eq!(dispatch("memory_sleep"), Dispatch::MemorySleep);
         assert_eq!(dispatch("nonsense"), Dispatch::Unknown);
+    }
+
+    // ------------------------------------------------ resume-on-approval (#142)
+
+    struct MockResumer {
+        result: Result<String, String>,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl BuildResumer for MockResumer {
+        async fn resume(&self, approval_entity_id: &str, workspace_id: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push((approval_entity_id.to_string(), workspace_id.to_string()));
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn should_resume_build_only_for_pipeline_gates_with_the_flag_on() {
+        // Build gate + flag on -> resume.
+        assert!(should_resume_build("pending_approval", true));
+        // Flag off (untrusted lifeos-node) -> never resume, even a gate.
+        assert!(!should_resume_build("pending_approval", false));
+        // A draft / storage-backend approval is not a build -> never resume.
+        assert!(!should_resume_build("draft", true));
+        assert!(!should_resume_build("storage_backend", true));
+    }
+
+    #[tokio::test]
+    async fn run_approval_resume_skips_non_build_and_flag_off() {
+        let resumer = MockResumer { result: Ok("build_1".into()), calls: Mutex::new(vec![]) };
+        let draft = ExecuteApprovalPayload { entity_id: "ent_d".into(), entity_type: "draft".into() };
+        assert!(run_approval_resume(&resumer, &draft, "ws1", true).await.is_none());
+
+        let gate = ExecuteApprovalPayload { entity_id: "ent_g".into(), entity_type: "pending_approval".into() };
+        assert!(run_approval_resume(&resumer, &gate, "ws1", false).await.is_none(), "flag off must not resume");
+        assert_eq!(resumer.calls.lock().unwrap().len(), 0, "resumer never invoked");
+    }
+
+    #[tokio::test]
+    async fn run_approval_resume_runs_the_gate_build_when_enabled() {
+        let resumer = MockResumer { result: Ok("build_42".into()), calls: Mutex::new(vec![]) };
+        let gate = ExecuteApprovalPayload { entity_id: "ent_gate".into(), entity_type: "pending_approval".into() };
+
+        let outcome = run_approval_resume(&resumer, &gate, "ws1", true).await;
+        assert_eq!(outcome, Some(Ok("build_42".to_string())));
+        let calls = resumer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], ("ent_gate".to_string(), "ws1".to_string()));
     }
 
     #[tokio::test]

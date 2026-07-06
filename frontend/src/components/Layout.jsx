@@ -36,7 +36,8 @@ import {
   StickyNote,
   MessageSquare,
   BookOpen,
-  Plane
+  Plane,
+  Inbox
 } from 'lucide-react';
 
 export default function Layout({ children, onLogout }) {
@@ -147,6 +148,7 @@ export default function Layout({ children, onLogout }) {
       items: [
         { name: 'Integrations', href: '/integrations', icon: Settings },
         { name: 'Docs', href: '/docs', icon: FileText },
+        { name: 'Approvals', href: '/approvals', icon: Inbox },
         { name: 'Agent Ledger', href: '/agent-ledger', icon: History },
         { name: 'Memory', href: '/memory', icon: Brain },
       ],

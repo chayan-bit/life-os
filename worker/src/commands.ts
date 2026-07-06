@@ -129,6 +129,7 @@ export function formatPendingApproval(entity: Entity): string {
 export function formatApprovalResult(result: ApprovalResult): string {
   if (result.outcome === "not_found") return "That draft no longer exists.";
   if (result.outcome === "already_resolved") return `Already ${result.entity.status} - no change.`;
+  if (result.outcome === "requires_typed_confirm") return `Typed phrase did not match "${result.phrase}" - not approved.`;
   if (result.outcome === "approved") return "Approved - queued for execution.";
   return "Denied.";
 }

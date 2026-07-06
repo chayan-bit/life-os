@@ -37,6 +37,18 @@ function approvalKeyboard(entityId: string): InlineKeyboard {
   return new InlineKeyboard().text("Approve", `${APPROVE_PREFIX}${entityId}`).text("Deny", `${DENY_PREFIX}${entityId}`);
 }
 
+const CONFIRM_MARKER = /\[confirm:(ent_[0-9A-Za-z]+)\]/;
+
+// The force-reply prompt shown when a typed-confirm gate is tapped. The
+// `[confirm:<id>]` marker is machine-parsed from the reply's quoted text.
+function typedConfirmPrompt(entityId: string, phrase: string): string {
+  return `This action needs typed confirmation. Reply to this message with exactly:\n${phrase}\n[confirm:${entityId}]`;
+}
+
+function parseConfirmMarker(text: string): string | null {
+  return text.match(CONFIRM_MARKER)?.[1] ?? null;
+}
+
 // `botInfo` lets tests construct a Bot without a network call to Telegram's
 // getMe (grammY's documented pattern for testing bots offline).
 export function createBot(deps: BotDeps, botInfo?: UserFromGetMe): Bot {
@@ -138,14 +150,34 @@ export function createBot(deps: BotDeps, botInfo?: UserFromGetMe): Bot {
 
     const entityId = data.slice(isApprove ? APPROVE_PREFIX.length : DENY_PREFIX.length);
     const result = isApprove ? await approveEntity(db, workspaceId, entityId) : await denyEntity(db, workspaceId, entityId);
-    const text = formatApprovalResult(result);
 
+    // A T5 gate can't be approved by a button (docs/SELF-EXTENSION-V2.md §8):
+    // answer with the phrase to type and open a force-reply prompt carrying
+    // the entity id so the reply handler below can match + approve it.
+    if (result.outcome === "requires_typed_confirm") {
+      await ctx.answerCallbackQuery({ text: `Requires typed confirmation - reply with: ${result.phrase}` });
+      await ctx.reply(typedConfirmPrompt(entityId, result.phrase), { reply_markup: { force_reply: true } }).catch(() => {});
+      return;
+    }
+
+    const text = formatApprovalResult(result);
     await ctx.answerCallbackQuery({ text });
     await ctx.editMessageText(text).catch(() => {
       // Original message may already be edited/gone (e.g. a second tap
       // racing the first) - the answerCallbackQuery toast above already
       // told the user the outcome either way.
     });
+  });
+
+  // Typed-confirm replies (issue #142): a reply to a force-reply prompt whose
+  // text carries `[confirm:<entityId>]`. The reply body must equal the exact
+  // phrase; approveEntity re-checks it server-side either way.
+  bot.on("message:text", async (ctx) => {
+    const replyText = ctx.message.reply_to_message?.text;
+    const entityId = replyText ? parseConfirmMarker(replyText) : null;
+    if (!entityId) return;
+    const result = await approveEntity(db, workspaceId, entityId, ctx.message.text.trim());
+    await ctx.reply(formatApprovalResult(result));
   });
 
   return bot;

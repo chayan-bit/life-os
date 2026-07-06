@@ -149,6 +149,11 @@ function runAttrs(ctx, request, status, nodes) {
     status,
     origin: "build",
     nodes,
+    // The full ordered DAG (id/tier/params/description/dependsOn). This is the
+    // minimal resume token (issue #142): with it + the per-node `nodes`
+    // statuses above, resume.js can re-enter the pipeline at an approved gate
+    // without re-running spec/plan. Empty until the plan is validated.
+    plan: ctx.plan ?? [],
   };
 }
 

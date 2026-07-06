@@ -82,6 +82,50 @@ describe("approveEntity", () => {
   });
 });
 
+describe("approveEntity - typed confirm (issue #142)", () => {
+  async function seedTypedGate() {
+    return createEntity(db, WS, {
+      module: "pipelines",
+      type: "pending_approval",
+      title: "T5 crate",
+      status: "pending_approval",
+      attrs: { requires_typed_confirm: true, node: "t5" },
+    });
+  }
+
+  it("refuses a bare tap (no typed phrase) on a typed-confirm gate", async () => {
+    const gate = await seedTypedGate();
+
+    const result = await approveEntity(db, WS, gate.id);
+
+    expect(result.outcome).toBe("requires_typed_confirm");
+    if (result.outcome === "requires_typed_confirm") expect(result.phrase).toBe("t5");
+    const still = await getEntityById(db, WS, gate.id);
+    expect(still?.status).toBe("pending_approval");
+    const queuedJobs = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
+    expect(queuedJobs).toHaveLength(0);
+  });
+
+  it("refuses a wrong typed phrase", async () => {
+    const gate = await seedTypedGate();
+    const result = await approveEntity(db, WS, gate.id, "nope");
+    expect(result.outcome).toBe("requires_typed_confirm");
+  });
+
+  it("approves when the exact phrase is typed, enqueuing execute_approval", async () => {
+    const gate = await seedTypedGate();
+
+    const result = await approveEntity(db, WS, gate.id, "t5");
+
+    expect(result.outcome).toBe("approved");
+    const updated = await getEntityById(db, WS, gate.id);
+    expect(updated?.status).toBe("approved");
+    const queuedJobs = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
+    expect(queuedJobs).toHaveLength(1);
+    expect(queuedJobs[0].kind).toBe("execute_approval");
+  });
+});
+
 describe("denyEntity", () => {
   it("transitions to denied, records a *.rejected event, and enqueues nothing", async () => {
     const draft = await seedDraft();

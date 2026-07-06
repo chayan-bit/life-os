@@ -22,6 +22,10 @@ pub enum ApiError {
     Forbidden(String),
     /// Resource (entity/workspace/...) does not exist.
     NotFound(String),
+    /// The request lost a race - e.g. an approval already resolved by another
+    /// tap (CAS matched zero rows). Distinct from BadRequest so callers can
+    /// treat "already done" as benign, not a client mistake.
+    Conflict(String),
     /// Route is intentionally not built yet in the base (honest, not a mock).
     NotImplemented(String),
     /// A downstream/local subprocess (e.g. an agent CLI) failed.
@@ -37,6 +41,7 @@ impl ApiError {
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
