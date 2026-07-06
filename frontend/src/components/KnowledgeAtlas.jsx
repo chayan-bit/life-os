@@ -9,6 +9,13 @@ import ATLAS_DATA from '../atlas_data.json';
 import { getCustomDomains, addCustomDomain, removeCustomDomain } from '../lib/atlasStore';
 import { scaffoldDomain, llmSelection } from '../lib/ai';
 import { apiCall } from '../lib/api';
+import {
+  listAnnotations,
+  createAnnotation,
+  updateAnnotation,
+  deleteAnnotation,
+  migrateLegacyAnnotations,
+} from '../lib/annotationsApi';
 
 // Palette + icons used to backfill metadata for domain entries that were
 // seeded with only { id, topics[] } (the JSON has ~132 such stubs). Without
@@ -57,7 +64,6 @@ const mergeDomainsById = (list) => {
 
 const BASE_DOMAINS = mergeDomainsById(ATLAS_DATA).map(normalizeDomain);
 
-const ANNOT_KEY = "KA_ANNOTATIONS_V1";
 const PROG_KEY = "KA_PROGRESS_V1";
 const CONN_KEY = "KA_USERCONN_V1";
 
@@ -135,11 +141,19 @@ export default function KnowledgeAtlas() {
   };
 
   useEffect(() => {
-    try {
-      if (localStorage.getItem(ANNOT_KEY)) setAnnotations(JSON.parse(localStorage.getItem(ANNOT_KEY)));
-      if (localStorage.getItem(PROG_KEY)) setProgress(JSON.parse(localStorage.getItem(PROG_KEY)));
-      if (localStorage.getItem(CONN_KEY)) setUserConns(JSON.parse(localStorage.getItem(CONN_KEY)));
-    } catch (e) {}
+    // Annotations now live in the workspace-scoped API. On first load we do a
+    // one-time, best-effort import of any legacy localStorage notes, then read
+    // the canonical set back from the API. Progress/connections stay local.
+    (async () => {
+      try {
+        await migrateLegacyAnnotations();
+        setAnnotations(await listAnnotations());
+      } catch (e) {}
+      try {
+        if (localStorage.getItem(PROG_KEY)) setProgress(JSON.parse(localStorage.getItem(PROG_KEY)));
+        if (localStorage.getItem(CONN_KEY)) setUserConns(JSON.parse(localStorage.getItem(CONN_KEY)));
+      } catch (e) {}
+    })();
   }, []);
 
   // Escape key closes subtopic viewer
@@ -150,9 +164,18 @@ export default function KnowledgeAtlas() {
     return () => window.removeEventListener('keydown', onKey);
   }, [activeSubtopic]);
 
-  const saveAnnotations = (newAnns) => {
-    setAnnotations(newAnns);
-    localStorage.setItem(ANNOT_KEY, JSON.stringify(newAnns));
+  // Delete one annotation via the API, then drop it from local state.
+  const removeAnnotation = async (id) => {
+    if (await deleteAnnotation(id)) {
+      setAnnotations((prev) => prev.filter((x) => x.id !== id));
+    }
+  };
+
+  // Clear every annotation (each is its own DELETE - there is no bulk route).
+  const clearAllAnnotations = async () => {
+    const ids = annotations.map((a) => a.id);
+    for (const id of ids) await deleteAnnotation(id);
+    setAnnotations([]);
   };
 
   // Use fixed positioning for tooltip - getBoundingClientRect() gives viewport coords directly
@@ -204,42 +227,46 @@ export default function KnowledgeAtlas() {
 
   const saveAnnotation = async () => {
     if (annotationDraft.type !== 'link' && !annotationDraft.text.trim()) return;
-    const annData = {
-      id: annotationDraft.id || "a_" + Date.now().toString(36),
+    const draft = {
       kind: annotationDraft.type,
       topicId: pendingAnchor?.topicId || activeTopic?.id,
       anchorType: pendingAnchor?.type || 'selection',
       quote: pendingAnchor?.quote,
       text: annotationDraft.text,
       link: annotationDraft.type === 'link' ? { to: annotationDraft.linkTo, url: annotationDraft.linkUrl, note: annotationDraft.linkNote } : null,
-      createdAt: new Date().toISOString(),
-      answer: '',
-      answeredAt: null
     };
-    let newAnns;
+
+    let saved;
     if (annotationDraft.id) {
-      newAnns = annotations.map(a => a.id === annData.id ? { ...a, ...annData, answer: a.answer, answeredAt: a.answeredAt } : a);
+      // Edit: the PATCH replaces attrs wholesale, so carry the existing
+      // answer/createdAt forward rather than blanking them.
+      const existing = annotations.find(a => a.id === annotationDraft.id) || {};
+      saved = await updateAnnotation(annotationDraft.id, {
+        ...draft, createdAt: existing.createdAt, answer: existing.answer, answeredAt: existing.answeredAt,
+      });
+      if (saved) setAnnotations(prev => prev.map(a => a.id === saved.id ? saved : a));
     } else {
-      newAnns = [...annotations, annData];
+      saved = await createAnnotation({ ...draft, createdAt: new Date().toISOString(), answer: '', answeredAt: null });
+      if (saved) setAnnotations(prev => [...prev, saved]);
     }
-    saveAnnotations(newAnns);
     setShowAnnotationModal(false);
     window.getSelection()?.removeAllRanges();
+    if (!saved) return;
 
-    if (annData.kind === 'question' && !annData.answer) {
+    if (saved.kind === 'question' && !saved.answer) {
       // Route through apiCall so the request carries API_BASE + tenant/auth
       // headers (X-Workspace-Id, Authorization). A raw fetch here would be
       // untenanted and pinned to localhost, breaking non-local deployments.
       const { ok, data } = await apiCall('POST', '/api/llm', {
         system: "You are a helpful study assistant. Answer the user's question based on the provided context.",
-        prompt: `Context Quote: "${annData.quote}"\nQuestion: ${annData.text}`,
+        prompt: `Context Quote: "${saved.quote}"\nQuestion: ${saved.text}`,
         ...llmSelection(),
       });
-      if (ok && data && data.text) {
-        saveAnnotations(newAnns.map(a => a.id === annData.id ? { ...a, answer: data.text, answeredAt: new Date().toISOString() } : a));
-      } else {
-        saveAnnotations(newAnns.map(a => a.id === annData.id ? { ...a, answer: "Mock response - Rust backend `/api/llm` not connected yet.", answeredAt: new Date().toISOString() } : a));
-      }
+      const answer = ok && data && data.text
+        ? data.text
+        : "Mock response - Rust backend `/api/llm` not connected yet.";
+      const answered = await updateAnnotation(saved.id, { ...saved, answer, answeredAt: new Date().toISOString() });
+      if (answered) setAnnotations(prev => prev.map(a => a.id === answered.id ? answered : a));
     }
   };
 
@@ -537,7 +564,7 @@ export default function KnowledgeAtlas() {
           </div>
           <div className="p-2 border-b-2 border-neo-border flex flex-wrap gap-2">
             <button onClick={exportNotes} className="neo-btn bg-neo-surface py-1 px-2 text-[10px] flex items-center gap-1"><Download size={10} /> Export</button>
-            <button onClick={() => { if (window.confirm("Clear all annotations?")) saveAnnotations([]); }} className="neo-btn bg-neo-red text-white py-1 px-2 text-[10px] flex items-center gap-1"><Trash2 size={10} /> Clear</button>
+            <button onClick={() => { if (window.confirm("Clear all annotations?")) clearAllAnnotations(); }} className="neo-btn bg-neo-red text-white py-1 px-2 text-[10px] flex items-center gap-1"><Trash2 size={10} /> Clear</button>
             {notesFilter && <button onClick={() => setNotesFilter(null)} className="neo-btn bg-neo-yellow text-black py-1 px-2 text-[10px]">Show All</button>}
           </div>
           <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4 bg-[var(--neo-bg)]">
@@ -547,7 +574,7 @@ export default function KnowledgeAtlas() {
                   <span className="font-bold text-xs">{a.kind === 'question' ? '❓ Question' : a.kind === 'link' ? '🔗 Link' : '💬 Note'}</span>
                   <div className="flex gap-1">
                     <button onClick={() => openAnnotationComposer(a.kind, a)} className="hover:text-neo-blue"><Pencil size={12} /></button>
-                    <button onClick={() => saveAnnotations(annotations.filter(x => x.id !== a.id))} className="hover:text-neo-red"><Trash2 size={12} /></button>
+                    <button onClick={() => removeAnnotation(a.id)} className="hover:text-neo-red"><Trash2 size={12} /></button>
                   </div>
                 </div>
                 {a.quote && <blockquote className="border-l-2 border-neo-blue pl-2 text-[10px] text-neo-text-muted italic">"{a.quote}"</blockquote>}

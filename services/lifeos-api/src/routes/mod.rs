@@ -1,6 +1,7 @@
 //! HTTP surface for `lifeos-api`. One handler module per resource group.
 
 mod agent;
+mod annotation;
 mod browser;
 mod calendar;
 mod configs;
@@ -59,6 +60,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/entity/:id", get(entity::get_one).patch(entity::update))
         // --- repair a forced sync conflict by replaying events (docs/DATA-MODEL.md §4.2) ---
         .route("/api/entity/:id/reconcile", post(entity::reconcile))
+        // --- reader/annotation layer: workspace-scoped notes/highlights/
+        //     questions on entities (docs/DATA-MODEL.md §2.4). Plain mutable
+        //     CRUD - not append-only - each write still logs an event. ---
+        .route("/api/annotation", post(annotation::create).get(annotation::list))
+        .route(
+            "/api/annotation/:id",
+            patch(annotation::update).delete(annotation::delete),
+        )
         // --- graph edges ---
         .route("/api/edge", post(edge::create).get(edge::list))
         .route("/api/edge/:id", patch(edge::update))

@@ -24,6 +24,13 @@ fn parse_attrs(s: Option<String>) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Object(Default::default()))
 }
 
+/// Parse an optional JSON text column into an optional value. Unlike
+/// `parse_attrs`, a NULL column stays `None` (not an empty object) - used by
+/// `annotations.anchor`, which is legitimately absent for whole-entity notes.
+fn parse_opt_attrs(s: Option<String>) -> Option<serde_json::Value> {
+    s.and_then(|s| serde_json::from_str(&s).ok())
+}
+
 // ---------------------------------------------------------------- entities
 
 pub const COLS_ENTITY: &str =
@@ -142,6 +149,43 @@ pub fn read_event(row: &Row) -> Result<Event, ApiError> {
         outcome: row.get(15)?,
         eval_score: row.get(16)?,
         gated: row.get(17)?,
+    })
+}
+
+// ------------------------------------------------------------- annotations
+
+pub const COLS_ANNOTATION: &str =
+    "id, workspace_id, entity_id, kind, body, anchor, attrs, created_by, created_at, updated_at";
+
+/// Workspace-scoped note/highlight/question/comment/link attached to an entity
+/// (or the workspace at large when `entity_id` is null). Unlike `events`,
+/// annotations are mutable and are plain CRUD - not the audit log.
+#[derive(Serialize)]
+pub struct Annotation {
+    pub id: String,
+    pub workspace_id: String,
+    pub entity_id: Option<String>,
+    pub kind: String,
+    pub body: Option<String>,
+    pub anchor: Option<serde_json::Value>,
+    pub attrs: serde_json::Value,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub fn read_annotation(row: &Row) -> Result<Annotation, ApiError> {
+    Ok(Annotation {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        entity_id: row.get(2)?,
+        kind: row.get(3)?,
+        body: row.get(4)?,
+        anchor: parse_opt_attrs(row.get(5)?),
+        attrs: parse_attrs(row.get(6)?),
+        created_by: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
