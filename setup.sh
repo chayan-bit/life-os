@@ -37,8 +37,8 @@ if [ "$found_agent" = 0 ]; then
   echo "  (Claude Code, Gemini CLI, OpenCode, ...) or set ANTHROPIC_API_KEY."
 fi
 
-say "Building Rust services (lifeos-api + lifeos-drain, release)"
-(cd services && cargo build --release -p lifeos-api -p lifeos-drain)
+say "Building Rust services (lifeos-api + lifeos-drain + lifeos-cli, release)"
+(cd services && cargo build --release -p lifeos-api -p lifeos-drain -p lifeos-cli)
 
 say "Installing frontend dependencies"
 (cd frontend && npm install)

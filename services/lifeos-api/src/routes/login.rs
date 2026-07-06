@@ -137,21 +137,25 @@ pub async fn set_password(
     let user = find_user_by_email(&state, email)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no account for '{email}'")))?;
-    if user.password_hash.is_some() {
+
+    let password_hash =
+        hash_password(&req.password).map_err(|e| ApiError::Internal(format!("password hashing failed: {e}")))?;
+    // Atomic guard: the `password_hash IS NULL` predicate is checked and
+    // written in the same statement, so a concurrent second request can
+    // never both pass a pre-check and then overwrite an already-set
+    // password (the read-then-write race this route used to have).
+    let rows_changed = state
+        .conn
+        .execute(
+            "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1 AND password_hash IS NULL",
+            libsql::params![user.id.clone(), password_hash, now_secs()],
+        )
+        .await?;
+    if rows_changed == 0 {
         return Err(ApiError::BadRequest(
             "this account already has a password - use POST /api/login".into(),
         ));
     }
-
-    let password_hash =
-        hash_password(&req.password).map_err(|e| ApiError::Internal(format!("password hashing failed: {e}")))?;
-    state
-        .conn
-        .execute(
-            "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
-            libsql::params![user.id.clone(), password_hash, now_secs()],
-        )
-        .await?;
 
     Ok(Json(json!({ "status": "password_set" })))
 }

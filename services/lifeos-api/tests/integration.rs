@@ -219,6 +219,43 @@ async fn logout_revokes_the_session_and_set_password_only_works_once() {
 }
 
 #[tokio::test]
+async fn set_password_is_atomic_and_rejects_a_second_call_on_the_same_passwordless_account() {
+    let app = test_app().await;
+
+    // `chayan@lifeos.app` is the seeded default account and starts passwordless.
+    let (st, _) = send(
+        &app.router,
+        "POST",
+        "/api/account/set-password",
+        Some(json!({"email": "chayan@lifeos.app", "password": "first-password-here"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "first set-password on a passwordless account must succeed");
+
+    // A second call must be rejected by the atomic `WHERE password_hash IS NULL`
+    // guard, not just an earlier read-then-write check - this is what closes the
+    // TOCTOU race a concurrent request could otherwise win.
+    let (st, _) = send(
+        &app.router,
+        "POST",
+        "/api/account/set-password",
+        Some(json!({"email": "chayan@lifeos.app", "password": "second-password-here"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a second set-password call must never overwrite an already-set password");
+
+    // The first password still works; the second was never applied.
+    let (st, _) = send(
+        &app.router,
+        "POST",
+        "/api/login",
+        Some(json!({"email": "chayan@lifeos.app", "password": "first-password-here"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the password set by the first call must still be the active one");
+}
+
+#[tokio::test]
 async fn entity_create_list_and_workspace_scoping() {
     let app = test_app().await;
     // Create in the default workspace.
