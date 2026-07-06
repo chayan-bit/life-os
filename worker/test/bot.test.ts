@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserFromGetMe } from "grammy/types";
 import type { LocalDb } from "@lifeos/db/client/local";
-import { events } from "@lifeos/db";
+import { events, jobs } from "@lifeos/db";
 import { eq } from "@lifeos/db/query";
 import { createBot, healthMessage, type BotDeps } from "../src/bot.js";
 import { createTestDb } from "./testDb.js";
@@ -454,5 +454,81 @@ describe("createBot - heavy-job enqueue (issue #67)", () => {
     await bot.handleUpdate(textUpdate("/ingest https://example.com/clip"));
 
     expect(sent[0]).toBe("Queued for the Mac.");
+  });
+});
+
+describe("createBot - voice notes (issue #143)", () => {
+  // Intercepts getFile (grammY API call) and stubs the raw file download so no
+  // network is hit - grammY's documented offline pattern extended to files.
+  function captureVoiceFlow(bot: ReturnType<typeof createBot>, fileSize = 2048) {
+    const sent: string[] = [];
+    bot.api.config.use((prev, method, payload, signal) => {
+      if (method === "sendMessage") {
+        sent.push((payload as { text: string }).text);
+        return Promise.resolve({ ok: true, result: {} } as never);
+      }
+      if (method === "getFile") {
+        return Promise.resolve({
+          ok: true,
+          result: { file_id: "f1", file_unique_id: "u1", file_size: fileSize, file_path: "voice/file_1.oga" },
+        } as never);
+      }
+      return prev(method, payload, signal);
+    });
+    return sent;
+  }
+
+  function voiceUpdate(fileSize?: number) {
+    return {
+      update_id: 20,
+      message: {
+        message_id: 21,
+        date: 0,
+        chat: { id: 99, type: "private" as const, first_name: "tester" },
+        from: { id: 1, is_bot: false, first_name: "tester" },
+        voice: { file_id: "f1", file_unique_id: "u1", duration: 3, mime_type: "audio/ogg", file_size: fileSize },
+      },
+    };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("downloads a voice note and enqueues a voice_turn job carrying base64 audio + chat", async () => {
+    const audio = new Uint8Array([79, 103, 103, 83, 1, 2, 3, 4]); // "OggS" + payload
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(audio.buffer, { status: 200 })),
+    );
+
+    const bot = createBot(deps, FAKE_BOT_INFO);
+    const sent = captureVoiceFlow(bot);
+
+    await bot.init();
+    await bot.handleUpdate(voiceUpdate(audio.byteLength));
+
+    expect(sent[0]).toMatch(/transcribing/i);
+
+    const rows = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe("voice_turn");
+    const payload = JSON.parse(rows[0].payload) as { chat_id: string; audio_b64: string; mime: string };
+    expect(payload.chat_id).toBe("99");
+    expect(payload.mime).toBe("audio/ogg");
+    // Round-trips back to the original bytes.
+    expect(atob(payload.audio_b64)).toBe(String.fromCharCode(...audio));
+  });
+
+  it("rejects an oversize audio file with a friendly message and enqueues nothing", async () => {
+    const bot = createBot(deps, FAKE_BOT_INFO);
+    const sent = captureVoiceFlow(bot);
+
+    await bot.init();
+    await bot.handleUpdate(voiceUpdate(21 * 1024 * 1024));
+
+    expect(sent[0]).toMatch(/too large/i);
+    const rows = await db.select().from(jobs).where(eq(jobs.workspaceId, WS));
+    expect(rows).toHaveLength(0);
   });
 });

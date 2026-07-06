@@ -1,9 +1,17 @@
 // grammY bot definition - issues #63-67.
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import type { WorkerDb } from "@lifeos/db/client/worker";
 import { approveEntity, denyEntity, listPendingApprovals } from "./approvals.js";
 import { recordEvent } from "./events.js";
+import {
+  MAX_VOICE_BYTES,
+  bytesToBase64,
+  downloadTelegramFile,
+  enqueueVoiceTurn,
+  voiceTooLargeMessage,
+  type TelegramVoiceLike,
+} from "./voice.js";
 import {
   captureDraft,
   captureTask,
@@ -168,6 +176,46 @@ export function createBot(deps: BotDeps, botInfo?: UserFromGetMe): Bot {
       // told the user the outcome either way.
     });
   });
+
+  // Voice notes (issue #143): download the OGG/Opus voice note (or an audio
+  // file), carry it as base64 in a `voice_turn` job, and let the Mac drain
+  // transcribe -> agent turn -> reply. The bot only enqueues; it never
+  // transcribes or runs the agent itself.
+  async function handleVoice(ctx: Context, media: TelegramVoiceLike | undefined) {
+    if (!media) return;
+    if (typeof media.file_size === "number" && media.file_size > MAX_VOICE_BYTES) {
+      await ctx.reply(voiceTooLargeMessage());
+      return;
+    }
+    const file = await ctx.api.getFile(media.file_id);
+    if (!file.file_path) {
+      await ctx.reply("Sorry, I couldn't fetch that voice note.");
+      return;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = await downloadTelegramFile(deps.token, file.file_path);
+    } catch {
+      await ctx.reply("Sorry, I couldn't download that voice note.");
+      return;
+    }
+    if (bytes.byteLength > MAX_VOICE_BYTES) {
+      await ctx.reply(voiceTooLargeMessage());
+      return;
+    }
+    await enqueueVoiceTurn(
+      db,
+      workspaceId,
+      String(ctx.chat?.id ?? ""),
+      bytesToBase64(bytes),
+      media.mime_type,
+      file.file_path,
+    );
+    await ctx.reply("Got it - transcribing your voice note and thinking...");
+  }
+
+  bot.on("message:voice", (ctx) => handleVoice(ctx, ctx.message.voice));
+  bot.on("message:audio", (ctx) => handleVoice(ctx, ctx.message.audio));
 
   // Typed-confirm replies (issue #142): a reply to a force-reply prompt whose
   // text carries `[confirm:<entityId>]`. The reply body must equal the exact
