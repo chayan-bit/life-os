@@ -262,9 +262,43 @@ pub async fn seed(conn: &Connection) -> Result<(), libsql::Error> {
     let user_exists = scalar_exists(conn, "SELECT 1 FROM users WHERE email = ?1", "chayan@lifeos.app").await?;
     if !user_exists {
         tracing::info!("seeding default user + membership");
+
+        // Security audit finding 2(b): the owner is seeded with a NON-NULL
+        // `password_hash`, never NULL. A NULL hash would let the unauthenticated,
+        // NULL-guarded `/api/account/set-password` bootstrap (routes/login.rs)
+        // set the owner's password and log in as owner before the real owner ever
+        // does - a full workspace takeover. With a non-NULL hash the
+        // `WHERE password_hash IS NULL` path can never match this row.
+        //
+        // If `LIFEOS_ADMIN_PASSWORD` is set at first boot we seed argon2(that) so
+        // the owner can log in immediately. Otherwise we seed argon2 over a fresh
+        // random secret that is discarded on the spot: a valid, non-NULL, but
+        // NON-VERIFIABLE ("locked") hash. No password logs in as the owner until
+        // an admin sets one (via `LIFEOS_ADMIN_PASSWORD` on a fresh DB, or the
+        // local-only set-password bootstrap).
+        let admin_password = std::env::var("LIFEOS_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty());
+        if admin_password.is_some() {
+            tracing::info!("seeding owner 'chayan@lifeos.app' with LIFEOS_ADMIN_PASSWORD");
+        } else {
+            tracing::warn!(
+                "no LIFEOS_ADMIN_PASSWORD set: seeding owner 'chayan@lifeos.app' with a locked (unusable) \
+                 password. Set LIFEOS_ADMIN_PASSWORD before first boot, or use the local set-password \
+                 bootstrap, to enable owner login."
+            );
+        }
+        let seed_secret = admin_password.unwrap_or_else(crate::auth::new_refresh_token);
+        let password_hash = crate::auth::hash_password(&seed_secret).unwrap_or_else(|e| {
+            // argon2 hashing effectively cannot fail; if it somehow does, fall
+            // back to a sentinel that `verify_password` rejects (it fails closed
+            // on an unparseable hash) and that is still non-NULL, so the takeover
+            // path stays closed.
+            tracing::error!("argon2 hashing of the seed owner password failed ({e}); storing a non-verifiable sentinel");
+            "locked:unusable".to_string()
+        });
+
         conn.execute(
-            "INSERT INTO users (id, email, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            libsql::params!["usr_chayan", "chayan@lifeos.app", "Chayan Aggarwal", now, now],
+            "INSERT INTO users (id, email, name, password_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params!["usr_chayan", "chayan@lifeos.app", "Chayan Aggarwal", password_hash, now, now],
         )
         .await?;
         conn.execute(

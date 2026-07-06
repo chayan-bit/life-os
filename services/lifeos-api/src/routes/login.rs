@@ -7,20 +7,23 @@
 //! bounded lifetime even if never explicitly revoked.
 //! `POST /api/logout` revokes a single session.
 //!
-//! `POST /api/account/set-password` is a narrow bootstrap: it only ever
-//! succeeds for a user whose `password_hash` is currently NULL (the
-//! personal account seeded by `db.rs::seed()` before issue #100, or any
-//! other pre-#100 row) - once a password is set, this route can never be
-//! used to overwrite it, so it cannot be used to take over an already-
-//! secured account.
+//! `POST /api/account/set-password` is a narrow, LOCAL-ONLY bootstrap: it only
+//! ever succeeds for a user whose `password_hash` is currently NULL (a pre-#100
+//! row) and only when the request originates from loopback (security audit
+//! finding 2). The default seeded owner is NO LONGER passwordless: `db.rs::seed()`
+//! now seeds it with a non-NULL, unusable hash (or `argon2(LIFEOS_ADMIN_PASSWORD)`),
+//! so this route can never be used to take the owner over, even before the real
+//! owner bootstraps. Once a password is set, the atomic `WHERE password_hash IS
+//! NULL` guard means this route can never overwrite it.
 
 use crate::auth::{hash_password, hash_refresh_token, issue_token, new_refresh_token, verify_password, REFRESH_TOKEN_TTL_SECS};
 use crate::error::{ApiError, ApiResult};
 use crate::ids::{new_id, now_secs};
 use crate::state::AppState;
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::IpAddr;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -30,17 +33,24 @@ pub struct LoginRequest {
 
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> ApiResult<Json<Value>> {
     let email = req.email.trim();
-    let user = find_user_by_email(&state, email)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("invalid email or password".into()))?;
+    // Finding 46: return ONE identical error for every failure mode - unknown
+    // email, an account with no usable password yet, or a wrong password - so
+    // the response can never be used to enumerate which accounts exist or which
+    // are un-bootstrapped. The specific reason is logged server-side only, and
+    // no raw upstream/DB text is ever echoed to the client.
+    let invalid = || ApiError::BadRequest("invalid email or password".into());
 
-    let stored_hash = user.password_hash.as_deref().ok_or_else(|| {
-        ApiError::BadRequest(
-            "this account has no password set yet - use POST /api/account/set-password once".into(),
-        )
-    })?;
+    let Some(user) = find_user_by_email(&state, email).await? else {
+        tracing::debug!("login rejected: no account for the supplied email");
+        return Err(invalid());
+    };
+    let Some(stored_hash) = user.password_hash.as_deref() else {
+        tracing::warn!(user_id = %user.id, "login rejected: account has no usable password set");
+        return Err(invalid());
+    };
     if !verify_password(&req.password, stored_hash) {
-        return Err(ApiError::BadRequest("invalid email or password".into()));
+        tracing::debug!(user_id = %user.id, "login rejected: wrong password");
+        return Err(invalid());
     }
 
     let workspace_id = primary_workspace(&state, &user.id).await?;
@@ -81,13 +91,23 @@ pub async fn refresh(State(state): State<AppState>, Json(req): Json<RefreshReque
         None => return Err(ApiError::BadRequest("invalid, expired, or already-used refresh token".into())),
     };
 
-    state
+    // Finding 17: rotation must be a compare-and-swap, not an unconditional
+    // UPDATE. Re-check `revoked_at IS NULL` in the same statement and require
+    // exactly one changed row, so two concurrent replays of the same refresh
+    // token can never BOTH pass the SELECT above and then BOTH mint a fresh
+    // session - exactly one racer wins, the other is rejected like any reuse.
+    let rotated = state
         .conn
         .execute(
-            "UPDATE sessions SET revoked_at = ?2 WHERE id = ?1",
+            "UPDATE sessions SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
             libsql::params![session_id, now],
         )
         .await?;
+    if rotated != 1 {
+        return Err(ApiError::BadRequest(
+            "invalid, expired, or already-used refresh token".into(),
+        ));
+    }
 
     let email = user_email(&state, &user_id).await?;
     let key_token = issue_token(&state.config.jwt_secret, &user_id, &workspace_id, &email);
@@ -125,21 +145,44 @@ pub struct SetPasswordRequest {
     password: String,
 }
 
-/// One-time bootstrap for a pre-#100 passwordless account (see module docs).
+/// One-time, LOCAL-ONLY bootstrap for a pre-#100 passwordless account (see
+/// module docs). Finding 2(a): reject anything that did not originate from
+/// loopback so an unauthenticated remote caller can never bootstrap someone
+/// else's account.
 pub async fn set_password(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SetPasswordRequest>,
 ) -> ApiResult<Json<Value>> {
+    // TODO(finding-2): the robust, UNSPOOFABLE origin check is the raw peer
+    // socket via `axum::extract::ConnectInfo<std::net::SocketAddr>`. Wiring it
+    // requires `main.rs` to serve with
+    // `app.into_make_service_with_connect_info::<std::net::SocketAddr>()`
+    // (that file is owned by another component, so it is not changed here).
+    // Until that lands, `bootstrap_origin_is_local` is a best-effort gate over
+    // the (client-supplied, hence spoofable) forwarding headers, backed by the
+    // real teeth of this fix: the seeded owner is sealed with a non-NULL hash
+    // (db.rs::seed), so this NULL-guarded route can never take it over anyway.
+    if !bootstrap_origin_is_local(&headers, state.config.trust_workspace_header) {
+        return Err(ApiError::Forbidden(
+            "set-password is only available from localhost".into(),
+        ));
+    }
+
     let email = req.email.trim();
     if req.password.len() < 8 {
         return Err(ApiError::BadRequest("password must be at least 8 characters".into()));
     }
+    // Do not reflect the requested email or otherwise confirm which addresses
+    // do or do not exist (finding 46, same principle as `login`).
     let user = find_user_by_email(&state, email)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("no account for '{email}'")))?;
+        .ok_or_else(|| ApiError::NotFound("no passwordless account matches this request".into()))?;
 
-    let password_hash =
-        hash_password(&req.password).map_err(|e| ApiError::Internal(format!("password hashing failed: {e}")))?;
+    let password_hash = hash_password(&req.password).map_err(|e| {
+        tracing::error!("set-password hashing failed: {e}");
+        ApiError::Internal("could not set password".into())
+    })?;
     // Atomic guard: the `password_hash IS NULL` predicate is checked and
     // written in the same statement, so a concurrent second request can
     // never both pass a pre-check and then overwrite an already-set
@@ -158,6 +201,93 @@ pub async fn set_password(
     }
 
     Ok(Json(json!({ "status": "password_set" })))
+}
+
+/// Whether a bootstrap set-password request may proceed from where it
+/// originated. This is a best-effort loopback gate until `ConnectInfo` is wired
+/// (see the TODO in `set_password`):
+///
+/// - Local-first default (`trust_workspace_header == true`): the API is bound to
+///   loopback, so a request that a fronting proxy did NOT tag with a client IP
+///   reached us directly and is local. If a proxy did forward one, it is allowed
+///   only when that address is itself loopback.
+/// - Shared/strict deployments (`trust_workspace_header == false`): client
+///   headers are not trusted and we lack the raw peer socket, so this local-only
+///   bootstrap is refused unless an operator explicitly opts in out-of-band with
+///   `LIFEOS_ALLOW_REMOTE_SET_PASSWORD`.
+fn bootstrap_origin_is_local(headers: &HeaderMap, trust_workspace_header: bool) -> bool {
+    if trust_workspace_header {
+        match forwarded_client_ip(headers) {
+            Some(ip) => ip.is_loopback(),
+            None => true,
+        }
+    } else {
+        remote_bootstrap_opt_in()
+    }
+}
+
+/// Best-effort extraction of the origin-client IP a fronting proxy recorded, via
+/// the usual forwarding headers. `None` means no such header was present (a
+/// direct hit on the loopback-bound listener).
+///
+/// These headers are client-supplied and therefore spoofable - they are a
+/// defense-in-depth signal, never an authority. The authoritative origin check
+/// is the raw peer socket (`ConnectInfo<SocketAddr>`); see the TODO in
+/// `set_password` and finding 2.
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    // `X-Forwarded-For: client, proxy1, proxy2` - the leftmost entry is the
+    // original client.
+    if let Some(first) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+    {
+        if let Ok(ip) = first.trim().parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+    if let Some(xri) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(ip) = xri.trim().parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+    // RFC 7239 `Forwarded: for=192.0.2.60;proto=http;by=203.0.113.43` (possibly a
+    // comma-separated chain) - the first `for=` is the origin client.
+    if let Some(fwd) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
+        for part in fwd.split([',', ';']) {
+            let part = part.trim();
+            let lower = part.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("for=") {
+                // Re-slice from the ORIGINAL (case-preserving is irrelevant for
+                // IPs, but keeps this robust): drop quotes and IPv6 brackets, and
+                // an optional trailing `:port`.
+                let raw = &part[part.len() - rest.len()..];
+                let cleaned = raw.trim_matches('"');
+                if let Some(v6) = cleaned.strip_prefix('[') {
+                    if let Some(host) = v6.split(']').next() {
+                        if let Ok(ip) = host.parse::<IpAddr>() {
+                            return Some(ip);
+                        }
+                    }
+                    continue;
+                }
+                let host = cleaned.rsplit_once(':').map(|(h, _)| h).unwrap_or(cleaned);
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Explicit opt-in for shared deployments that genuinely need the local-only
+/// bootstrap route (e.g. a controlled one-off migration).
+fn remote_bootstrap_opt_in() -> bool {
+    matches!(
+        std::env::var("LIFEOS_ALLOW_REMOTE_SET_PASSWORD").ok().as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 /// Creates a session row and returns the plaintext refresh token (only ever

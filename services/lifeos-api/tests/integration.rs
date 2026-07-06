@@ -227,40 +227,43 @@ async fn logout_revokes_the_session_and_set_password_only_works_once() {
 }
 
 #[tokio::test]
-async fn set_password_is_atomic_and_rejects_a_second_call_on_the_same_passwordless_account() {
+async fn seeded_owner_is_sealed_and_cannot_be_taken_over_via_set_password() {
+    // Security audit finding 2: `chayan@lifeos.app` (owner of the default
+    // workspace) used to be seeded passwordless (NULL `password_hash`), so any
+    // unauthenticated caller reaching the API before the real owner bootstrapped
+    // could set its password via /api/account/set-password and log in as owner.
+    // It is now seeded with a non-NULL, unusable hash, so the NULL-guarded
+    // bootstrap can never match it.
     let app = test_app().await;
 
-    // `chayan@lifeos.app` is the seeded default account and starts passwordless.
+    // set-password must NOT succeed for the seeded owner: its hash is non-NULL,
+    // so the atomic `WHERE password_hash IS NULL` guard changes zero rows.
     let (st, _) = send(
         &app.router,
         "POST",
         "/api/account/set-password",
-        Some(json!({"email": "chayan@lifeos.app", "password": "first-password-here"})),
+        Some(json!({"email": "chayan@lifeos.app", "password": "attacker-chosen-password"})),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "first set-password on a passwordless account must succeed");
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "the sealed seeded owner must reject set-password (non-NULL hash), preventing takeover"
+    );
 
-    // A second call must be rejected by the atomic `WHERE password_hash IS NULL`
-    // guard, not just an earlier read-then-write check - this is what closes the
-    // TOCTOU race a concurrent request could otherwise win.
-    let (st, _) = send(
-        &app.router,
-        "POST",
-        "/api/account/set-password",
-        Some(json!({"email": "chayan@lifeos.app", "password": "second-password-here"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "a second set-password call must never overwrite an already-set password");
-
-    // The first password still works; the second was never applied.
+    // And the attacker-chosen password must not authenticate as the owner.
     let (st, _) = send(
         &app.router,
         "POST",
         "/api/login",
-        Some(json!({"email": "chayan@lifeos.app", "password": "first-password-here"})),
+        Some(json!({"email": "chayan@lifeos.app", "password": "attacker-chosen-password"})),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "the password set by the first call must still be the active one");
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "no attacker-chosen password may ever log in as the sealed seeded owner"
+    );
 }
 
 #[tokio::test]
