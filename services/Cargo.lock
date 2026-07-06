@@ -2020,7 +2020,9 @@ name = "lifeos-drain"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
+ "chrono",
  "libsql",
  "lifeos-actions",
  "lifeos-agents",

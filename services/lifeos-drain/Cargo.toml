@@ -11,6 +11,8 @@ libsql = { version = "0.6.0", default-features = false, features = ["remote", "h
 ulid = "1.1"
 blake3 = "1.5"
 async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 lifeos-ingest = { path = "../lifeos-ingest" }
 lifeos-vcs = { path = "../lifeos-vcs" }

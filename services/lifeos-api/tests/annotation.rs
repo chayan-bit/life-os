@@ -1,6 +1,6 @@
 //! `/api/annotation` CRUD + workspace-isolation suite. Annotations are the
 //! reader/note layer (docs/DATA-MODEL.md §2.4): mutable, workspace-scoped, and
-//! - unlike events - fully CRUD-able. This locks down create/list-filter/
+//! (unlike events) fully CRUD-able. This locks down create/list-filter/
 //! update/delete, tenant isolation (A's row invisible + unmutable to B), and
 //! the 404/400 behavior the rest of the API shares.
 

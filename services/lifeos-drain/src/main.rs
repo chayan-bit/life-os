@@ -42,8 +42,9 @@ use libsql::Builder;
 use lifeos_drain::ai::{AgentCliCaptioner, AgentCliJudge, AgentCliModel, AgentCliStageRunner};
 use lifeos_drain::{
     claim_job, claim_next_module_request, complete_job, dispatch, fail_job, notify_pipeline_gated,
-    reap_stuck, run_module_build, Dispatch, DrainConfig, NoopNotifier, Notifier, ScaffoldJsBuilder,
-    TelegramNotifier,
+    reap_stuck, run_approval_resume_from_payload, run_daily_brief, run_module_build, run_voice_turn,
+    AgentTurnRunner, BuildResumer, Dispatch, DrainConfig, IngestVoiceTranscriber, NodeAgentRunner,
+    NoopNotifier, Notifier, ScaffoldJsBuilder, ScaffoldJsResumer, TelegramNotifier, VoiceTurnPayload,
 };
 use lifeos_ingest::{
     Captioner, Embedder, HaikuCaptioner, IngestJobPayload, NoopCaptioner, NoopEmbedder, NoopOcr,
@@ -151,7 +152,28 @@ async fn main() {
     if !build_pipeline {
         println!("lifeos-drain: LIFEOS_BUILD_PIPELINE=0 (untrusted-node posture): codegen disabled, not polling module_requests");
     }
-    let builder = ScaffoldJsBuilder { server_dir, build_pipeline };
+    let builder = ScaffoldJsBuilder { server_dir: server_dir.clone(), build_pipeline };
+    // Resume-on-approval (issue #142): a `pending_approval` build gate that a
+    // human approved re-enters the pipeline via `node build/run.js --resume`.
+    // Same trusted-Mac gate as a fresh build (`build_pipeline`).
+    let resumer = ScaffoldJsResumer { server_dir: server_dir.clone() };
+    // The Node agent-turn entry (`node agent/run.js`) both the voice-note reply
+    // (#143) and the daily brief (#144) shell, same process contract
+    // `ScaffoldJsBuilder`/`lifeos-api`'s /api/agent route use.
+    let agent_runner = NodeAgentRunner { server_dir };
+    // OGG/Opus transcode fallback (issue #143): Telegram voice notes are
+    // OGG/Opus, which symphonia (wav/mp3/aac/isomp4) cannot decode. With
+    // LIFEOS_FFMPEG_BIN set, the audio path transcodes via ffmpeg first;
+    // without it, an OGG/Opus voice note fails loudly rather than silently.
+    let ffmpeg_bin = std::env::var("LIFEOS_FFMPEG_BIN").ok().filter(|s| !s.is_empty());
+    if ffmpeg_bin.is_none() {
+        println!("lifeos-drain: LIFEOS_FFMPEG_BIN not set, OGG/Opus voice notes will fail loudly (symphonia has no Opus decoder)");
+    }
+    // Daily brief schedule (issue #144): once per workspace per day, after
+    // LIFEOS_BRIEF_HOUR (default 8) in local time. The local UTC offset is
+    // read once at startup; the pure `brief_due` gate uses it per tick.
+    let brief_hour = env_int("LIFEOS_BRIEF_HOUR", 8).clamp(0, 23);
+    let tz_offset_secs = chrono::Local::now().offset().local_minus_utc() as i64;
     let notifier: Box<dyn Notifier> = match std::env::var("TELEGRAM_BOT_TOKEN") {
         Ok(token) if !token.is_empty() => Box::new(TelegramNotifier::new(token)),
         _ => {
@@ -273,6 +295,10 @@ async fn main() {
                     telegram_admin_chat_id.as_deref(),
                     &sleep_backend,
                     &cli_agents,
+                    &resumer,
+                    &agent_runner,
+                    ffmpeg_bin.as_deref(),
+                    build_pipeline,
                 )
                 .await
             }
@@ -308,6 +334,13 @@ async fn main() {
             Ok(_) => {}
             Err(e) => eprintln!("lifeos-drain: memory sleep trigger failed: {e}"),
         }
+        // Proactive daily brief trigger (issue #144): once per workspace per
+        // day, after LIFEOS_BRIEF_HOUR in local time.
+        match lifeos_drain::maybe_enqueue_daily_brief(&conn, brief_hour, tz_offset_secs, now_secs()).await {
+            Ok(n) if n > 0 => println!("lifeos-drain: enqueued {n} daily_brief job(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("lifeos-drain: daily brief trigger failed: {e}"),
+        }
         sleep(poll).await;
     }
 }
@@ -329,12 +362,73 @@ async fn run_job(
     telegram_admin_chat_id: Option<&str>,
     sleep_backend: &dyn lifeos_vcs::StorageBackend,
     cli_agents: &std::sync::Arc<Vec<lifeos_agents::DetectedAgent>>,
+    resumer: &dyn BuildResumer,
+    agent_runner: &dyn AgentTurnRunner,
+    ffmpeg_bin: Option<&str>,
+    build_pipeline: bool,
 ) {
     println!("lifeos-drain: claimed {} (kind={})", job.id, job.kind);
     let result = match dispatch(&job.kind) {
         Dispatch::Stub(handler) => {
-            println!("lifeos-drain: {} -> {handler} (stub, no-op this phase)", job.id);
-            complete_job(conn, &job.id, worker_id).await
+            // `execute_approval` (issue #142) is acknowledged as a stub, but an
+            // approved BUILD gate must re-enter the pipeline here (the resume
+            // path lib.rs owns) rather than being a bare no-op.
+            if job.kind == "execute_approval" {
+                run_execute_approval(conn, resumer, job, worker_id, build_pipeline).await
+            } else {
+                println!("lifeos-drain: {} -> {handler} (stub, no-op this phase)", job.id);
+                complete_job(conn, &job.id, worker_id).await
+            }
+        }
+        Dispatch::VoiceTurn => {
+            // Telegram voice note (issue #143): base64 audio -> whisper
+            // transcript -> agent turn -> reply. All effects (transcribe,
+            // agent turn, notify) are inside `run_voice_turn`.
+            let payload: VoiceTurnPayload = serde_json::from_str(&job.payload).unwrap_or_default();
+            let transcriber_adapter = IngestVoiceTranscriber { transcriber, ffmpeg_bin };
+            match run_voice_turn(
+                conn,
+                &transcriber_adapter,
+                agent_runner,
+                notifier,
+                payload,
+                &job.workspace_id,
+                now_secs(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("lifeos-drain: {} voice_turn -> replied", job.id);
+                    complete_job(conn, &job.id, worker_id).await
+                }
+                Err(e) => {
+                    eprintln!("lifeos-drain: {} voice_turn failed: {e} - failing", job.id);
+                    fail_job(conn, &job.id, worker_id).await
+                }
+            }
+        }
+        Dispatch::DailyBrief => {
+            // Proactive daily brief (issue #144): a READ-ONLY (dry-run) agent
+            // turn digested to Telegram + a `brief` entity written by drain.
+            match run_daily_brief(
+                conn,
+                agent_runner,
+                notifier,
+                &job.workspace_id,
+                telegram_admin_chat_id,
+                now_secs(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("lifeos-drain: {} daily_brief -> sent", job.id);
+                    complete_job(conn, &job.id, worker_id).await
+                }
+                Err(e) => {
+                    eprintln!("lifeos-drain: {} daily_brief failed: {e} - failing", job.id);
+                    fail_job(conn, &job.id, worker_id).await
+                }
+            }
         }
         Dispatch::Ingest => {
             let payload: IngestJobPayload = serde_json::from_str(&job.payload).unwrap_or_default();
@@ -446,5 +540,33 @@ async fn run_job(
         ),
         Ok(_) => {}
         Err(e) => eprintln!("lifeos-drain: status update for {} failed: {e}", job.id),
+    }
+}
+
+/// Handles a claimed `execute_approval` job (issue #142): resume the build
+/// pipeline for an approved gate, or acknowledge a non-build approval. A build
+/// resume that fails is surfaced honestly (the job is failed); everything else
+/// completes. The resume is gated on `build_pipeline` (trusted-Mac only) inside
+/// `run_approval_resume_from_payload`.
+async fn run_execute_approval(
+    conn: &libsql::Connection,
+    resumer: &dyn BuildResumer,
+    job: &lifeos_drain::ClaimedJob,
+    worker_id: &str,
+    build_pipeline: bool,
+) -> libsql::Result<u64> {
+    match run_approval_resume_from_payload(resumer, &job.payload, &job.workspace_id, build_pipeline).await {
+        None => {
+            println!("lifeos-drain: {} execute_approval acknowledged (no build to resume)", job.id);
+            complete_job(conn, &job.id, worker_id).await
+        }
+        Some(Ok(run_id)) => {
+            println!("lifeos-drain: {} execute_approval resumed build -> {run_id}", job.id);
+            complete_job(conn, &job.id, worker_id).await
+        }
+        Some(Err(e)) => {
+            eprintln!("lifeos-drain: {} execute_approval resume failed: {e} - failing", job.id);
+            fail_job(conn, &job.id, worker_id).await
+        }
     }
 }

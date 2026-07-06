@@ -1,9 +1,17 @@
 //! Decodes committed audio blobs into the 16kHz mono f32 PCM whisper-rs
-//! expects (issue #89). Pure Rust via `symphonia` - no ffmpeg dependency.
+//! expects (issue #89). Pure Rust via `symphonia` - no ffmpeg dependency for
+//! the formats symphonia handles (wav/mp3/aac/isomp4).
 //!
 //! Only formats symphonia can actually demux/decode are attempted; anything
 //! else surfaces as `AudioError::UnsupportedContainer` so `route_by_mime`
 //! can report an honest gap instead of a silent failure.
+//!
+//! OGG/Opus honesty (issue #143): Telegram voice notes are OGG/Opus, and
+//! symphonia 0.5 ships NO Opus decoder (it decodes Vorbis, not Opus). Rather
+//! than pretend otherwise, `decode_audio` falls back to an `ffmpeg` transcode
+//! (a WAV symphonia then decodes) when an `ffmpeg` binary is supplied; with no
+//! ffmpeg, an OGG/Opus note surfaces `UnsupportedContainer` - an honest gap,
+//! never a silent zero-segment transcript.
 
 use std::fmt;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -116,6 +124,71 @@ pub fn decode_to_16k_mono_f32(bytes: &[u8]) -> Result<Vec<f32>, AudioError> {
     Ok(resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE))
 }
 
+/// True iff `bytes` start with the OGG container magic (`OggS`). Telegram
+/// voice notes are OGG/Opus; symphonia cannot decode Opus, so these route
+/// through the ffmpeg transcode fallback in `decode_audio`.
+pub fn is_ogg(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"OggS")
+}
+
+/// Decodes audio `bytes` to 16kHz mono f32 PCM, trying symphonia first and
+/// falling back to an `ffmpeg` transcode for containers symphonia cannot
+/// handle (chiefly OGG/Opus - see the module doc). `ffmpeg_bin` is the path to
+/// an ffmpeg binary (`LIFEOS_FFMPEG_BIN`); when `None`, an unsupported
+/// container stays an honest `UnsupportedContainer` error rather than a
+/// silent failure.
+pub async fn decode_audio(bytes: &[u8], ffmpeg_bin: Option<&str>) -> Result<Vec<f32>, AudioError> {
+    match decode_to_16k_mono_f32(bytes) {
+        Err(AudioError::UnsupportedContainer) => match ffmpeg_bin {
+            Some(bin) => {
+                let wav = ffmpeg_transcode_to_wav(bin, bytes).await?;
+                decode_to_16k_mono_f32(&wav)
+            }
+            None => Err(AudioError::UnsupportedContainer),
+        },
+        other => other,
+    }
+}
+
+/// Transcodes arbitrary audio `bytes` to a 16kHz mono WAV via an `ffmpeg`
+/// subprocess (same shell-out DI shape as `TesseractOcr`). Uses temp files
+/// (not pipes) so ffmpeg writes a seekable, well-formed WAV header symphonia
+/// can then demux. A missing/failing ffmpeg surfaces as `DecodeFailed`, never
+/// a panic.
+async fn ffmpeg_transcode_to_wav(ffmpeg_bin: &str, bytes: &[u8]) -> Result<Vec<u8>, AudioError> {
+    let input = tempfile::NamedTempFile::new()
+        .map_err(|e| AudioError::DecodeFailed(format!("temp input: {e}")))?;
+    let output = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| AudioError::DecodeFailed(format!("temp output: {e}")))?;
+    std::fs::write(input.path(), bytes)
+        .map_err(|e| AudioError::DecodeFailed(format!("write temp input: {e}")))?;
+
+    let result = tokio::process::Command::new(ffmpeg_bin)
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-i")
+        .arg(input.path())
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(TARGET_SAMPLE_RATE.to_string())
+        .arg("-f")
+        .arg("wav")
+        .arg(output.path())
+        .output()
+        .await
+        .map_err(|e| AudioError::DecodeFailed(format!("failed to spawn ffmpeg '{ffmpeg_bin}': {e}")))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(AudioError::DecodeFailed(format!("ffmpeg transcode failed: {stderr}")));
+    }
+
+    std::fs::read(output.path()).map_err(|e| AudioError::DecodeFailed(format!("read transcoded wav: {e}")))
+}
+
 /// Mixes down an interleaved multi-channel decoded buffer to mono f32.
 fn append_mono_samples(decoded: &AudioBufferRef, channels: usize, out: &mut Vec<f32>) {
     macro_rules! mixdown {
@@ -210,5 +283,37 @@ mod tests {
     fn malformed_bytes_are_rejected_not_panicked_on() {
         let result = decode_to_16k_mono_f32(b"not an audio file at all");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_ogg_detects_the_ogg_magic_and_rejects_wav() {
+        assert!(is_ogg(b"OggS\x00\x02..."));
+        // A synthetic WAV starts with "RIFF", not "OggS".
+        assert!(!is_ogg(&synth_wav_bytes(16_000, 220.0, 0.1)));
+        assert!(!is_ogg(b""));
+    }
+
+    #[tokio::test]
+    async fn decode_audio_passes_symphonia_decodable_wav_without_ffmpeg() {
+        // A WAV symphonia can already decode never touches the ffmpeg path.
+        let bytes = synth_wav_bytes(16_000, 220.0, 0.25);
+        let samples = decode_audio(&bytes, None).await.unwrap();
+        assert_eq!(samples.len(), 4_000);
+    }
+
+    #[tokio::test]
+    async fn decode_audio_reports_unsupported_when_ogg_opus_and_no_ffmpeg() {
+        // OGG/Opus with no ffmpeg configured is an honest gap, not a silent
+        // empty transcript. (Bytes need only be un-decodable by symphonia.)
+        let result = decode_audio(b"OggS\x00\x02 fake opus payload", None).await;
+        assert!(matches!(result, Err(AudioError::UnsupportedContainer)));
+    }
+
+    #[tokio::test]
+    async fn decode_audio_ffmpeg_fallback_fails_cleanly_when_binary_is_missing() {
+        // With a bogus ffmpeg path the fallback must surface a DecodeFailed
+        // error, never panic (proves the transcode wiring is exercised).
+        let result = decode_audio(b"OggS\x00\x02 fake opus payload", Some("/nonexistent/ffmpeg")).await;
+        assert!(matches!(result, Err(AudioError::DecodeFailed(_))));
     }
 }

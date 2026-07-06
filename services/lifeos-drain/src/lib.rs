@@ -176,6 +176,13 @@ pub enum Dispatch {
     /// consolidation cycle via `lifeos_memory::run_sleep_cycle`, same
     /// direct-library-call shape as `Ingest`/`Pipeline`.
     MemorySleep,
+    /// `voice_turn` jobs (issue #143): a Telegram voice note the Worker
+    /// enqueued (base64 audio + chat) - transcribe, run an agent turn on the
+    /// transcript, reply. Handled by `run_voice_turn`.
+    VoiceTurn,
+    /// `daily_brief` jobs (issue #144): a scheduled, read-only (dry-run) agent
+    /// turn digested to Telegram. Handled by `run_daily_brief`.
+    DailyBrief,
     /// Unknown kind - cannot be handled, will be failed.
     Unknown,
 }
@@ -222,6 +229,8 @@ pub fn dispatch(kind: &str) -> Dispatch {
         // `jobs`-dispatch arm, so a bare drain of the row never fails it.
         "execute_approval" => Dispatch::Stub("lifeos-drain approval resume"),
         "memory_sleep" => Dispatch::MemorySleep,
+        "voice_turn" => Dispatch::VoiceTurn,
+        "daily_brief" => Dispatch::DailyBrief,
         _ => Dispatch::Unknown,
     }
 }
@@ -572,8 +581,12 @@ pub async fn notify_pipeline_gated(notifier: &dyn Notifier, chat_id: &str, stage
 // DI-shaped core it calls, mirroring `run_module_build`/`ScaffoldJsBuilder`.
 
 /// Payload of an `execute_approval` job: the approved entity + its type.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// `Default` (empty strings) is the safe parse-failure fallback: an unknown
+/// `entity_type` is never a build gate, so `should_resume_build` returns false
+/// and the job is acknowledged rather than mis-resumed.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct ExecuteApprovalPayload {
+    #[serde(default)]
     pub entity_id: String,
     #[serde(default)]
     pub entity_type: String,
@@ -643,6 +656,22 @@ pub async fn run_approval_resume(
     Some(resumer.resume(&payload.entity_id, workspace_id).await)
 }
 
+/// The `execute_approval` job dispatch entry `main.rs`'s `run_job` calls: parse
+/// the claimed job's raw JSON payload, then delegate to `run_approval_resume`.
+/// A malformed payload parses to `ExecuteApprovalPayload::default()`, whose
+/// empty `entity_type` is never a build gate, so it yields `None` (acknowledge)
+/// rather than a spurious resume. Kept here (not inline in `main.rs`) so the
+/// job -> resume wiring is unit-testable without spawning a `node` process.
+pub async fn run_approval_resume_from_payload(
+    resumer: &dyn BuildResumer,
+    payload_json: &str,
+    workspace_id: &str,
+    build_pipeline: bool,
+) -> Option<Result<String, String>> {
+    let payload: ExecuteApprovalPayload = serde_json::from_str(payload_json).unwrap_or_default();
+    run_approval_resume(resumer, &payload, workspace_id, build_pipeline).await
+}
+
 /// Runs a claimed module request's build to completion: calls `builder`,
 /// applies the matching `module_requests` transition, and notifies the
 /// requester's chat (if any). This is the orchestration `main.rs`'s loop
@@ -673,6 +702,299 @@ pub async fn run_module_build(
             }
         }
     }
+}
+
+// ------------------------------------------------------- agent turns (shared)
+//
+// Both the voice-note reply (#143) and the daily brief (#144) need to run ONE
+// agent turn on the Mac. The canonical entry is `node agent/run.js <prompt>
+// <workspaceId> [--dry-run]` (server/agent/run.js) - the exact process +
+// last-line-JSON contract `lifeos-api`'s /api/agent route and
+// `ScaffoldJsBuilder` already use. `AgentTurnRunner` is the DI seam so both
+// orchestrations are unit-testable without spawning `node`.
+
+/// Runs one agent turn and returns the turn's reply text. `dry_run` maps to
+/// `runAgentTurn`'s `opts.dryRun` (issue #140): a side-effect-free read-only
+/// turn (used by the daily brief).
+#[async_trait]
+pub trait AgentTurnRunner: Send + Sync {
+    async fn run(&self, prompt: &str, workspace_id: &str, dry_run: bool) -> Result<String, String>;
+}
+
+/// Extracts the reply text from an agent turn's last stdout JSON line
+/// (`runAgentTurn`'s return value: `{success, outcome, text, error?}`). On
+/// success returns `text` (possibly empty); on failure returns the honest
+/// `error`/`outcome`.
+fn parse_agent_turn_result(last_line: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(last_line)
+        .map_err(|e| format!("agent turn output was not valid JSON: {e} (line: {last_line})"))?;
+    let field = |key: &str| parsed.get(key).and_then(|v| v.as_str()).map(String::from);
+    if parsed.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(field("text").unwrap_or_default())
+    } else {
+        Err(field("error")
+            .or_else(|| field("outcome"))
+            .unwrap_or_else(|| "agent turn reported failure with no error message".to_string()))
+    }
+}
+
+/// Shells `node agent/run.js <prompt> <workspaceId> [--dry-run]` - the SAME
+/// process + last-line-JSON contract `ScaffoldJsBuilder`/`ScaffoldJsResumer`
+/// use, just the agent-turn entry.
+pub struct NodeAgentRunner {
+    pub server_dir: String,
+}
+
+#[async_trait]
+impl AgentTurnRunner for NodeAgentRunner {
+    async fn run(&self, prompt: &str, workspace_id: &str, dry_run: bool) -> Result<String, String> {
+        let mut cmd = tokio::process::Command::new("node");
+        cmd.arg("agent/run.js").arg(prompt).arg(workspace_id);
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        let output = cmd
+            .current_dir(&self.server_dir)
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn node agent/run.js: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+        let Some(last_line) = last_line else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("agent/run.js produced no output (stderr: {stderr})"));
+        };
+        parse_agent_turn_result(last_line)
+    }
+}
+
+// --------------------------------------------------------- voice notes (#143)
+
+/// Payload of a `voice_turn` job (worker/src/voice.ts): a Telegram voice note
+/// carried as base64 audio bytes plus the chat to reply into.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct VoiceTurnPayload {
+    #[serde(default)]
+    pub chat_id: String,
+    #[serde(default)]
+    pub audio_b64: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+}
+
+/// Turns raw voice-note bytes into a transcript. DI seam so `run_voice_turn` is
+/// unit-testable without a real whisper model or ffmpeg; the real impl
+/// (`IngestVoiceTranscriber`) delegates to `lifeos_ingest::transcribe_audio_bytes`.
+#[async_trait]
+pub trait VoiceTranscriber: Send + Sync {
+    async fn transcribe_voice(&self, audio_bytes: &[u8]) -> Result<String, String>;
+}
+
+/// Real voice transcription via `lifeos-ingest` (symphonia + whisper, with the
+/// OGG/Opus ffmpeg fallback for Telegram voice notes). Borrows the `Transcriber`
+/// the drain already constructed rather than owning a second whisper model.
+pub struct IngestVoiceTranscriber<'a> {
+    pub transcriber: &'a dyn lifeos_ingest::Transcriber,
+    pub ffmpeg_bin: Option<&'a str>,
+}
+
+#[async_trait]
+impl VoiceTranscriber for IngestVoiceTranscriber<'_> {
+    async fn transcribe_voice(&self, audio_bytes: &[u8]) -> Result<String, String> {
+        lifeos_ingest::transcribe_audio_bytes(audio_bytes, self.transcriber, self.ffmpeg_bin).await
+    }
+}
+
+/// Orchestrates a claimed `voice_turn` job (issue #143): decode+transcribe the
+/// voice note, stamp a `voice.received` event (the turn stamps its own
+/// `agent.turn`), run an agent turn on the transcript, and reply into the
+/// originating chat. Kept here (DI over trait objects) so it is unit-testable
+/// without a whisper model, a `node` process, or a live Telegram call - same
+/// discipline as `run_module_build`.
+pub async fn run_voice_turn(
+    conn: &Connection,
+    transcriber: &dyn VoiceTranscriber,
+    agent: &dyn AgentTurnRunner,
+    notifier: &dyn Notifier,
+    payload: VoiceTurnPayload,
+    workspace_id: &str,
+    now: i64,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.audio_b64.as_bytes())
+        .map_err(|e| format!("voice payload audio_b64 was not valid base64: {e}"))?;
+
+    let transcript = transcriber.transcribe_voice(&bytes).await?;
+    if transcript.is_empty() {
+        // An empty transcript is an honest dead-end, not an agent turn.
+        notifier
+            .notify(&payload.chat_id, "I couldn't make out any speech in that voice note.")
+            .await;
+        return Ok(());
+    }
+
+    // Append-only record of what was heard (docs/SECURITY.md §1). The agent
+    // turn writes its own `agent.turn` row, so memory consolidates both.
+    emit_event(
+        conn,
+        workspace_id,
+        "voice.received",
+        "",
+        "mac-drain",
+        &serde_json::json!({ "chars": transcript.len(), "chat_id": payload.chat_id, "mime": payload.mime }),
+        now,
+    )
+    .await
+    .map_err(|e| format!("failed to record voice.received event: {e}"))?;
+
+    let reply = agent.run(&transcript, workspace_id, false).await?;
+    let reply = if reply.trim().is_empty() { "(no reply)".to_string() } else { reply };
+    notifier.notify(&payload.chat_id, &reply).await;
+    Ok(())
+}
+
+// --------------------------------------------------------- daily brief (#144)
+
+/// The fixed, single-source daily-brief prompt (issue #144). Kept a constant
+/// so the read-only turn is reproducible and the budget stays small.
+pub const DAILY_BRIEF_PROMPT: &str = "Produce a concise morning brief for this workspace as a short bulleted digest. \
+Cover, using only what the world snapshot and memory context show (do not fabricate): \
+tasks due today, the count of items pending approval, builds awaiting a gate, \
+gaps in the trading journal, and learning items due for review. \
+Keep it under 10 short lines. This is a read-only summary - take no actions.";
+
+/// Pure once-a-day + after-the-hour gate for the daily brief (issue #144),
+/// split out so the scheduling rule is directly unit-testable. Fires when the
+/// local wall-clock hour has reached `brief_hour` AND no brief was already sent
+/// on today's local calendar day.
+///
+/// - `now` / `last_sent` are UTC unix seconds; `tz_offset_secs` is the local
+///   UTC offset (east-positive) so both convert to the same local day.
+pub fn brief_due(now: i64, tz_offset_secs: i64, brief_hour: i64, last_sent: Option<i64>) -> bool {
+    let local_now = now + tz_offset_secs;
+    let local_hour = local_now.rem_euclid(86_400) / 3_600;
+    if local_hour < brief_hour {
+        return false;
+    }
+    let today = local_now.div_euclid(86_400);
+    match last_sent {
+        Some(ts) => (ts + tz_offset_secs).div_euclid(86_400) < today,
+        None => true,
+    }
+}
+
+/// The timestamp of the most recent `brief.sent` event for a workspace, if any.
+async fn last_brief_sent(conn: &Connection, workspace_id: &str) -> libsql::Result<Option<i64>> {
+    let mut rows = conn
+        .query(
+            "SELECT MAX(ts) FROM events WHERE workspace_id = ?1 AND type = 'brief.sent'",
+            params![workspace_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get::<Option<i64>>(0)?),
+        None => Ok(None),
+    }
+}
+
+/// Daily-brief scheduler (issue #144), the counterpart to
+/// `maybe_enqueue_memory_sleep`: on each poll tick, enqueue one `daily_brief`
+/// job per workspace that is `brief_due` and has no `daily_brief` already
+/// queued/running (debounce). The `brief.sent` ledger + the debounce together
+/// guarantee at most one brief per workspace per local day. Returns jobs
+/// enqueued.
+pub async fn maybe_enqueue_daily_brief(
+    conn: &Connection,
+    brief_hour: i64,
+    tz_offset_secs: i64,
+    now: i64,
+) -> libsql::Result<u64> {
+    let mut rows = conn.query("SELECT id FROM workspaces ORDER BY id", ()).await?;
+    let mut workspaces = Vec::new();
+    while let Some(row) = rows.next().await? {
+        workspaces.push(row.get::<String>(0)?);
+    }
+    let mut enqueued = 0;
+    for ws in workspaces {
+        let last_sent = last_brief_sent(conn, &ws).await?;
+        if !brief_due(now, tz_offset_secs, brief_hour, last_sent) {
+            continue;
+        }
+        let mut pending = conn
+            .query(
+                "SELECT 1 FROM jobs WHERE workspace_id = ?1 AND kind = 'daily_brief' \
+                 AND status IN ('queued', 'running') LIMIT 1",
+                params![ws.clone()],
+            )
+            .await?;
+        if pending.next().await?.is_some() {
+            continue; // debounce: a brief is already scheduled/running today
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, kind, payload, status, priority, attempts, created_at) \
+             VALUES (?1, ?2, 'daily_brief', '{}', 'queued', 0, 0, ?3)",
+            params![format!("job_{}", Ulid::new()), ws, now],
+        )
+        .await?;
+        enqueued += 1;
+    }
+    Ok(enqueued)
+}
+
+/// Writes the `brief` entity the PWA reads (issue #144). This is the ONE write
+/// the daily-brief flow makes; it happens OUTSIDE the dry-run agent turn, by
+/// drain itself, so the turn stays side-effect-free. Returns the entity id.
+async fn insert_brief_entity(
+    conn: &Connection,
+    workspace_id: &str,
+    text: &str,
+    now: i64,
+) -> libsql::Result<String> {
+    let entity_id = format!("ent_{}", Ulid::new());
+    let attrs = serde_json::json!({ "text": text }).to_string();
+    conn.execute(
+        "INSERT INTO entities (id, workspace_id, module, type, title, attrs, source, created_at, updated_at) \
+         VALUES (?1, ?2, 'briefs', 'brief', 'Daily brief', ?3, 'agent', ?4, ?4)",
+        params![entity_id.clone(), workspace_id, attrs, now],
+    )
+    .await?;
+    Ok(entity_id)
+}
+
+/// Orchestrates a claimed `daily_brief` job (issue #144): run a READ-ONLY
+/// (dry-run) agent turn over the world snapshot + memory, write the resulting
+/// `brief` entity (drain's own write, not the turn's), stamp the `brief.sent`
+/// ledger event (the once-a-day guard), and send the digest to Telegram.
+/// Testable over the same trait mocks as `run_voice_turn`.
+pub async fn run_daily_brief(
+    conn: &Connection,
+    agent: &dyn AgentTurnRunner,
+    notifier: &dyn Notifier,
+    workspace_id: &str,
+    chat_id: Option<&str>,
+    now: i64,
+) -> Result<(), String> {
+    // dry_run = true: the turn itself creates no entities/edges (issue #140).
+    let brief = agent.run(DAILY_BRIEF_PROMPT, workspace_id, true).await?;
+    let brief = if brief.trim().is_empty() { "No brief content today.".to_string() } else { brief };
+
+    let entity_id = insert_brief_entity(conn, workspace_id, &brief, now)
+        .await
+        .map_err(|e| format!("failed to write brief entity: {e}"))?;
+    // `brief.sent` is the ledger the once-a-day guard (`brief_due`) reads.
+    emit_event(conn, workspace_id, "brief.sent", &entity_id, "mac-drain", &serde_json::json!({}), now)
+        .await
+        .map_err(|e| format!("failed to record brief.sent event: {e}"))?;
+
+    match chat_id {
+        Some(chat) => notifier.notify(chat, &format!("Daily brief\n\n{brief}")).await,
+        None => println!("lifeos-drain: daily brief for {workspace_id} (no admin chat configured): {brief}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -974,6 +1296,8 @@ mod tests {
         assert_eq!(dispatch("storage_migrate"), Dispatch::Stub("lifeos-api storage migration"));
         assert_eq!(dispatch("execute_approval"), Dispatch::Stub("lifeos-drain approval resume"));
         assert_eq!(dispatch("memory_sleep"), Dispatch::MemorySleep);
+        assert_eq!(dispatch("voice_turn"), Dispatch::VoiceTurn);
+        assert_eq!(dispatch("daily_brief"), Dispatch::DailyBrief);
         assert_eq!(dispatch("nonsense"), Dispatch::Unknown);
     }
 
@@ -1027,6 +1351,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_approval_job_resumes_the_gate_only_when_the_build_pipeline_is_on() {
+        // The exact JSON an `execute_approval` job for a build gate carries.
+        let gate_payload = r#"{"entity_id":"ent_gate","entity_type":"pending_approval"}"#;
+
+        // LIFEOS_BUILD_PIPELINE off (untrusted node): the resumer is NEVER
+        // invoked and the job is acknowledged (None) rather than resumed.
+        let resumer_off = MockResumer { result: Ok("build_1".into()), calls: Mutex::new(vec![]) };
+        assert!(run_approval_resume_from_payload(&resumer_off, gate_payload, "ws1", false)
+            .await
+            .is_none());
+        assert_eq!(resumer_off.calls.lock().unwrap().len(), 0, "flag off must never resume");
+
+        // LIFEOS_BUILD_PIPELINE on (trusted Mac): the same job triggers the
+        // resumer exactly once with the gate entity + workspace.
+        let resumer_on = MockResumer { result: Ok("build_1".into()), calls: Mutex::new(vec![]) };
+        let outcome = run_approval_resume_from_payload(&resumer_on, gate_payload, "ws1", true).await;
+        assert_eq!(outcome, Some(Ok("build_1".to_string())));
+        let calls = resumer_on.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], ("ent_gate".to_string(), "ws1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn execute_approval_job_with_a_non_gate_or_malformed_payload_is_acknowledged() {
+        let resumer = MockResumer { result: Ok("build_1".into()), calls: Mutex::new(vec![]) };
+        // A draft approval is not a build - acknowledged, never resumed.
+        assert!(run_approval_resume_from_payload(
+            &resumer,
+            r#"{"entity_id":"ent_d","entity_type":"draft"}"#,
+            "ws1",
+            true,
+        )
+        .await
+        .is_none());
+        // A malformed payload falls back to Default (empty type) - also not a
+        // build gate, so it is acknowledged rather than crashing the job.
+        assert!(run_approval_resume_from_payload(&resumer, "not json", "ws1", true).await.is_none());
+        assert_eq!(resumer.calls.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn memory_sleep_enqueues_on_threshold_and_debounces() {
         let path = "test_memory_sleep_enqueue.db";
         let conn = fresh_conn(path).await;
@@ -1068,5 +1433,242 @@ mod tests {
         assert_eq!(n, 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    // ------------------------------------------------------ agent-turn parse
+
+    #[test]
+    fn parse_agent_turn_result_reads_text_and_surfaces_failures() {
+        assert_eq!(
+            parse_agent_turn_result(r#"{"success":true,"outcome":"completed","text":"hi there"}"#).unwrap(),
+            "hi there"
+        );
+        // Success with no text is an empty (not failed) reply.
+        assert_eq!(parse_agent_turn_result(r#"{"success":true,"outcome":"completed"}"#).unwrap(), "");
+        // Failure surfaces the honest error.
+        assert_eq!(
+            parse_agent_turn_result(r#"{"success":false,"outcome":"failed","error":"model down"}"#).unwrap_err(),
+            "model down"
+        );
+        assert!(parse_agent_turn_result("not json").is_err());
+    }
+
+    // ------------------------------------------------------- voice notes (#143)
+
+    struct MockVoiceTranscriber {
+        result: Result<String, String>,
+        seen: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl VoiceTranscriber for MockVoiceTranscriber {
+        async fn transcribe_voice(&self, audio_bytes: &[u8]) -> Result<String, String> {
+            self.seen.lock().unwrap().push(audio_bytes.len());
+            self.result.clone()
+        }
+    }
+
+    struct MockAgentRunner {
+        result: Result<String, String>,
+        calls: Mutex<Vec<(String, String, bool)>>,
+    }
+
+    #[async_trait]
+    impl AgentTurnRunner for MockAgentRunner {
+        async fn run(&self, prompt: &str, workspace_id: &str, dry_run: bool) -> Result<String, String> {
+            self.calls.lock().unwrap().push((prompt.to_string(), workspace_id.to_string(), dry_run));
+            self.result.clone()
+        }
+    }
+
+    fn voice_payload(bytes: &[u8], chat_id: &str) -> VoiceTurnPayload {
+        use base64::Engine as _;
+        VoiceTurnPayload {
+            chat_id: chat_id.to_string(),
+            audio_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime: Some("audio/ogg".into()),
+            file_name: Some("voice/file_1.oga".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_voice_turn_transcribes_runs_the_turn_and_replies() {
+        let conn = fresh_conn("test_voice_turn_ok.db").await;
+        let transcriber = MockVoiceTranscriber {
+            result: Ok("what is due today".into()),
+            seen: Mutex::new(vec![]),
+        };
+        let agent = MockAgentRunner { result: Ok("You have 2 tasks due.".into()), calls: Mutex::new(vec![]) };
+        let notifier = MockNotifier::default();
+
+        run_voice_turn(&conn, &transcriber, &agent, &notifier, voice_payload(b"raw-ogg-bytes", "chat_7"), "ws1", 100)
+            .await
+            .unwrap();
+
+        // A voice.received event was appended (await first, before any guard).
+        assert_eq!(event_count(&conn, "voice.received").await, 1);
+        // Transcriber saw the decoded bytes (13 = len of "raw-ogg-bytes").
+        assert_eq!(transcriber.seen.lock().unwrap().clone(), vec![13]);
+        // The agent turn ran on the transcript, NOT dry-run (a real reply).
+        assert_eq!(agent.calls.lock().unwrap().clone(), vec![(
+            "what is due today".to_string(),
+            "ws1".to_string(),
+            false,
+        )]);
+        // The reply went to the originating chat.
+        assert_eq!(
+            notifier.calls.lock().unwrap().clone(),
+            vec![("chat_7".to_string(), "You have 2 tasks due.".to_string())]
+        );
+
+        let _ = std::fs::remove_file("test_voice_turn_ok.db");
+    }
+
+    #[tokio::test]
+    async fn run_voice_turn_replies_gracefully_on_empty_transcript_without_a_turn() {
+        let conn = fresh_conn("test_voice_turn_empty.db").await;
+        // An empty transcript (whisper heard nothing) is a friendly dead-end,
+        // not an agent turn.
+        let transcriber = MockVoiceTranscriber { result: Ok(String::new()), seen: Mutex::new(vec![]) };
+        let agent = MockAgentRunner { result: Ok("unused".into()), calls: Mutex::new(vec![]) };
+        let notifier = MockNotifier::default();
+
+        run_voice_turn(&conn, &transcriber, &agent, &notifier, voice_payload(b"x", "chat_1"), "ws1", 100)
+            .await
+            .unwrap();
+
+        // No agent turn ran, but the user still got a friendly reply.
+        assert_eq!(agent.calls.lock().unwrap().len(), 0);
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+        assert_eq!(event_count(&conn, "voice.received").await, 0);
+
+        let _ = std::fs::remove_file("test_voice_turn_empty.db");
+    }
+
+    #[tokio::test]
+    async fn run_voice_turn_fails_when_transcription_fails() {
+        let conn = fresh_conn("test_voice_turn_fail.db").await;
+        let transcriber = MockVoiceTranscriber {
+            result: Err("no whisper model configured".into()),
+            seen: Mutex::new(vec![]),
+        };
+        let agent = MockAgentRunner { result: Ok("unused".into()), calls: Mutex::new(vec![]) };
+        let notifier = MockNotifier::default();
+
+        let err = run_voice_turn(&conn, &transcriber, &agent, &notifier, voice_payload(b"x", "chat_1"), "ws1", 100)
+            .await
+            .unwrap_err();
+        assert!(err.contains("whisper"));
+        assert_eq!(agent.calls.lock().unwrap().len(), 0);
+
+        let _ = std::fs::remove_file("test_voice_turn_fail.db");
+    }
+
+    // -------------------------------------------------------- daily brief (#144)
+
+    #[test]
+    fn brief_due_gates_on_hour_and_once_per_local_day() {
+        // Fixed local offset of 0 (UTC) keeps the arithmetic obvious.
+        // 2021-01-01 07:00 UTC -> hour 7 < 8: not yet due.
+        assert!(!brief_due(1_609_484_400, 0, 8, None));
+        // 2021-01-01 08:00 UTC -> hour 8 >= 8, no prior brief: due.
+        assert!(brief_due(1_609_488_000, 0, 8, None));
+        // Same day, already sent at 08:00 -> not due again at 09:00.
+        assert!(!brief_due(1_609_491_600, 0, 8, Some(1_609_488_000)));
+        // Next day after the hour, last sent yesterday -> due again.
+        assert!(brief_due(1_609_574_400 + 3_600, 0, 8, Some(1_609_488_000)));
+    }
+
+    #[test]
+    fn brief_due_respects_a_nonzero_local_offset() {
+        // 2021-01-01 00:00:00 UTC.
+        const MIDNIGHT_UTC: i64 = 1_609_459_200;
+        // +05:30 (IST, 19800s). 02:45 UTC == 08:15 IST -> hour 8 >= 8: due.
+        assert!(brief_due(MIDNIGHT_UTC + 2 * 3_600 + 45 * 60, 19_800, 8, None));
+        // 01:00 UTC == 06:30 IST -> before hour 8: not due.
+        assert!(!brief_due(MIDNIGHT_UTC + 3_600, 19_800, 8, None));
+    }
+
+    async fn brief_conn(path: &str) -> Connection {
+        let conn = fresh_conn(path).await;
+        conn.execute_batch(
+            "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, created_at INTEGER, updated_at INTEGER);
+             CREATE TABLE jobs (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'queued',
+                priority INTEGER DEFAULT 0, run_after INTEGER, claimed_by TEXT, claimed_at INTEGER,
+                attempts INTEGER DEFAULT 0, created_at INTEGER NOT NULL);
+             CREATE TABLE entities (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, module TEXT NOT NULL,
+                type TEXT NOT NULL, parent_id TEXT, title TEXT, status TEXT, tier TEXT,
+                attrs TEXT NOT NULL DEFAULT '{}', source TEXT, blob_ref TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+             INSERT INTO workspaces VALUES ('ws_default', 'p', 1, 1);",
+        )
+        .await
+        .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn maybe_enqueue_daily_brief_fires_once_per_day_then_debounces() {
+        let path = "test_daily_brief_enqueue.db";
+        let conn = brief_conn(path).await;
+        // 09:00 UTC, offset 0, hour 8: due. First tick enqueues one job.
+        let now = 1_609_491_600;
+        assert_eq!(maybe_enqueue_daily_brief(&conn, 8, 0, now).await.unwrap(), 1);
+        // Second tick the same day: a daily_brief job is already queued -> 0.
+        assert_eq!(maybe_enqueue_daily_brief(&conn, 8, 0, now + 60).await.unwrap(), 0, "debounced");
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM jobs WHERE kind = 'daily_brief'", ())
+            .await
+            .unwrap();
+        let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn maybe_enqueue_daily_brief_skips_before_the_hour() {
+        let path = "test_daily_brief_before_hour.db";
+        let conn = brief_conn(path).await;
+        // 07:00 UTC, hour 7 < 8: nothing enqueued.
+        assert_eq!(maybe_enqueue_daily_brief(&conn, 8, 0, 1_609_484_400).await.unwrap(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn run_daily_brief_runs_a_dry_run_turn_and_writes_exactly_one_brief() {
+        let conn = brief_conn("test_run_daily_brief.db").await;
+        let agent = MockAgentRunner {
+            result: Ok("- 2 tasks due\n- 1 pending approval".into()),
+            calls: Mutex::new(vec![]),
+        };
+        let notifier = MockNotifier::default();
+
+        run_daily_brief(&conn, &agent, &notifier, "ws_default", Some("admin_chat"), 200).await.unwrap();
+
+        // The agent turn ran READ-ONLY (dry_run = true) on the fixed prompt.
+        let calls = agent.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, DAILY_BRIEF_PROMPT);
+        assert!(calls[0].2, "brief turn must be dry-run");
+
+        // Exactly one brief entity was written - by drain, not the dry-run turn.
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM entities WHERE type = 'brief' AND workspace_id = 'ws_default'", ())
+            .await
+            .unwrap();
+        let n: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 1);
+        // The brief.sent ledger event (the once-a-day guard) was stamped.
+        assert_eq!(event_count(&conn, "brief.sent").await, 1);
+        // The digest went to the admin chat.
+        let notes = notifier.calls.lock().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].0, "admin_chat");
+        assert!(notes[0].1.contains("2 tasks due"));
+
+        let _ = std::fs::remove_file("test_run_daily_brief.db");
     }
 }

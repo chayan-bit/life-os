@@ -299,6 +299,27 @@ fn run_whisper(model_path: &str, samples: &[f32]) -> Result<Vec<TranscriptSegmen
     Ok(segments)
 }
 
+/// Decodes and transcribes raw audio `bytes` into one flat transcript string,
+/// reusing the same `audio::decode_audio` (symphonia + optional ffmpeg
+/// fallback) and `Transcriber` seam the entity-centric ingest path uses. This
+/// is the primitive `lifeos-drain`'s voice-note turn (issue #143) calls: it
+/// needs a transcript from bytes, not a segment-entity tree. `ffmpeg_bin`
+/// enables the OGG/Opus fallback (Telegram voice notes); see `audio` doc.
+pub async fn transcribe_audio_bytes(
+    bytes: &[u8],
+    transcriber: &dyn Transcriber,
+    ffmpeg_bin: Option<&str>,
+) -> Result<String, String> {
+    let samples = audio::decode_audio(bytes, ffmpeg_bin).await.map_err(|e| e.to_string())?;
+    let segments = transcriber.transcribe(&samples).await?;
+    let text = segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(text.trim().to_string())
+}
+
 /// A completed (or honestly-degraded) ingest run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestOutcome {
@@ -1213,5 +1234,41 @@ mod tests {
             other => panic!("expected Completed, got {other:?}"),
         };
         assert_eq!(segment_ids.len(), 2);
+    }
+
+    fn tiny_wav_bytes() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(&mut buf, spec).unwrap();
+        for i in 0..1_600 {
+            writer.write_sample(((i as f32 * 0.1).sin() * 1000.0) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_bytes_joins_segment_texts_into_one_transcript() {
+        let transcriber = MockTranscriber {
+            result: Ok(vec![
+                TranscriptSegment { text: "hello".into(), t_start_secs: 0.0, t_end_secs: 1.0 },
+                TranscriptSegment { text: "world".into(), t_start_secs: 1.0, t_end_secs: 2.0 },
+            ]),
+        };
+        // A symphonia-decodable WAV needs no ffmpeg fallback.
+        let transcript = transcribe_audio_bytes(&tiny_wav_bytes(), &transcriber, None).await.unwrap();
+        assert_eq!(transcript, "hello world");
+    }
+
+    #[tokio::test]
+    async fn transcribe_audio_bytes_surfaces_the_decode_error_for_ogg_without_ffmpeg() {
+        let transcriber = MockTranscriber { result: Ok(vec![]) };
+        let err = transcribe_audio_bytes(b"OggS\x00\x02 fake opus", &transcriber, None).await.unwrap_err();
+        assert!(err.contains("symphonia") || err.to_lowercase().contains("container"), "got: {err}");
     }
 }
