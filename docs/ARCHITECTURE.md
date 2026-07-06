@@ -4,7 +4,7 @@ This is the canonical, detailed architecture reference for Life OS.
 `README.md` is the narrative superset; `CLAUDE.md` is the short working-rules companion; this `docs/` tree is the deep specification.
 Read this file first, then the focused sub-documents it links.
 
-> Status: design-complete specification, pre-implementation.
+> Status: implemented and tested through issue #140 - 9 Rust crates, a React SPA, a Cloudflare Worker, 19 migrations, roughly 1000 passing tests. Each section below is annotated inline with what is actually built vs. what remains target spec.
 > Every claim here has been validated against how the underlying tools (Turso/libSQL, Claude Agent SDK, Nango, Cloudflare Workers, sqlite-vec) actually behave as of mid-2026; corrections to the original plan are called out inline and in the relevant sub-doc.
 
 ---
@@ -19,7 +19,9 @@ Read this file first, then the focused sub-documents it links.
 | [INTEGRATIONS.md](./INTEGRATIONS.md)             | The **owned-OAuth** model that replaces claude.ai MCP connectors; Nango; the browser actuator; per-provider mechanics        |
 | [VERSIONING.md](./VERSIONING.md)                 | `lifeos-vcs` - the universal content-addressed VCS for every file type (CAS, chunking, snapshots, per-type semantic diff)    |
 | [MEDIA-INTELLIGENCE.md](./MEDIA-INTELLIGENCE.md) | `lifeos-ingest` - transcription/captioning/parsing → memvec; the honest memvec capability boundary; CLIP                     |
-| [SELF-EXTENSION.md](./SELF-EXTENSION.md)         | The "Ask AI to add a module" builder on the Claude Agent SDK; tool-locking; two validators; sandbox                          |
+| [SELF-EXTENSION.md](./SELF-EXTENSION.md)         | Tier 0 of the ladder: the "Ask AI to add a module" **manifest** builder on the Claude Agent SDK; tool-locking; two validators; sandbox    |
+| [SELF-EXTENSION-V2.md](./SELF-EXTENSION-V2.md)   | The **T0-T5 generation ladder**: manifest → renderer → agent tool → backend route → migration → whole subsystem, each sandboxed/validated/committed; the four never-generable surfaces |
+| [AGENT-CORE.md](./AGENT-CORE.md)                 | The general **plan → execute → verify** tool-calling loop (`/api/agent`): Tool-RAG, `lifeos-memory` integration, self-evolution, tracing via `events`, minimal self-healing, the **two-layer LLM cache** (API-key mode), world-model snapshot + guardrails, corrective-RAG/abstention |
 | [AGENT-CONTROL.md](./AGENT-CONTROL.md)           | Universal in-app agent actuation: typed action registry, the four protected domains, dry-run previews, action ledger + undo, capability matrix |
 | [AI-MEMORY.md](./AI-MEMORY.md)                   | The cognitive memory architecture: event-sourced memory, episodic/semantic/procedural layers, activation-scored retrieval, consolidation, the context compiler, bi-temporal forgetting |
 | [STORAGE-BACKENDS.md](./STORAGE-BACKENDS.md)     | Bring-your-own blob storage: pluggable `StorageBackend` (R2/S3/Drive/Dropbox/local) for VCS/repo/file data; fetch + markdown render; integrity + token isolation |
@@ -63,7 +65,7 @@ So Life OS does not bolt on a second system; it **turns the schema you already h
 6. **Owned credentials only.** No integration depends on a third party's account (notably: **not** the claude.ai MCP connectors). All OAuth flows use developer apps you own, tokens encrypted at rest, injected at call time, never in agent context. See [INTEGRATIONS.md](./INTEGRATIONS.md).
 7. **Minimum always-on context, token-disciplined.** API-first thin tools over heavy MCPs; on-demand loading only; bounded context injection.
 8. **Reuse before build; fork when 80% fits.** Generalize the existing `knowledge-atlas` app and harness infra; adopt battle-tested OSS (Nango, grammY, Drizzle, Refine, Claude Agent SDK, whisper-rs, jj); fork an OSS repo and extend it rather than writing net-new.
-9. **Rust where it is security- or throughput-critical.** The local API, the VCS, the ingest pipeline, the broker guard, the job drainer, the pipeline engine - all Rust. The browser SPA, the Worker bot, the module manifests, the scaffolder stay JS/TS; memvec stays Python. See [RUST-COMPONENTS.md](./RUST-COMPONENTS.md).
+9. **Rust where it is security- or throughput-critical.** The local API, the VCS, the ingest pipeline, the job drainer, the pipeline engine, the actions engine, the keyless agent-CLI router, the cognitive memory engine - all Rust. A future, narrowly-scoped broker guard is target spec, not built (§6, [SECURITY.md](./SECURITY.md) §1). The browser SPA, the Worker bot, the module manifests, the scaffolder stay JS/TS; memvec stays Python. See [RUST-COMPONENTS.md](./RUST-COMPONENTS.md).
 
 ---
 
@@ -94,7 +96,7 @@ So Life OS does not bolt on a second system; it **turns the schema you already h
    │  • Claude Code harness: module scaffolder, Eval, Release, deep agents│
    │  • Nango (self-hosted) — OAuth vault + proxy for owned integrations  │
    │  • browser-use actuator — drive any website with no API (gated)     │
-   │  • thin tools in ~/.claude/bin (allow-listed) + broker-guard hook    │
+   │  • thin tools in ~/.claude/bin (allow-listed); broker-guard planned  │
    │  • lifeos-derived.db (un-synced): FTS5 + sqlite-vec                  │
    └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -187,9 +189,16 @@ dedicated table this repo already uses for the self-extension queue (`db/schema.
 generic `jobs(kind='ingest')` row (`worker/src/jobs.ts::enqueueJob`, the same helper #66's
 `execute_approval` jobs use). Both reply "queued" immediately and touch no filesystem -
 there isn't one on a Cloudflare Worker, so "the bot never writes code/files" holds
-structurally, not just by convention. Real dispatch (`lifeos-drain` claiming and running
-these) is not built yet - its `dispatch()` doesn't recognize `ingest` or drain
-`module_requests` at all, same gap #66 left for `execute_approval`.
+structurally, not just by convention. Real dispatch is now built: `lifeos-drain`'s
+`dispatch()` (`services/lifeos-drain/src/lib.rs`) routes `ingest`, `pipeline`, and
+`memory_sleep` jobs to real handlers, and `claim_next_module_request`/`run_module_build`
+poll and drain `module_requests` directly (outside the `jobs` table, by design - see that
+function's doc comment). `module_build` jobs enqueued through the `jobs` table itself
+remain a `Dispatch::Stub`, the same acknowledged-but-not-yet-wired shape as `eval`/
+`reconcile` (see `docs/PLATFORM-SYSTEMS.md` §6). The bot's command surface has since grown
+beyond `/addmodule`/`/ingest`: `worker/src/commands.ts` also implements `/recall <query>`
+(lexical entity search, "what did I note about X") and `/pending` (lists every
+`pending_approval` entity awaiting a Telegram approve/deny tap, `docs/SECURITY.md` §2).
 
 **Heavy drain on the Mac:**
 `launchd` poller (or on-wake) → `lifeos-drain` (Rust) atomically claims a `jobs` row (`UPDATE … RETURNING`) → runs the relevant Rust service or a headless Claude Agent SDK job → writes results + `events` → bot notifies.
@@ -218,17 +227,18 @@ life-os/
     learning/ tasks/ projects/ trading/ social/ marketing/ design/
     email/ calendar/ files/ notion/ slack/ reading/ travel/
     _template/                # scaffold skeleton for self-extension
-  services/                   # Rust services (the heavy brain's native code)
-    lifeos-api/   lifeos-vcs/   lifeos-ingest/   lifeos-pipelines/
-    lifeos-drain/ broker-guard/
+  services/                   # Rust services (the heavy brain's native code), 9 crates
+    lifeos-agents/ lifeos-api/   lifeos-vcs/     lifeos-ingest/
+    lifeos-pipelines/ lifeos-actions/ lifeos-memory/ lifeos-drain/
+    lifeos-cli/                # thin allow-listed CLI, binary name `lifeos`
+    # broker-guard: planned, not built (docs/SECURITY.md §1, revert f3bd18d)
   server/                     # Node glue where JS is required
-    scaffold.js               # drives the Claude Agent SDK
-    validators/ structural.js render.js
-    memvec.py memory.js       # reused harness infra (Python)
+    scaffold.js validators/ evals/ build/ agent/ lib/    # scaffold + T0-T5 pipeline
+    memvec.py                 # reused harness infra (Python)
   worker/                     # Cloudflare Worker: grammY bot (Haiku) + OAuth callbacks
-  migrations/ 0001_core.sql 0002_control_plane.sql …
-  store/                      # offline write-queue / spool
-  bin/                        # thin allow-listed CLI wrappers (Rust binaries)
+  migrations/ 0001_core.sql … 0019_memory_communities.sql   # 19 migrations
+  infra/                      # self-hosted Nango, etc.
+  external/                   # vendored/forked deps (e.g. jj)
   docs/                       # this specification tree
   CLAUDE.md README.md
 ```

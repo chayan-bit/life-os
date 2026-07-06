@@ -11,7 +11,7 @@ All sit on the existing schema (`entities`/`edges`/`events`/`jobs`) - **zero new
 A single natural-language bar that routes to entities, actions, or pipelines.
 - **Search:** queries the one hybrid index (FTS5 + memvec RRF) over **every module** → entities across domains.
 - **Verbs:** "draft a post about X", "what's blocked", "diff this asset", "find the clip where I said Y".
-- **Build:** `core/command.js` (JS, browser) over the existing search + tool registry. No new storage.
+- **Build:** `frontend/src/components/CommandBar.jsx` (JS, browser) over the existing search + tool registry. No new storage.
 
 ### 1.2 Agent pipelines (user/module-defined DAGs)
 Multi-agent Workflows declared in the manifest:
@@ -31,12 +31,17 @@ pipelines: [{ id:'post-from-topic', stages:[
 `lifeos-drain` claims `pipeline` jobs (payload `{pipeline, input}`, same shape
 `routes/planned.rs::pipeline_run` already enqueues) and calls
 `lifeos_pipelines::process_pipeline_job` directly as a library, same pattern as
-`lifeos-ingest`. No Rust "Claude Agent SDK" crate exists anywhere in this
-workspace: the established codebase pattern (`lifeos-ingest/src/vision.rs::
-HaikuCaptioner`) is a direct `reqwest` call to the Anthropic Messages API,
-DI-trait-wrapped (`PipelineStageRunner`, `NoopStageRunner`/`HaikuStageRunner`,
-env-gated on `ANTHROPIC_API_KEY` exactly like the ingest captioner) - pipeline
-stages follow the same shape rather than pulling in an SDK dependency.
+`lifeos-ingest`. No Rust port of the Claude Agent SDK exists anywhere in this
+workspace; instead **`lifeos-agents`** (added later) now fills that role via
+CLI subprocesses - it detects an installed coding-agent CLI on PATH and runs
+completions through it keyless. The per-stage runner wiring in
+`services/lifeos-drain/src/main.rs` is **keyless-CLI-first**: `AgentCliStageRunner`
+(via `lifeos_agents::detect()`) is used whenever any CLI is on PATH; only when
+none is detected does it fall back to the older pattern established by
+`lifeos-ingest/src/vision.rs::HaikuCaptioner` - a direct `reqwest` call to the
+Anthropic Messages API, DI-trait-wrapped (`PipelineStageRunner`,
+`NoopStageRunner`/`HaikuStageRunner`, env-gated on `ANTHROPIC_API_KEY`) - and
+finally to `NoopStageRunner` when neither a CLI nor a key is available.
 
 `pipeline_registry()` is a hardcoded Rust table today, seeded with the one
 pipeline this doc actually specifies (`post-from-topic` above, field names
@@ -69,7 +74,7 @@ metrics: [
   { id:'pnl_curve',      source:'events', where:"type='trade.closed'",   agg:'cumsum(attrs.pnl)', viz:'line' },
   { id:'posts_per_week', source:'events', where:"type='post.published'", agg:'count', bucket:'week', viz:'bar' } ]
 ```
-- **Build:** `core/analytics.js` (JS render) + a `lifeos metrics` endpoint in the Rust API (pure SQL agg over `events` - fast).
+- **Build:** a frontend render layer over `GET /api/metrics` (`services/lifeos-api/src/routes/metrics.rs`, pure SQL agg over `events` - fast).
 - Cross-module dashboard = union over all manifests' metrics.
 - **Time-travel "as of"** works because `events` is append-only.
 
@@ -85,7 +90,11 @@ metrics: [
 as standalone Telegram commands - `worker/src/commands.ts`: `/today` (due today), `/pnl`
 (realized PnL), `/inbox` (uncategorized captures - status IS NULL, closest analog to
 "what's blocked" until a `task.blocked` event exists), `/draft` (creates a
-`pending_approval` entity, "drafts awaiting approval"). No scheduled digest job yet - that's
+`pending_approval` entity, "drafts awaiting approval"). The same module also implements
+`/recall <query>` (lexical entity search, "what did I note about X") and `/pending` (lists
+every `pending_approval` entity awaiting a Telegram approve/deny tap, `docs/SECURITY.md`
+§2) - useful digest-adjacent lookups today, even though neither feeds the scheduled digest
+itself. No scheduled digest job yet - that's
 a `jobs`-row + cron trigger, deferred until the heavy-job enqueue path (#67) exists to model
 it on. `/task`/`/topic`/`/done`/`/quiz` are capture/complete/quiz commands, not digest
 inputs - see `docs/MODULES.md` §2.1/§2.2/§2.4 for their module-specific notes. Every command
@@ -112,7 +121,7 @@ A module is already a validated, self-contained manifest ([SELF-EXTENSION.md](./
 - **Entity types:** `module_package` (`{id, version, author, manifest_ref(blob), signature, installs}`), `module_review`.
 - **Publish:** `lifeos module publish` → structural + render validators → **sign** the manifest (ed25519, tamper-evident) → push to a registry (a Turso table + R2 blob, or a GitHub repo of manifests).
 - **Install:** the **same two validators run locally on the trusted Mac** before register → git commit. Untrusted manifests get the same `dontAsk` + PreToolUse + Seatbelt sandbox treatment as self-built ones.
-- **Security:** never auto-install into `core/`; manifests are declarative (no arbitrary code), drastically limiting blast radius; signature + local re-validation + sandbox.
+- **Security:** never auto-install outside `modules/<id>/`; manifests are declarative (no arbitrary code), drastically limiting blast radius; signature + local re-validation + sandbox.
 - **Build:** 🦀 Rust for sign/verify (ed25519) inside the `lifeos` API; validators reused from Phase 5.
 - This is the multi-tenant distribution channel.
 
@@ -138,7 +147,7 @@ list), routed at `/marketplace`.
 
 ## 5. PWA (rich mobile beyond Telegram)
 
-- The SPA + `manifest.webmanifest` + a **service worker** (offline cache of `core/` + the embedded-replica read model) + **Web Push**.
+- The SPA + `manifest.webmanifest` + a **service worker** (offline cache of the frontend build output + the embedded-replica read model) + **Web Push**.
 - Telegram stays for quick capture/approve; the PWA is the full-fidelity surface (galleries, dashboards, version diffs, maps, timelines).
 - **Auth:** `frontend/src/lib` auth path (session + workspace) - no-op locally, real for SaaS.
 - **Offline:** reads from a local cache / IndexedDB mirror; writes spool to `store/` and reconcile via the single-writer + events-as-truth model ([DATA-MODEL.md](./DATA-MODEL.md) §4).

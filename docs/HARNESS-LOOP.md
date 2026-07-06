@@ -45,13 +45,18 @@ of never blocking Stop.
 
 **Implemented (issue #96):** the pipeline `gate: "eval"` stage (the one
 concrete gate boundary that exists - `verify` before `publish` in
-`post-from-topic`, see §6) now uses a real Haiku judge
-(`services/lifeos-pipelines/src/eval_gate.rs::HaikuJudge`, same
-direct-`reqwest`-to-the-Anthropic-Messages-API pattern as
-`lifeos-ingest/src/vision.rs::HaikuCaptioner`) instead of the length-only
-heuristic from #92 (`HeuristicJudge`, kept as the always-available
-fallback for no `ANTHROPIC_API_KEY`, a not-sampled call, or a judge
-error - the run must never fail because judging failed). Content-cached
+`post-from-topic`, see §6) now uses a real judge. The lane ordering, wired in
+`services/lifeos-drain/src/main.rs`, is **keyless-CLI-first**: if any local
+agent CLI is detected on PATH (`lifeos_agents::detect()` - Claude Code,
+Gemini CLI, Codex, OpenCode, Hermes, Antigravity, ...), the judge is
+`AgentCliJudge` (`services/lifeos-drain/src/ai.rs`), which routes the judging
+prompt through that CLI as a subprocess - no API key needed. Only when no CLI
+is detected does it fall back to `HaikuJudge`
+(`services/lifeos-pipelines/src/eval_gate.rs::HaikuJudge`, a direct `reqwest`
+call to the Anthropic Messages API, gated on `ANTHROPIC_API_KEY`) and, when
+neither a CLI nor a key is available, to the length-only heuristic from #92
+(`HeuristicJudge`, the always-available last resort - the run must never fail
+because judging failed). Content-cached
 via a `blake3`-hashed `entities` row (`module='harness', type='eval_cache'`
 - "zero new tables"); sampled via `PIPELINE_EVAL_SAMPLE_RATE` (default
 0.2) using **deterministic** hash-based sampling (no `rand`, so the same

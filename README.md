@@ -116,7 +116,8 @@ A task / trade / topic / post / campaign / asset are all rows in `entities`, dis
 | `users` | Identity. Personal = one row (you). |
 | `memberships` | `user_id ↔ workspace_id` + role (owner/admin/member). |
 | `connections` | Per-workspace, per-account integration credentials: `provider` (instagram/x/whatsapp/slack/reddit/figma/notion/kite/…), `account_handle`, `scopes`, **`access_token_enc` / `refresh_token_enc` (encrypted at rest)**, `expires_at`, `status`. Supports **multiple accounts per provider**. |
-| `subscriptions` / `plans` | Billing seam (stub now; gates module/quota access in SaaS). |
+
+**Billing removed by design (migration `0013_remove_billing.sql`, issue #104):** the `subscriptions`/`plans` billing seam from the original control-plane migration was dropped - `DROP TABLE IF EXISTS` on both, never read by any route. This is a self-hosted, bring-your-own-database-and-AI-model project; there is no product to meter or bill. `workspaces.plan` stays as a free-text label only, never checked by any route.
 
 **Tenancy strategy:** schema is `workspace_id`-scoped everywhere; personal deployment uses **one shared DB**, and the API enforces workspace filtering (RLS-style). SaaS scales via **Turso database-per-workspace** - the local API abstracts "which DB" so this is a deployment swap, not a code change. Secrets are **never** synced into the agent context or the replica's reach of the bot; the API injects them at call time using a per-workspace envelope key.
 
@@ -243,11 +244,15 @@ life-os/
     marketing/ module.js
     design/    module.js                              # Figma + Higgsfield
     _template/ module.js views.md README.md           # scaffold skeleton
-  server/
-    server.js db.js auth.js bot.js sync.js scaffold.js oauth.js memvec.py memory.js
+  services/                  # Rust services (the heavy brain's native code), 9 crates
+    lifeos-agents/ lifeos-api/ lifeos-vcs/ lifeos-ingest/ lifeos-pipelines/
+    lifeos-actions/ lifeos-memory/ lifeos-drain/ lifeos-cli/   # binary name `lifeos`
+  server/                    # Node glue where JS is required
+    scaffold.js memvec.py agent/ build/ validators/ lib/ evals/ test/
   worker/                    # Cloudflare Worker: Telegram bot (Haiku) + OAuth callbacks
-  migrations/ 0001_core.sql 0002_control_plane.sql …
-  store/                     # offline write-queue / spool
+  migrations/ 0001_core.sql … 0019_memory_communities.sql   # 19 migrations
+  infra/                     # self-hosted Nango, etc.
+  external/                  # vendored/forked deps (e.g. jj)
   CLAUDE.md README.md
 ```
 
@@ -290,7 +295,7 @@ Each phase ships with tests (≥80%, TDD) and a conventional-commit history.
 | Bot transport | Telegram | Free, ubiquitous, works laptop-off |
 | Telegram framework | **grammY** (MIT) | Native Cloudflare Workers adapter (`webhookCallback(bot,"cloudflare-mod")`), inline approve/deny keyboards |
 | DB access | **Drizzle ORM** + `@libsql/client` (MIT) | Typed access to `entities/edges/events`; `/web` import on the Worker (no FS/TCP), embedded-replica `syncUrl` on the Mac |
-| Frontend | Vanilla-JS SPA (generalized knowledge-atlas); **Refine** (MIT) for the admin shell + generic views | No-build core; Refine's backend-agnostic `dataProvider` deletes most list/board/table/calendar/gallery wiring; bring-your-own graph (Cytoscape) |
+| Frontend | React + Vite SPA under `frontend/` (superseded the original no-build vanilla-JS plan); **Refine** (MIT) adopted, `dataProvider` proven | The live generic views (list/board/table/calendar/gallery/…) are hand-built components in `frontend/src/core/renderers/`, not yet routed through Refine; `frontend/src/lib/refineDataProvider.js` is wired end-to-end against the real API and proven on one proof-of-concept page (`frontend/src/pages/RefineDemo.jsx`), not yet the app shell; bring-your-own graph (Cytoscape) |
 | Local API | Node (extend atlas server) / FastAPI | Single DB-token owner, workspace-scoped |
 | Semantic search | sqlite-vec + MiniLM-384 (`memvec.py`) in a separate un-synced `lifeos-derived.db` | Reuse existing harness infra; native libSQL vectors rejected (beta, would couple derived state to the synced DB) |
 | Self-extension | **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) | First-class tool-locking, PreToolUse path hook, Seatbelt sandbox, worktree isolation, schema-validated structured output (Zod) |
@@ -327,4 +332,4 @@ data model, every module, the owned-integration model, `lifeos-vcs`, media intel
 
 ---
 
-*Status: design-complete specification, pre-implementation. See `CLAUDE.md` for working rules, [`docs/`](./docs/ARCHITECTURE.md) for the full spec, and §10 / `docs/BUILD-PLAN.md` for the phased build.*
+*Status: implemented and tested through issue #140 - 9 Rust crates, a React SPA, a Cloudflare Worker, 19 migrations, roughly 1000 passing tests. See `CLAUDE.md` for working rules, [`docs/`](./docs/ARCHITECTURE.md) for the full spec (each section annotated with what's actually built), and §10 / `docs/BUILD-PLAN.md` for the phased build.*
