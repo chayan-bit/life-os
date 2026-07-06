@@ -88,6 +88,11 @@ export default function LoginPage({ onLogin }) {
         return;
       }
 
+      // Match the login success handler exactly (issue: registration never
+      // set this flag, so a fresh registration bounced back to the login
+      // screen on first reload even though a valid session was minted).
+      localStorage.setItem('life_os_loggedin', 'true');
+      localStorage.setItem('life_os_user_email', regEmail);
       localStorage.setItem(WORKSPACE_ID_KEY, data.workspace_id);
       localStorage.setItem(KEY_TOKEN_KEY, data.key_token);
       localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
@@ -227,6 +232,13 @@ export default function LoginPage({ onLogin }) {
         ) : (
           /* REGISTRATION / CREATION FORM */
           <form onSubmit={handleRegisterSubmit} className="flex flex-col gap-4">
+            {error && (
+              <div className="p-3 bg-neo-red text-white border-2 border-neo-border flex items-center gap-2 neo-label-sm">
+                <ShieldAlert size={16} />
+                <span>{error}</span>
+              </div>
+            )}
+
             <div className="flex flex-col gap-1.5">
               <label className="neo-label-md flex items-center gap-1.5" htmlFor="regName">
                 <User size={14} />

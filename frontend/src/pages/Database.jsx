@@ -66,8 +66,6 @@ export default function DatabaseView() {
 
   const [formError, setFormError] = useState('');
   const [formSuccess, setFormSuccess] = useState('');
-  // Load custom entities from localStorage to support persistency in MVP
-  const [customEntities, setCustomEntities] = useState([]);
   const [formModule, setFormModule] = useState('trading');
   const [formType, setFormType] = useState('trade');
   const [formTitle, setFormTitle] = useState('AAPL setup');
@@ -75,15 +73,6 @@ export default function DatabaseView() {
   const [apiStatus, setApiStatus] = useState('checking');
 
   useEffect(() => {
-    const saved = localStorage.getItem('life_os_custom_entities');
-    if (saved) {
-      try {
-        setCustomEntities(JSON.parse(saved));
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
     // Ping lifeos-api Axum server to check if it's awake
     apiCall('GET', '/api/health').then(({ ok, data }) => {
       setApiStatus(ok && data?.status === 'healthy' ? 'online' : 'offline');
@@ -177,61 +166,44 @@ export default function DatabaseView() {
     }
   };
 
+  // Creates the entity via the real API only - no local-only fallback copy.
+  // The workspace comes from the app's existing tenant mechanism
+  // (lib/api.js::authHeaders reads WORKSPACE_ID_KEY from localStorage and
+  // attaches it as X-Workspace-Id on every call apiCall makes), never a
+  // hardcoded id constructed here.
   const handleCreateEntity = (e) => {
     e.preventDefault();
     let parsedAttrs = {};
     try {
       parsedAttrs = JSON.parse(formAttrs);
-      setFormError('');
     } catch (err) {
       setFormError('Invalid JSON in attrs field.');
       return;
     }
 
-    const newId = "ent_" + Math.random().toString(36).substring(2, 10);
-    const newEnt = {
-      id: newId,
-      workspace_id: "default-personal-workspace",
-      module: formModule,
-      type: formType,
-      title: formTitle,
-      status: "active",
-      attrs: parsedAttrs,
-      edges: [],
-      created_at: Date.now()
-    };
-
-    const updated = [newEnt, ...customEntities];
-    setCustomEntities(updated);
-    localStorage.setItem('life_os_custom_entities', JSON.stringify(updated));
-
-    // Try posting to local Axum backend
+    setFormError('');
+    setFormSuccess('');
     apiCall('POST', '/api/entity', {
       module: formModule,
       type: formType,
       title: formTitle,
       attrs: parsedAttrs,
-    }).then(({ ok, data, offline }) => {
+    }).then(({ ok, offline, error }) => {
       if (offline) {
-        console.warn('[Database API] Local server offline, saved locally only.');
-      } else if (ok) {
-        console.log('[Database API] Saved on local server:', data);
-        loadLiveEntities();
+        setFormError('Cannot reach the Life OS API. Check that lifeos-api is running.');
+        return;
       }
+      if (!ok) {
+        setFormError(error || 'Failed to create entity.');
+        return;
+      }
+      setFormSuccess(`Entity "${formTitle}" created.`);
+      setTimeout(() => setFormSuccess(''), 3000);
+      loadLiveEntities();
     });
-
-    setFormSuccess(`Entity "${formTitle}" created.`);
-    setTimeout(() => setFormSuccess(''), 3000);
   };
 
-  const selectedData = entityDefinitions[selectedEntity] || (customEntities.find(e => e.id === selectedEntity) ? {
-    title: customEntities.find(e => e.id === selectedEntity).title,
-    module: customEntities.find(e => e.id === selectedEntity).module,
-    type: customEntities.find(e => e.id === selectedEntity).type,
-    status: customEntities.find(e => e.id === selectedEntity).status,
-    attrs: customEntities.find(e => e.id === selectedEntity).attrs,
-    edges: []
-  } : null);
+  const selectedData = entityDefinitions[selectedEntity] || null;
 
   return (
     <div className="flex flex-col gap-8">
@@ -296,25 +268,13 @@ export default function DatabaseView() {
                   {type.toUpperCase()} (SEED)
                 </button>
               ))}
-
-              {customEntities.map((ent) => (
-                <button
-                  key={ent.id}
-                  onClick={() => setSelectedEntity(ent.id)}
-                  className={`neo-btn py-1.5 px-3 neo-label-sm ${
-                    selectedEntity === ent.id ? 'bg-neo-mint' : 'bg-neo-surface'
-                  }`}
-                >
-                  {ent.title.toUpperCase()} (CUSTOM)
-                </button>
-              ))}
             </div>
 
             {/* Simulated Database Row */}
             {selectedData && (
               <div className="neo-border p-4 bg-gray-950 text-emerald-400 font-mono text-sm neo-radius overflow-x-auto shadow-inner">
                 <div className="text-xs text-neo-text-muted mb-2">// Simulated SQL row in entities table</div>
-                <div><span className="text-pink-400">id</span>: "{selectedEntity.startsWith('ent_') ? selectedEntity : 'd3b07384-d113-4cd4'}"</div>
+                <div><span className="text-pink-400">id</span>: "d3b07384-d113-4cd4"</div>
                 <div><span className="text-pink-400">workspace_id</span>: "personal_workspace"</div>
                 <div><span className="text-pink-400">module</span>: "{selectedData.module}"</div>
                 <div><span className="text-pink-400">type</span>: "{selectedData.type}"</div>

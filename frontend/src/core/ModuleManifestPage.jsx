@@ -73,7 +73,11 @@ export default function ModuleManifestPage({ manifest }) {
     if (view.kind === 'metric') {
       apiCall('GET', '/api/event?limit=2000').then(({ ok, data, offline }) => {
         if (offline) { setState('offline'); return; }
-        setEvents(ok ? data || [] : []);
+        // A non-offline API error used to fall through to `ok ? data : []`
+        // and still flip to 'ready', rendering a false "no data" empty
+        // state instead of surfacing the failure (finding 52).
+        if (!ok) { setState('error'); return; }
+        setEvents(data || []);
         setState('ready');
       });
       return;
@@ -81,10 +85,13 @@ export default function ModuleManifestPage({ manifest }) {
     apiCall('GET', `/api/entity?module=${encodeURIComponent(manifest.id)}&type=${encodeURIComponent(view.type)}&limit=500`)
       .then(({ ok, data, offline }) => {
         if (offline) { setState('offline'); return; }
-        setEntities(ok ? data || [] : []);
+        if (!ok) { setState('error'); return; }
+        setEntities(data || []);
         setState('ready');
       });
   }, [manifest.id, view?.type, view?.kind, reloadKey]);
+
+  const retry = () => setReloadKey((k) => k + 1);
 
   const runSync = async () => {
     if (!manifest.sync) return;
@@ -147,6 +154,12 @@ export default function ModuleManifestPage({ manifest }) {
 
       <div data-view-id={view?.id} className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
         {state === 'offline' && <p className="text-xs text-neo-red font-bold">Backend unreachable.</p>}
+        {state === 'error' && (
+          <div className="text-xs text-neo-red font-bold flex items-center gap-2">
+            Failed to load this view.
+            <button onClick={retry} className="neo-btn bg-neo-surface-high py-1 px-2 text-[10px] font-bold">Retry</button>
+          </div>
+        )}
         {state === 'loading' && <p className="text-xs text-neo-text-muted">Loading…</p>}
         {state === 'ready' && view?.kind === 'metric' && metric && (
           <GenericMetricChart metric={metric} events={events} />

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Activity, RefreshCw } from 'lucide-react';
 import { apiCall } from '../lib/api';
+import ErrorBoundary from '../components/ErrorBoundary';
 import {
   ResponsiveContainer, LineChart, Line, BarChart, Bar,
   XAxis, YAxis, Tooltip, CartesianGrid,
@@ -55,15 +56,23 @@ function Stat({ label, value }) {
 
 export default function ObserveDashboard() {
   const [metrics, setMetrics] = useState(null);
-  const [status, setStatus] = useState('loading'); // loading | ready | offline
+  const [status, setStatus] = useState('loading'); // loading | ready | offline | error
 
+  // A non-offline API error (e.g. a 500) used to leave `metrics` null while
+  // still flipping status to 'ready', so the render below dereferenced
+  // `metrics.*` on null and crashed the whole page (finding 22). Now an
+  // error gets its own status and metrics is only ever read once it's a
+  // real object.
   const load = useCallback(() => {
     setStatus('loading');
-    apiCall('GET', '/api/metrics').then(({ ok, data, offline }) => {
-      if (offline) { setStatus('offline'); return; }
-      setMetrics(ok ? data : null);
-      setStatus('ready');
-    });
+    apiCall('GET', '/api/metrics')
+      .then(({ ok, data, offline }) => {
+        if (offline) { setMetrics(null); setStatus('offline'); return; }
+        if (!ok || !data) { setMetrics(null); setStatus('error'); return; }
+        setMetrics(data);
+        setStatus('ready');
+      })
+      .catch(() => { setMetrics(null); setStatus('error'); });
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -80,7 +89,11 @@ export default function ObserveDashboard() {
   const recentBuildNodes = metrics?.recent_build_nodes || [];
   const buildRunsByOutcome = metrics?.build_runs_by_outcome || {};
 
+  // ErrorBoundary wraps just this page's own content for now - a global
+  // wrap around the whole router tree in App.jsx is the natural follow-up
+  // but that file is owned by another worker, so it's left out of scope.
   return (
+    <ErrorBoundary>
     <div className="flex flex-col gap-6">
       <div className="neo-surface neo-border-thick neo-shadow p-6 bg-neo-surface">
         <h2 className="neo-title-md mb-2 flex items-center gap-2">
@@ -98,9 +111,10 @@ export default function ObserveDashboard() {
         </button>
         {status === 'loading' && <span className="text-xs text-neo-text-muted">Loading metrics...</span>}
         {status === 'offline' && <span className="text-xs text-neo-red font-bold">Backend unreachable.</span>}
+        {status === 'error' && <span className="text-xs text-neo-red font-bold">Failed to load metrics. Try refresh.</span>}
       </div>
 
-      {status === 'ready' && (
+      {status === 'ready' && metrics && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <Card title="Agent turns & tokens">
             <div className="flex gap-6 mb-2">
@@ -265,5 +279,6 @@ export default function ObserveDashboard() {
         </div>
       )}
     </div>
+    </ErrorBoundary>
   );
 }

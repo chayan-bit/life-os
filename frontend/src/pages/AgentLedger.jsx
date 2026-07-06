@@ -9,20 +9,25 @@ import { undoAction, undoPlan } from '../lib/agentActions';
 // action; the original event is never rewritten or deleted.
 export default function AgentLedger() {
   const [events, setEvents] = useState([]);
-  const [loading, setLoading] = useState(true);
+  // loading | ready | error - a failed fetch used to silently fall back to
+  // an empty events array and render "No agent actions yet.", masking an
+  // outage as emptiness (finding 52).
+  const [status, setStatus] = useState('loading');
   const [busyId, setBusyId] = useState(null);
 
   const load = useCallback(async () => {
-    setLoading(true);
+    setStatus('loading');
     const [applied, undone] = await Promise.all([
       apiCall('GET', '/api/event?type=action.applied&limit=500'),
       apiCall('GET', '/api/event?type=action.undone&limit=500'),
     ]);
-    const appliedRows = applied.ok ? applied.data : [];
-    const undoneRows = undone.ok ? undone.data : [];
-    const undoneOf = new Set(undoneRows.map((e) => e.attrs?.undoes_event_id).filter(Boolean));
-    setEvents(appliedRows.map((e) => ({ ...e, undone: undoneOf.has(e.id) })));
-    setLoading(false);
+    if (!applied.ok || !undone.ok) {
+      setStatus('error');
+      return;
+    }
+    const undoneOf = new Set((undone.data || []).map((e) => e.attrs?.undoes_event_id).filter(Boolean));
+    setEvents((applied.data || []).map((e) => ({ ...e, undone: undoneOf.has(e.id) })));
+    setStatus('ready');
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -89,8 +94,14 @@ export default function AgentLedger() {
         </p>
       </div>
 
-      {loading && <p className="text-xs text-neo-text-muted">Loading…</p>}
-      {!loading && !events.length && <p className="text-xs text-neo-text-muted">No agent actions yet.</p>}
+      {status === 'loading' && <p className="text-xs text-neo-text-muted">Loading…</p>}
+      {status === 'error' && (
+        <div className="text-xs text-neo-red font-bold flex items-center gap-2">
+          Failed to load the agent ledger.
+          <button onClick={load} className="neo-btn bg-neo-surface-high py-1 px-2 text-[10px] font-bold">Retry</button>
+        </div>
+      )}
+      {status === 'ready' && !events.length && <p className="text-xs text-neo-text-muted">No agent actions yet.</p>}
 
       {Object.entries(plans).map(([planId, evs]) => {
         const allUndone = evs.every((e) => e.undone);

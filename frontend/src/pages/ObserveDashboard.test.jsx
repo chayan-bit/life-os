@@ -102,6 +102,22 @@ describe('ObserveDashboard', () => {
     await waitFor(() => expect(screen.getByText(/Backend unreachable/i)).toBeTruthy());
   });
 
+  // Finding 22: a non-offline API error (e.g. a 500) used to leave metrics
+  // null while still flipping to the 'ready' render branch, which
+  // dereferenced metrics.* on null and crashed the page. It must now render
+  // a plain error message instead.
+  it('shows an error state instead of crashing when the metrics call returns a non-offline error', async () => {
+    apiCall.mockResolvedValueOnce({ ok: false, data: null, error: 'server exploded', offline: false });
+    render(<ObserveDashboard />);
+    await waitFor(() => expect(screen.getByText(/Failed to load metrics/i)).toBeTruthy());
+  });
+
+  it('shows an error state when the metrics call rejects outright', async () => {
+    apiCall.mockRejectedValueOnce(new Error('network down'));
+    render(<ObserveDashboard />);
+    await waitFor(() => expect(screen.getByText(/Failed to load metrics/i)).toBeTruthy());
+  });
+
   it('renders empty-state notes per card when metrics are all zero', async () => {
     apiCall.mockResolvedValueOnce({ ok: true, data: EMPTY_METRICS, offline: false });
     render(<ObserveDashboard />);

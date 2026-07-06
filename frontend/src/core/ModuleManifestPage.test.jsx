@@ -45,6 +45,18 @@ describe('ModuleManifestPage', () => {
 
     await waitFor(() => expect(document.querySelector('[data-view-id="board"]')).toBeTruthy());
   });
+
+  // Finding 52: a non-offline API error used to fall through to an empty
+  // entities array and still render 'ready', masking the failure as "no
+  // items" instead of surfacing it.
+  it('shows an error message (not an empty view) when the entity fetch fails', async () => {
+    apiCall.mockReset();
+    apiCall.mockResolvedValue({ ok: false, data: null, error: 'boom', offline: false });
+
+    render(<ModuleManifestPage manifest={MANIFEST} />);
+
+    await waitFor(() => expect(screen.getByText(/Failed to load this view/i)).toBeTruthy());
+  });
 });
 
 // Drift guard (T1, issue #133): rendererKinds.js is the plain-JS source of

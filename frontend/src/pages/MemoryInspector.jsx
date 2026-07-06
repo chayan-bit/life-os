@@ -93,8 +93,16 @@ export default function MemoryInspector() {
   const [stats, setStats] = useState(null);
   const [rules, setRules] = useState([]);
   const [busy, setBusy] = useState('');
+  // Ledger and rules come off two independent endpoints, so each gets its
+  // own loading/error/ready status (finding 52) - a failed fetch used to
+  // fall through to the same "nothing yet" empty state as a genuinely empty
+  // response, masking a real outage as emptiness.
+  const [entriesState, setEntriesState] = useState('loading'); // loading | ready | error
+  const [rulesState, setRulesState] = useState('loading');
 
   const load = useCallback(async () => {
+    setEntriesState('loading');
+    setRulesState('loading');
     const [inspect, rulesRes] = await Promise.all([
       apiCall('GET', '/api/memory/inspect?limit=100'),
       apiCall('GET', '/api/memory/rules'),
@@ -102,8 +110,16 @@ export default function MemoryInspector() {
     if (inspect.ok) {
       setEntries(inspect.data?.entries || []);
       setStats(inspect.data?.stats || null);
+      setEntriesState('ready');
+    } else {
+      setEntriesState('error');
     }
-    if (rulesRes.ok) setRules(rulesRes.data?.rules || []);
+    if (rulesRes.ok) {
+      setRules(rulesRes.data?.rules || []);
+      setRulesState('ready');
+    } else {
+      setRulesState('error');
+    }
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -209,7 +225,15 @@ export default function MemoryInspector() {
             Every recall/skip/abstention/consolidation is an append-only event - nothing here can be rewritten.
           </p>
           <div className="space-y-2 max-h-[32rem] overflow-y-auto pr-1">
-            {entries.length === 0 && <div className="text-xs text-neo-text-muted">No memory activity yet.</div>}
+            {entriesState === 'error' && (
+              <div className="text-xs text-neo-red font-bold flex items-center gap-2">
+                Failed to load the recall ledger.
+                <button onClick={load} className="neo-btn bg-neo-surface-high py-0.5 px-2 text-[10px] font-bold">Retry</button>
+              </div>
+            )}
+            {entriesState === 'ready' && entries.length === 0 && (
+              <div className="text-xs text-neo-text-muted">No memory activity yet.</div>
+            )}
             {entries.map((e) => <LedgerEntry key={e.id} entry={e} />)}
           </div>
         </div>
@@ -218,7 +242,15 @@ export default function MemoryInspector() {
           <p className="text-[11px] text-neo-text-muted">
             Learned from feedback by consolidation; injected into every compiled context.
           </p>
-          {rules.length === 0 && <div className="text-xs text-neo-text-muted">No learned rules yet.</div>}
+          {rulesState === 'error' && (
+            <div className="text-xs text-neo-red font-bold flex items-center gap-2">
+              Failed to load procedural rules.
+              <button onClick={load} className="neo-btn bg-neo-surface-high py-0.5 px-2 text-[10px] font-bold">Retry</button>
+            </div>
+          )}
+          {rulesState === 'ready' && rules.length === 0 && (
+            <div className="text-xs text-neo-text-muted">No learned rules yet.</div>
+          )}
           {rules.map((r) => (
             <div key={r} className="neo-border bg-neo-surface p-2.5 text-sm">{r}</div>
           ))}
