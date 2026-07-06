@@ -2,15 +2,24 @@
 //! sync via a [`StorageBackend`], never through the libSQL replica
 //! (docs/VERSIONING.md §2.1/§5, CLAUDE.md hard rules).
 //!
+//! **Not yet wired into any caller.** [`BlobMirror`], [`pull_on_demand`], and
+//! [`BlobMirror::from_r2_env`] are re-exported from the crate root but no
+//! service in this workspace constructs or calls them yet - this is a real
+//! planned feature (R2 mirror/pull-on-demand for the CAS), not dead code to
+//! delete. `from_r2_env` is gated behind the `R2_BUCKET`, `R2_ENDPOINT`,
+//! `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` env vars (unset anywhere today
+//! - see docs/MANUAL-SETUP.md), so don't assume production blobs are
+//! actually mirrored to R2 by reading this file alone.
+//!
 //! Historically this module talked to R2/S3 directly; it is now a thin
 //! compatibility wrapper over [`ExternalObjectStoreBackend`]
 //! (docs/STORAGE-BACKENDS.md §2) so the mirror is just "one more backend" -
 //! the put/get/integrity logic lives in `backend.rs` and is shared with every
 //! other user-chosen backend. `AmazonS3Builder` pointed at an R2 endpoint
-//! remains the real production path; tests stand a `LocalFileSystem` remote
-//! in so the mirror/pull/integrity logic is exercised without live R2
-//! credentials in CI (the same boundary used for the Nango/Kite connectors,
-//! docs/MANUAL-SETUP.md).
+//! remains the intended production path once wired up; tests stand a
+//! `LocalFileSystem` remote in so the mirror/pull/integrity logic is
+//! exercised without live R2 credentials in CI (the same boundary used for
+//! the Nango/Kite connectors, docs/MANUAL-SETUP.md).
 
 use std::fmt;
 use std::sync::Arc;

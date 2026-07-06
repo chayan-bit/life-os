@@ -5,7 +5,6 @@ import {
   BookOpen, Search, Terminal, Cpu, MessageSquare, Plus, Compass, X, Sparkles, GitBranch, Pencil, ChevronRight, ChevronLeft, Link as LinkIcon,
   Download, Upload, Trash2, Check, ArrowRight, Maximize2, ChevronDown, ChevronUp, Loader2
 } from 'lucide-react';
-import ATLAS_DATA from '../atlas_data.json';
 import { getCustomDomains, addCustomDomain, removeCustomDomain } from '../lib/atlasStore';
 import { scaffoldDomain, llmSelection } from '../lib/ai';
 import { apiCall } from '../lib/api';
@@ -62,8 +61,6 @@ const mergeDomainsById = (list) => {
   return [...byId.values()];
 };
 
-const BASE_DOMAINS = mergeDomainsById(ATLAS_DATA).map(normalizeDomain);
-
 const PROG_KEY = "KA_PROGRESS_V1";
 const CONN_KEY = "KA_USERCONN_V1";
 
@@ -104,11 +101,26 @@ export default function KnowledgeAtlas() {
 
   const contentRef = useRef(null);
 
+  // The shipped atlas is a 2.4MB JSON file - loaded lazily (code-split out of
+  // the main bundle) rather than statically imported, so it only downloads
+  // when this view actually mounts.
+  const [baseDomains, setBaseDomains] = useState([]);
+  const [atlasLoading, setAtlasLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    import('../atlas_data.json').then((mod) => {
+      if (cancelled) return;
+      setBaseDomains(mergeDomainsById(mod.default).map(normalizeDomain));
+      setAtlasLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
   // Custom (user/AI-scaffolded) domains merged on top of the shipped atlas.
   const [customRev, setCustomRev] = useState(0);
   const DOMAINS = useMemo(
-    () => [...BASE_DOMAINS, ...getCustomDomains().map((d, i) => normalizeDomain(d, BASE_DOMAINS.length + i))],
-    [customRev]
+    () => [...baseDomains, ...getCustomDomains().map((d, i) => normalizeDomain(d, baseDomains.length + i))],
+    [customRev, baseDomains]
   );
   const customIds = useMemo(() => new Set(getCustomDomains().map((d) => d.id)), [customRev]);
 
@@ -707,6 +719,11 @@ export default function KnowledgeAtlas() {
               <Plus size={14} /> Add Domain
             </button>
           </div>
+          {atlasLoading && (
+            <div className="flex items-center justify-center gap-2 py-16 text-xs font-mono text-neo-text-muted">
+              <Loader2 size={16} className="animate-spin" /> Loading knowledge atlas…
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
             {DOMAINS.map(d => (
               <div
