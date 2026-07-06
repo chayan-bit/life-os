@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Store, UploadCloud, DownloadCloud, ShieldCheck, ShieldAlert, ShieldQuestion,
   RefreshCw, Search, History, X, AlertTriangle, CheckCircle2,
@@ -118,6 +118,30 @@ export default function Marketplace() {
   const [publishNotice, setPublishNotice] = useState('');
   const [publishing, setPublishing] = useState(false);
 
+  // Modal keyboard/focus handling for the detail drawer (finding 56): the
+  // element that opened it gets focus back on close, and the close button
+  // gets focus on open so keyboard/screen-reader users land inside the
+  // drawer immediately instead of it opening silently behind them.
+  const closeButtonRef = useRef(null);
+  const lastTriggerRef = useRef(null);
+  const wasOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (!selected) return undefined;
+    closeButtonRef.current?.focus?.();
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') closeDetail();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected]);
+
+  useEffect(() => {
+    if (wasOpenRef.current && !selected) lastTriggerRef.current?.focus?.();
+    wasOpenRef.current = Boolean(selected);
+  }, [selected]);
+
   const loadPackages = async () => {
     setLoading(true);
     const { ok, data, error: err } = await apiCall('GET', '/api/marketplace/packages');
@@ -139,7 +163,8 @@ export default function Marketplace() {
     return packages.filter((p) => `${p.module_id} ${p.version}`.toLowerCase().includes(q));
   }, [packages, query]);
 
-  const openDetail = async (pkg) => {
+  const openDetail = async (pkg, triggerEl) => {
+    lastTriggerRef.current = triggerEl || document.activeElement;
     setSelected(pkg);
     setInstallError('');
     setInstalledId(null);
@@ -284,7 +309,7 @@ export default function Marketplace() {
         {filtered.map((pkg) => (
           <button
             key={pkg.id}
-            onClick={() => openDetail(pkg)}
+            onClick={(e) => openDetail(pkg, e.currentTarget)}
             className="neo-surface neo-border neo-shadow-sm p-4 flex items-center justify-between text-left hover:bg-neo-bg"
           >
             <div className="flex flex-col gap-1">
@@ -309,6 +334,7 @@ export default function Marketplace() {
           installedId={installedId}
           onInstall={install}
           onClose={closeDetail}
+          closeButtonRef={closeButtonRef}
         />
       )}
     </div>
@@ -318,7 +344,7 @@ export default function Marketplace() {
 // The detail drawer: manifest preview, signature badge, version history with
 // per-version install (rollback), and the primary install with progress +
 // validation-failure display.
-function Drawer({ pkg, sigStatus, versions, versionsLoading, installingId, installError, installedId, onInstall, onClose }) {
+function Drawer({ pkg, sigStatus, versions, versionsLoading, installingId, installError, installedId, onInstall, onClose, closeButtonRef }) {
   return (
     <div className="fixed inset-0 z-40 flex justify-end" role="dialog" aria-label="Package details">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
@@ -328,7 +354,7 @@ function Drawer({ pkg, sigStatus, versions, versionsLoading, installingId, insta
             <span className="font-bold text-base">{pkg.module_id}@{pkg.version}</span>
             <SignatureBadge status={sigStatus} />
           </div>
-          <button onClick={onClose} className="neo-btn p-2" aria-label="Close details"><X size={16} /></button>
+          <button ref={closeButtonRef} onClick={onClose} className="neo-btn p-2" aria-label="Close details"><X size={16} /></button>
         </div>
 
         <ManifestPreview manifest={pkg.manifest} />

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { FileCode, Play, FileAudio, Search, GitCommit, ArrowRight, Eye, Diff, UploadCloud, RefreshCw } from 'lucide-react';
+import { FileCode, Play, FileAudio, Search, GitCommit, UploadCloud, RefreshCw, ExternalLink } from 'lucide-react';
 import { apiCall } from '../lib/api';
 import { listFileEntities } from '../lib/vcsApi';
 
@@ -122,49 +122,183 @@ function IngestStatusPanel() {
   );
 }
 
-export default function VcsIngest() {
-  const [transcriptionQuery, setTranscriptionQuery] = useState('Nango credentials proxy');
-  const allClips = [
-    { file: 'session_clip_382.mp3', text: '...the credentials actually reside inside self-hosted Nango proxy, meaning the agent context does not leak access tokens...', timestamp: '04:12 - 04:30', confidence: '98%' },
-    { file: 'meeting_notes_june.mp3', text: '...we should configure the proxy callback URL on the Cloudflare Worker to point to Nango...', timestamp: '12:05 - 12:20', confidence: '91%' },
-    { file: 'trading_playbook_audio.wav', text: '...double bottom bounds are checked on chart screenshots using perceptual hash difference functions...', timestamp: '01:45 - 02:10', confidence: '89%' },
-    { file: 'vcs_overview.mp3', text: '...content-defined chunking or CDC uses blake3 hashes to deduplicate versions of large media files like video and assets...', timestamp: '08:50 - 09:30', confidence: '95%' }
-  ];
+// Real committed-files summary (finding 24), reusing the same
+// listFileEntities() the Ingest Status panel above already calls. This used
+// to be a "Universal Version History" list with invented version counts and
+// commit messages. Full commit timelines and per-type diffs already exist
+// for real one tab over (components/TimeTravel.jsx, Storage.jsx's Versions
+// tab, backed by GET /api/vcs/history + /api/vcs/diff) - duplicating that
+// logic here would just be a second implementation to keep in sync, so this
+// stays a small, honest read of what is actually committed.
+function CommittedFilesPanel() {
+  const [files, setFiles] = useState([]);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
 
-  // Interactive query-based filtering
-  const foundClips = allClips.filter(c => 
-    c.text.toLowerCase().includes(transcriptionQuery.toLowerCase()) ||
-    c.file.toLowerCase().includes(transcriptionQuery.toLowerCase())
+  useEffect(() => {
+    listFileEntities()
+      .then(setFiles)
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  return (
+    <div className="lg:col-span-6 neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
+      <h3 className="neo-title-md border-b-2 border-neo-border pb-3 mb-4 flex items-center gap-2">
+        <GitCommit size={18} />
+        Committed Files
+      </h3>
+
+      {error && <div className="text-xs text-neo-red mb-3">{error}</div>}
+      {!loading && !error && files.length === 0 && (
+        <div className="text-center py-6 text-neo-text-muted italic text-xs">
+          No files committed to lifeos-vcs yet.
+        </div>
+      )}
+      {loading && <div className="text-xs text-neo-text-muted italic">Loading…</div>}
+
+      <div className="flex flex-col gap-3">
+        {files.map((f) => (
+          <div key={f.id} className="p-4 bg-neo-bg neo-border flex flex-col gap-2">
+            <div className="flex justify-between items-start gap-2">
+              <span className="neo-label-md block font-bold text-neo-blue truncate">{f.attrs?.name || f.title || f.id}</span>
+              <span className={`neo-chip py-0.5 text-[9px] shrink-0 ${f.blob_ref ? 'neo-chip--completed' : 'neo-chip--review'}`}>
+                {f.blob_ref ? 'COMMITTED' : 'NOT COMMITTED'}
+              </span>
+            </div>
+            <span className="text-[10px] text-neo-text-muted font-mono">
+              Last updated {new Date(f.updated_at * 1000).toLocaleString()}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <p className="text-[10px] text-neo-text-muted italic mt-4 flex items-center gap-1">
+        <ExternalLink size={11} /> Full commit timeline, branches/tags and per-type diffs live in this page's Versions tab.
+      </p>
+    </div>
   );
+}
 
-  const [selectedDiffFile, setSelectedDiffFile] = useState('image');
-  const [diffResult, setDiffResult] = useState({
-    image: {
-      filename: 'AAPL_Daily_Chart.png',
-      change: 'Perceptual Hash Diff: 14.8% delta',
-      details: 'Visual bounds adjusted on RSI index line. Pixels shifted by +12px on Y axis.',
-      visual: 'Side-by-side overlay representation: Blue/red outline overlay on RSI channel.'
-    },
-    godot: {
-      filename: 'combat_scene.tscn',
-      change: 'Text Diff: 3 lines added, 2 removed',
-      details: 'Modified node properties under [node name="Player" type="CharacterBody2D"]:\n- speed = 400.0\n+ speed = 480.0',
-      visual: 'Plain-text config serialization matching standard git diff'
-    },
-    figma: {
-      filename: 'Dashboard Design System',
-      change: 'Node Tree Diff: 2 nodes added, 1 modified',
-      details: 'Added FrameNode "GlobeLogoContainer"\nAdded VectorNode "LatitudeOrbitLine"\nModified TextStyleNode font-weight from Bold to Heavy',
-      visual: 'JSON structure comparison of Figma document tree via mcp-figma'
+// Debounced free-text search over real transcript segments (finding 24),
+// same GET /api/search hybrid lexical+semantic endpoint components/
+// CommandBar.jsx already uses. `type=segment` rows are the timestamped
+// transcript chunks lifeos-ingest writes (services/lifeos-ingest/src/
+// lib.rs::insert_segment) - text, and t_start/t_end for transcribed audio.
+// There is no dedicated segment-search route yet, so this reuses the
+// generic entity search rather than inventing one; it replaces a fully
+// hardcoded clip list that never made a network call.
+const SEARCH_DEBOUNCE_MS = 300;
+
+function formatTimestamp(secs) {
+  if (typeof secs !== 'number' || Number.isNaN(secs)) return null;
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function SegmentSearchPanel() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [status, setStatus] = useState('idle'); // idle | loading | done | error
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setResults([]);
+      setStatus('idle');
+      return undefined;
     }
-  });
+    setStatus('loading');
+    const handle = setTimeout(() => {
+      apiCall('GET', `/api/search?q=${encodeURIComponent(q)}&module=files&limit=20`).then(({ ok, data, error: err }) => {
+        if (!ok) {
+          setError(err || 'search failed');
+          setStatus('error');
+          return;
+        }
+        setError('');
+        setResults((data?.results || []).filter((r) => r.type === 'segment'));
+        setStatus('done');
+      });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(handle);
+  }, [query]);
 
-  const versionedFiles = [
-    { name: 'logo_animation_hero.mp4', type: 'VIDEO', size: '14.2 MB', versions: 3, lastCommit: 'Refine spin speed offset' },
-    { name: 'dashboard_mockup.fig', type: 'DESIGN', size: '4.8 MB', versions: 5, lastCommit: 'Brutalist box outline fix' },
-    { name: 'audio_dictation_notes.wav', type: 'AUDIO', size: '32.1 MB', versions: 2, lastCommit: 'Transcript generated' },
-  ];
+  return (
+    <div className="lg:col-span-6 flex flex-col gap-6">
+      <div className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface flex-1">
+        <h3 className="neo-title-md border-b-2 border-neo-border pb-3 mb-4 flex items-center gap-2">
+          <FileAudio size={18} />
+          Semantic Voice Search
+        </h3>
 
+        <div className="flex gap-2 mb-6">
+          <div className="relative flex-1">
+            <Search size={16} className="absolute left-3 top-3 text-neo-text-muted" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search transcribed audio/video segments…"
+              aria-label="Search transcribed segments"
+              className="neo-input w-full pl-10"
+            />
+          </div>
+        </div>
+
+        {error && <div className="text-xs text-neo-red mb-3">{error}</div>}
+
+        <div className="flex flex-col gap-3 max-h-[300px] overflow-y-auto">
+          {status === 'idle' && (
+            <div className="text-center py-6 text-neo-text-muted italic text-xs">
+              Type to search real transcript segments (GET /api/search, lexical + semantic).
+            </div>
+          )}
+          {status === 'loading' && (
+            <div className="text-center py-6 text-neo-text-muted italic text-xs">Searching…</div>
+          )}
+          {status === 'done' && results.length === 0 && (
+            <div className="text-center py-6 text-neo-text-muted italic text-xs">
+              No matching transcript segments found.
+            </div>
+          )}
+          {results.map((seg) => {
+            const start = formatTimestamp(seg.attrs?.t_start);
+            const end = formatTimestamp(seg.attrs?.t_end);
+            return (
+              <div key={seg.id} className="p-3 bg-neo-surface neo-border text-xs flex flex-col gap-2 relative">
+                <div className="flex justify-between items-center border-b border-neo-border pb-1.5">
+                  <span className="font-bold flex items-center gap-1 font-mono text-[10px]">
+                    <FileAudio size={12} className="text-neo-blue" />
+                    {seg.id}
+                  </span>
+                  {typeof seg.score === 'number' && (
+                    <span className="text-[9px] neo-chip neo-chip--completed py-0.5">score {seg.score.toFixed(3)}</span>
+                  )}
+                </div>
+                <p className="italic text-neo-text-muted text-[11px]">"{seg.attrs?.text}"</p>
+                {start && (
+                  <div className="flex justify-between items-center pt-2">
+                    <span className="text-[10px] font-mono bg-neo-bg px-1.5 py-0.5 border">
+                      {start} - {end}
+                    </span>
+                    <span className="text-[10px] text-neo-blue font-bold flex items-center gap-0.5">
+                      <Play size={10} className="fill-neo-blue" /> {start}
+                    </span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function VcsIngest() {
   // Interactive slider for FastCDC deduplication simulator
   const [chunkSizeKb, setChunkSizeKb] = useState(64);
   const totalBaseSizeMb = 120.4;
@@ -188,108 +322,33 @@ export default function VcsIngest() {
       {/* Ingest Status - real, backed by POST /api/ingest + GET /api/entity (issue #91) */}
       <IngestStatusPanel />
 
-      {/* Main Grid */}
+      {/* Main Grid - both panels are real API-backed reads (finding 24) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-
-        {/* Version Control list */}
-        <div className="lg:col-span-6 neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
-          <h3 className="neo-title-md border-b-2 border-neo-border pb-3 mb-4 flex items-center gap-2">
-            <GitCommit size={18} />
-            Universal Version History
-          </h3>
-          <div className="flex flex-col gap-4">
-            {versionedFiles.map((file, idx) => (
-              <div key={idx} className="p-4 bg-neo-bg neo-border flex flex-col gap-2 relative">
-                <div className="flex justify-between items-start">
-                  <div>
-                    <span className="neo-label-md block font-bold text-neo-blue">{file.name}</span>
-                    <span className="text-[10px] text-neo-text-muted font-mono">{file.size} • {file.type}</span>
-                  </div>
-                  <span className="neo-chip neo-chip--completed py-0.5 text-[9px]">{file.versions} VERSIONS</span>
-                </div>
-                
-                <div className="pt-2 border-t border-neo-border border-dashed text-xs flex justify-between items-center">
-                  <span className="text-[10px] italic text-neo-text-muted">Latest: "{file.lastCommit}"</span>
-                  <button onClick={() => setSelectedDiffFile(file.type === 'VIDEO' ? 'godot' : file.type === 'DESIGN' ? 'figma' : 'image')} className="neo-btn py-1 px-2.5 bg-neo-surface text-[10px] font-bold">
-                    Diff History
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Media Intelligence Clip Finder */}
-        <div className="lg:col-span-6 flex flex-col gap-6">
-          <div className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface flex-1">
-            <h3 className="neo-title-md border-b-2 border-neo-border pb-3 mb-4 flex items-center gap-2">
-              <FileAudio size={18} />
-              Semantic Voice Search
-            </h3>
-            
-            <div className="flex gap-2 mb-6">
-              <div className="relative flex-1">
-                <Search size={16} className="absolute left-3 top-3 text-neo-text-muted" />
-                <input
-                  type="text"
-                  value={transcriptionQuery}
-                  onChange={(e) => setTranscriptionQuery(e.target.value)}
-                  placeholder="Type e.g. Nango, proxy, chart, blake3..."
-                  className="neo-input w-full pl-10"
-                />
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-3 max-h-[300px] overflow-y-auto">
-              {foundClips.length > 0 ? foundClips.map((clip, idx) => (
-                <div key={idx} className="p-3 bg-neo-surface neo-border text-xs flex flex-col gap-2 relative">
-                  <div className="flex justify-between items-center border-b border-neo-border pb-1.5">
-                    <span className="font-bold flex items-center gap-1">
-                      <FileAudio size={12} className="text-neo-blue" />
-                      {clip.file}
-                    </span>
-                    <span className="text-[9px] neo-chip neo-chip--completed py-0.5">{clip.confidence} match</span>
-                  </div>
-                  <p className="italic text-neo-text-muted text-[11px]">"{clip.text}"</p>
-                  <div className="flex justify-between items-center pt-2">
-                    <span className="text-[10px] font-mono bg-neo-bg px-1.5 py-0.5 border">
-                      Timestamp: {clip.timestamp}
-                    </span>
-                    <span className="text-[10px] text-neo-blue font-bold flex items-center gap-0.5">
-                      <Play size={10} className="fill-neo-blue" /> {clip.timestamp.split(' - ')[0]}
-                    </span>
-                  </div>
-                </div>
-              )) : (
-                <div className="text-center py-6 text-neo-text-muted italic text-xs">
-                  No matching transcript chunks found.
-                </div>
-              )}
-            </div>
-
-          </div>
-        </div>
-
+        <CommittedFilesPanel />
+        <SegmentSearchPanel />
       </div>
 
-      {/* FastCDC Deduplication Simulator */}
+      {/* FastCDC Deduplication Simulator - illustrative model only, not
+          measured against your real files: there is no dedup/chunk-size
+          stats endpoint yet, so the numbers below are a formula over the
+          slider position, not data read from lifeos-vcs (finding 24). */}
       <div className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
         <h3 className="neo-title-md border-b-2 border-neo-border pb-3 mb-4">
-          FastCDC Deduplication Simulator
+          FastCDC Deduplication Simulator <span className="text-[10px] font-normal text-neo-text-muted uppercase">(illustrative model, not your real files)</span>
         </h3>
         <p className="text-xs text-neo-text-muted mb-4">
-          Content-Defined Chunking splits file revisions dynamically to maximize block reuse. Move the slider to inspect the impact of block-size boundaries.
+          Content-Defined Chunking splits file revisions dynamically to maximize block reuse. Move the slider to see how block-size boundaries affect the ratio, conceptually - lifeos-vcs does not yet expose a real per-workspace dedup metric to compute this from.
         </p>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
           <div className="p-4 bg-neo-bg neo-border flex flex-col gap-2">
             <label className="neo-label-sm font-bold block">TARGET CHUNK BOUNDARY: {chunkSizeKb} KB</label>
-            <input 
-              type="range" 
-              min={16} 
-              max={256} 
+            <input
+              type="range"
+              min={16}
+              max={256}
               step={16}
-              value={chunkSizeKb} 
+              value={chunkSizeKb}
               onChange={(e) => setChunkSizeKb(parseInt(e.target.value))}
               className="w-full cursor-pointer h-2 bg-neo-surface rounded-none border-2 border-neo-border accent-black"
             />
@@ -302,65 +361,15 @@ export default function VcsIngest() {
           <div className="p-4 bg-neo-surface border-2 border-neo-border text-center">
             <span className="neo-label-sm block text-neo-text-muted">DEDUPLICATION RATIO</span>
             <span className="neo-title-md text-3xl text-neo-mint font-black block my-1">{dedupRatio}%</span>
-            <span className="text-[10px] block">Block reuse optimized</span>
+            <span className="text-[10px] block">Illustrative, not measured</span>
           </div>
 
           <div className="p-4 bg-neo-surface border-2 border-neo-border text-center">
             <span className="neo-label-sm block text-neo-text-muted">STORED SIZE VS BASE</span>
             <span className="neo-title-md text-3xl text-neo-blue font-black block my-1">{finalSizeMb} MB</span>
-            <span className="text-[10px] block">Down from {totalBaseSizeMb} MB</span>
+            <span className="text-[10px] block">Down from {totalBaseSizeMb} MB (example base size)</span>
           </div>
         </div>
-      </div>
-
-      {/* Semantic Diff Explorer Section */}
-      <div className="neo-surface neo-border-thick neo-shadow p-5 bg-neo-surface">
-        <h3 className="neo-title-md border-b-2 border-neo-border pb-3 mb-4 flex items-center gap-2">
-          <Diff size={18} />
-          Per-Type Semantic Diff Explorer (`diff(a, b)` function)
-        </h3>
-        
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-          {[
-            { id: 'image', label: 'Image (PNG/JPG)', desc: 'Perceptual overlay delta' },
-            { id: 'godot', label: 'Godot scene (.tscn)', desc: 'Declarative text block comparison' },
-            { id: 'figma', label: 'Figma mockups', desc: 'Node-tree vector diff' }
-          ].map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setSelectedDiffFile(item.id)}
-              className={`neo-btn text-left p-3 flex flex-col gap-1 ${
-                selectedDiffFile === item.id ? 'bg-neo-yellow' : 'bg-neo-surface'
-              }`}
-            >
-              <span className="neo-label-md text-xs">{item.label}</span>
-              <span className="text-[10px] text-neo-text-muted">{item.desc}</span>
-            </button>
-          ))}
-        </div>
-
-        <div className="neo-border p-4 bg-neo-bg flex flex-col gap-3">
-          <div className="flex justify-between items-center border-b border-neo-border pb-2 mb-1">
-            <span className="neo-label-sm font-bold text-xs">File: {diffResult[selectedDiffFile].filename}</span>
-            <span className="neo-chip neo-chip--review text-[10px]">{diffResult[selectedDiffFile].change}</span>
-          </div>
-          
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="p-3 bg-neo-surface neo-border">
-              <span className="neo-label-sm block text-[10px] text-neo-text-muted mb-1">DIFF OUTPUT LOGS:</span>
-              <pre className="font-mono text-xs whitespace-pre-wrap leading-tight text-neo-text-muted">
-                {diffResult[selectedDiffFile].details}
-              </pre>
-            </div>
-            <div className="p-3 bg-neo-surface neo-border flex flex-col justify-center items-center text-center">
-              <span className="neo-label-sm block text-[10px] text-neo-text-muted mb-2">VISUAL COMPARISON PREVIEW:</span>
-              <div className="p-4 bg-zinc-950 text-white font-mono text-[10px] neo-radius w-full border">
-                {diffResult[selectedDiffFile].visual}
-              </div>
-            </div>
-          </div>
-        </div>
-
       </div>
 
     </div>

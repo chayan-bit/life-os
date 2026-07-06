@@ -94,3 +94,36 @@ describe('AIConsole', () => {
     expect(apiCall.mock.calls.some((c) => c[1] === '/api/agent')).toBe(false);
   });
 });
+
+// Finding 56: the close ('X') button had no accessible name, Escape didn't
+// close the panel, and focus wasn't managed on open/close.
+describe('AIConsole accessibility', () => {
+  beforeEach(() => {
+    apiCall.mockReset();
+    apiCall.mockResolvedValue({ ok: true, data: {}, error: null });
+  });
+
+  it('gives the close button an accessible name', () => {
+    render(<AIConsole />);
+    fireEvent.click(screen.getByTitle('Ask AI to change anything'));
+    expect(screen.getByRole('button', { name: 'Close AI console' })).toBeTruthy();
+  });
+
+  it('focuses the composer on open', () => {
+    render(<AIConsole />);
+    fireEvent.click(screen.getByTitle('Ask AI to change anything'));
+    expect(document.activeElement).toBe(screen.getByPlaceholderText(/Change anything/));
+  });
+
+  it('closes on Escape and returns focus to the launcher', async () => {
+    render(<AIConsole />);
+    const launcher = screen.getByRole('button', { name: 'Open AI console' });
+    fireEvent.click(launcher);
+    expect(screen.getByRole('button', { name: 'Close AI console' })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Close AI console' })).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open AI console' }));
+  });
+});

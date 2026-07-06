@@ -14,9 +14,6 @@ import {
   ShieldCheck,
   Play,
   RefreshCw,
-  Plus,
-  ToggleLeft,
-  ToggleRight,
   AlertTriangle
 } from 'lucide-react';
 import { apiCall } from '../lib/api';
@@ -51,11 +48,21 @@ export default function Dashboard() {
     verify: { label: '3. eval-gate', icon: ShieldCheck },
     publish: { label: '4. social.draft (Gated)', icon: Zap },
   };
-  const [actions, setActions] = useState([
-    { id: 1, trigger: 'asset.version_created', action: 'draft social post', active: true },
-    { id: 2, trigger: 'trade.closed', action: 'generate reflection draft', active: true },
-    { id: 3, trigger: 'design_file.updated', action: 'run figma-implement-design', active: false }
-  ]);
+  // Read-only mirror of the real static registry in
+  // services/lifeos-actions/src/lib.rs::action_registry() (issue #93). That
+  // engine has no per-rule enable/disable and no listing API - rules are
+  // compiled in, not stored - so there is nothing to fetch or toggle here.
+  // A previous version of this panel had a toggle that flipped only local
+  // component state and silently dropped the "change" on reload (finding
+  // 25); since the backend has no concept of disabling a rule, the honest
+  // fix is to drop the fake control rather than fake its persistence.
+  // `wired: false` means the trigger event isn't emitted anywhere in the
+  // codebase yet (see that file's doc comment), so the rule never fires.
+  const ACTION_RULES = [
+    { id: 'thumbnail_caption_draft', trigger: 'version.created', action: 'asset.thumbnail_caption_draft', wired: true },
+    { id: 'equity_curve_journal', trigger: 'trade.closed', action: 'trading.equity_curve_and_journal', wired: false },
+    { id: 'topic_quiz', trigger: 'topic.due', action: 'telegram.quiz', wired: false },
+  ];
 
   // Real POST /api/pipeline/run (issue #92) + polling GET /api/event?run_id=
   // for the job's per-stage events, via the shared hook (issue #94, also
@@ -68,10 +75,6 @@ export default function Dashboard() {
   } = usePipelineRun(PIPELINE_STAGE_ORDER);
   const pipelineLogs = pipelineStageLogs.map((log) => ({ ...log, ...PIPELINE_STAGE_META[log.stage] }));
   const runPipelineDemo = () => triggerPipeline('post-from-topic', {});
-
-  const toggleAction = (actionId) => {
-    setActions(actions.map(act => act.id === actionId ? { ...act, active: !act.active } : act));
-  };
 
   // Live aggregates from GET /api/metrics; null fields render as '-' while
   // loading/offline rather than fabricating a count.
@@ -350,20 +353,20 @@ export default function Dashboard() {
           <p className="text-xs text-neo-text-muted mb-4">
             Define automated rules that trigger actions based on event store outputs (GitHub Actions paradigm).
           </p>
+          <p className="text-[10px] text-neo-text-muted italic -mt-2 mb-3">
+            Read-only preview of the static registry in <code>services/lifeos-actions</code> - rules are
+            compiled in, not stored, so there is no per-rule enable/disable here.
+          </p>
           <div className="flex flex-col gap-3">
-            {actions.map((act) => (
-              <div key={act.id} className="p-3 bg-neo-surface-muted neo-border flex justify-between items-center text-xs">
+            {ACTION_RULES.map((rule) => (
+              <div key={rule.id} className="p-3 bg-neo-surface-muted neo-border flex justify-between items-center text-xs">
                 <div>
-                  <span className="neo-label-sm text-[10px] text-neo-blue block mb-0.5">ON EVENT: {act.trigger}</span>
-                  <span className="font-bold">RUN: {act.action}</span>
+                  <span className="neo-label-sm text-[10px] text-neo-blue block mb-0.5">ON EVENT: {rule.trigger}</span>
+                  <span className="font-bold">RUN: {rule.action}</span>
                 </div>
-                <button onClick={() => toggleAction(act.id)} className="neo-icon-btn p-1 border-0 bg-transparent cursor-pointer">
-                  {act.active ? (
-                    <ToggleRight size={28} className="text-neo-mint" />
-                  ) : (
-                    <ToggleLeft size={28} className="text-neo-text-muted" />
-                  )}
-                </button>
+                <span className={`neo-chip py-0.5 text-[9px] ${rule.wired ? 'neo-chip--completed' : 'neo-chip--review'}`}>
+                  {rule.wired ? 'LIVE' : 'NOT YET WIRED'}
+                </span>
               </div>
             ))}
           </div>

@@ -101,7 +101,12 @@ export default function AIConsole() {
   const [log, setLog] = useState([]);
   const [busy, setBusy] = useState(false);
   const endRef = useRef(null);
+  const inputRef = useRef(null);
+  const launcherRef = useRef(null);
+  const wasOpenRef = useRef(false);
   const navigate = useNavigate();
+
+  const close = () => setOpen(false);
 
   useEffect(() => {
     const onOpen = (e) => {
@@ -111,6 +116,27 @@ export default function AIConsole() {
     window.addEventListener('lifeos:ai', onOpen);
     return () => window.removeEventListener('lifeos:ai', onOpen);
   }, []);
+
+  // Focus the composer on open; Escape closes the panel from anywhere inside
+  // it (finding 56 - command-palette-style surfaces need both). On close,
+  // return focus to the launcher - it only re-enters the DOM once `open`
+  // flips back to false, so that happens in its own effect below rather
+  // than inside `close()` itself.
+  useEffect(() => {
+    if (!open) return undefined;
+    inputRef.current?.focus?.();
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') close();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (wasOpenRef.current && !open) launcherRef.current?.focus?.();
+    wasOpenRef.current = open;
+  }, [open]);
 
   useEffect(() => { endRef.current?.scrollIntoView?.({ behavior: 'smooth' }); }, [log, busy]);
 
@@ -127,7 +153,7 @@ export default function AIConsole() {
       await executeAction({ tool: 'navigate', args: { to: nav.href } }, {});
       setLog((l) => [...l, { role: 'system', text: `Navigating to **${nav.label}**.` }]);
       navigate(nav.href);
-      setOpen(false);
+      close();
       return;
     }
 
@@ -182,9 +208,11 @@ export default function AIConsole() {
       {/* Floating launcher - reachable from every page */}
       {!open && (
         <button
+          ref={launcherRef}
           onClick={() => setOpen(true)}
           className="fixed bottom-6 right-6 z-[120] neo-btn bg-neo-blue text-white py-3 px-4 flex items-center gap-2 neo-shadow-lg"
           title="Ask AI to change anything"
+          aria-label="Open AI console"
         >
           <Sparkles size={18} /> <span className="hidden sm:inline font-bold">AI Console</span>
         </button>
@@ -194,7 +222,7 @@ export default function AIConsole() {
         <aside className="fixed right-0 top-0 bottom-0 w-full sm:w-[420px] bg-[var(--neo-surface)] border-l-4 border-neo-border neo-shadow-xl z-[130] flex flex-col">
           <div className="p-4 border-b-4 border-neo-border flex justify-between items-center bg-neo-blue text-white">
             <h3 className="neo-title-md text-base flex items-center gap-2"><Wand2 size={18} /> AI Console</h3>
-            <button onClick={() => setOpen(false)} className="neo-icon-btn p-1.5 text-neo-text"><X size={16} /></button>
+            <button onClick={close} className="neo-icon-btn p-1.5 text-neo-text" aria-label="Close AI console"><X size={16} /></button>
           </div>
 
           <div className="px-4 py-2 border-b-2 border-neo-border bg-neo-surface-muted text-[11px] text-neo-text-muted flex items-center gap-1.5">
@@ -233,10 +261,12 @@ export default function AIConsole() {
 
           <div className="p-3 border-t-2 border-neo-border flex flex-col gap-2">
             <textarea
+              ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run(); } }}
               placeholder="Change anything… (Enter to send)"
+              aria-label="Message to AI console"
               className="neo-input text-sm min-h-[60px] w-full"
             />
             <button onClick={run} disabled={busy} className="neo-btn bg-neo-blue text-white py-2 text-xs font-bold flex items-center justify-center gap-2 disabled:opacity-50">

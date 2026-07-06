@@ -1,8 +1,15 @@
 import React, { useState } from 'react';
 import { Refine, useList } from '@refinedev/core';
-import { Boxes } from 'lucide-react';
+import { Boxes, FlaskConical } from 'lucide-react';
 import { refineDataProvider } from '../lib/refineDataProvider';
 import GenericList from '../core/renderers/GenericList';
+
+// Finding 55: this page is a proof-of-concept, not a shipped feature, and is
+// the sole consumer of @refinedev/core in the app - already code-split via
+// App.jsx's `lazy(() => import('./pages/RefineDemo'))`, so the dependency
+// never lands in the main bundle. Follow-up (needs App.jsx + Layout.jsx,
+// which this fix does not touch): drop the "/refine-demo" route and its nav
+// entry from production once the dataProvider proof is no longer needed.
 
 // Proof that refineDataProvider works end-to-end against the live API: a
 // Refine `useList` call rendering real `tasks/task` entities. See issue
@@ -30,6 +37,13 @@ function TaskList() {
 export default function RefineDemo() {
   return (
     <div className="flex flex-col gap-6">
+      <div className="neo-surface neo-border-thick neo-shadow p-3 bg-neo-yellow flex items-center gap-2 text-neo-text">
+        <FlaskConical size={16} className="shrink-0" />
+        <span className="neo-label-sm font-bold uppercase">
+          Demo / proof-of-concept - not a production feature. Kept for the Refine dataProvider integration proof.
+        </span>
+      </div>
+
       <div className="neo-surface neo-border-thick neo-shadow p-6 bg-neo-surface">
         <h2 className="neo-title-md mb-2 flex items-center gap-2">
           <Boxes size={22} />

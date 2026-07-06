@@ -129,6 +129,32 @@ describe('Marketplace install', () => {
   });
 });
 
+// Finding 56: the detail drawer is a modal-style overlay - it needs Escape
+// to close and to manage focus (into the drawer on open, back to the
+// triggering row on close), not just a close button.
+describe('Marketplace detail drawer accessibility', () => {
+  it('closes on Escape and returns focus to the package that opened it', async () => {
+    mockApi();
+    render(<Marketplace />);
+    const trigger = await screen.findByRole('button', { name: /reading@1\.0\.0/ });
+    fireEvent.click(trigger);
+
+    await waitFor(() => expect(screen.getByRole('dialog')).toBeTruthy());
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('focuses the close button when the drawer opens', async () => {
+    mockApi();
+    render(<Marketplace />);
+    fireEvent.click(await screen.findByRole('button', { name: /reading@1\.0\.0/ }));
+
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close details' })));
+  });
+});
+
 describe('Marketplace gated publish', () => {
   it('creates a pending-approval draft instead of publishing directly', async () => {
     mockApi();
